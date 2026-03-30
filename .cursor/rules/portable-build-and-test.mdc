@@ -1,0 +1,11 @@
+---
+description: Auto build and smoke test portable package
+alwaysApply: true
+---
+
+# Portable Build And Test
+
+- When a change adds or updates user-facing functionality that should ship in the portable package, automatically rebuild the green package with `build_portable.ps1` after the implementation is complete.
+- After each such rebuild, automatically run a portable smoke test without asking first.
+- The smoke test should cover at least: launching `RenderdocDiffTools.exe`, confirming the local service starts, and exercising the most relevant changed workflow or API path.
+- Report test results clearly, including what was verified and anything that could not be verified in the current environment.

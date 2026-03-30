@@ -1,0 +1,38 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Build outputs
+build/
+dist/
+
+# Local runtime data
+logs/
+user_data/
+sessions/
+cmp_sessions/
+perf_sessions/
+export_jobs/
+output/
+
+# Local config and secrets
+config/settings.json
+
+# Temporary/demo environments
+.tmp-asset-test/
+docs/demo_home/
+
+# Local captures and derived exports
+*.rdc
+*_RenderdocDiffExport/
+
+# Local debug outputs
+.tmp_vsin_*.csv
+*_thumb.png
+*_draws.json
+third_round_*.json
+out_*/
+second_round_out/
+
+# Tool runtime noise
+**/__pycache__/

@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RenderDoc 对比分析 Web UI</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>RenderDoc 工具集</h1>
+      <p>在同一界面中切换使用问题诊断工具与性能 diff 工具。</p>
+    </div>
+    <div class="topbar-actions">
+      <button id="open-setup-btn" class="secondary-btn">环境设置</button>
+      <button id="refresh-health-btn" class="secondary-btn">刷新环境状态</button>
+    </div>
+  </header>
+
+  <div id="setup-modal" class="modal-backdrop hidden">
+    <div class="modal-panel">
+      <h2>首启环境检查向导</h2>
+      <p>请确认 RenderDoc、LLM 和性能 diff 工具路径配置正确。保存后会立即应用到当前实例。</p>
+
+      <form id="setup-form">
+        <label>RenderDoc Python Path</label>
+        <input id="setup-renderdoc-python-path" type="text" placeholder="例如 C:\Users\...\rdc\renderdoc 或 C:\Program Files\RenderDoc">
+
+        <label>LLM Provider</label>
+        <select id="setup-llm-provider">
+          <option value="local">local</option>
+          <option value="openai_compatible">openai_compatible</option>
+        </select>
+
+        <label>OpenAI-compatible Base URL</label>
+        <input id="setup-openai-base-url" type="text" placeholder="例如 https://api.deepseek.com/v1">
+
+        <label>OpenAI-compatible API Key</label>
+        <input id="setup-openai-api-key" type="password" placeholder="输入你的 API Key">
+
+        <label>OpenAI-compatible Model</label>
+        <input id="setup-openai-model" type="text" placeholder="例如 deepseek-chat">
+
+        <label>renderdoc_cmp 根目录</label>
+        <input id="setup-cmp-root" type="text" placeholder="例如 G:\UGit\renderdoc_cmp\renderdoccmp">
+
+        <div class="modal-actions">
+          <button id="setup-save-btn" type="submit">保存并应用</button>
+          <button id="setup-close-btn" type="button" class="secondary-btn">关闭</button>
+        </div>
+      </form>
+
+      <h3>检测结果</h3>
+      <pre id="setup-status-output" class="analysis-pre">正在检测...</pre>
+    </div>
+  </div>
+
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="diagnose">问题诊断</button>
+    <button class="tab-btn" data-tab="cmp">性能 Diff</button>
+    <button class="tab-btn" data-tab="perf">性能</button>
+    <button class="tab-btn" data-tab="asset-export">资产批量导出</button>
+  </nav>
+
+  <main id="workspace-diagnose" class="layout tab-workspace active">
+    <section class="panel form-panel">
+      <h2>新建分析</h2>
+      <form id="analyze-form">
+        <label>Before `.rdc` 路径</label>
+        <div class="input-with-button">
+          <input id="before-path" type="text" placeholder="例如 G:\Capture\before.rdc">
+          <button id="pick-before-path-btn" type="button" class="secondary-btn">浏览</button>
+        </div>
+        <input id="before-file" name="before_file" type="file" accept=".rdc" class="hidden">
+
+        <label>After `.rdc` 路径</label>
+        <div class="input-with-button">
+          <input id="after-path" type="text" placeholder="例如 G:\Capture\after.rdc">
+          <button id="pick-after-path-btn" type="button" class="secondary-btn">浏览</button>
+        </div>
+        <input id="after-file" name="after_file" type="file" accept=".rdc" class="hidden">
+
+        <label>目标 Pass</label>
+        <input id="pass-name" name="pass_name" type="text" placeholder="例如 M_Matcap_Glitter_SSS_Trans SK_OG_069_Wai_001" required>
+
+        <label>问题描述</label>
+        <textarea id="issue" name="issue" rows="4" placeholder="例如：面部亮度异常，只有脸发亮，身体正常" required></textarea>
+
+        <div class="row">
+          <div>
+            <label>EID Before（可选）</label>
+            <input id="eid-before" name="eid_before" type="text" placeholder="例如 575">
+          </div>
+          <div>
+            <label>EID After（可选）</label>
+            <input id="eid-after" name="eid_after" type="text" placeholder="例如 610">
+          </div>
+        </div>
+
+        <button id="analyze-btn" type="submit">开始分析</button>
+      </form>
+
+      <div class="health-block">
+        <h3>环境状态</h3>
+        <pre id="health-output">正在加载...</pre>
+      </div>
+    </section>
+
+    <section class="panel result-panel">
+      <h2>当前 Session</h2>
+      <div id="session-summary" class="empty-state">还没有分析结果。</div>
+
+      <h3>首轮报告</h3>
+      <pre id="analysis-output" class="analysis-pre">暂无内容</pre>
+
+      <h3>EID 深挖报告</h3>
+      <pre id="eid-output" class="analysis-pre">暂无内容</pre>
+
+      <h3>UE 源码扫描报告</h3>
+      <pre id="ue-scan-output" class="analysis-pre">暂无内容</pre>
+    </section>
+
+    <section class="panel session-panel">
+      <h2>Session 与追问</h2>
+      <div id="sessions-list" class="session-list"></div>
+
+      <div class="chat-box">
+        <h3>EID 深挖</h3>
+        <form id="eid-form">
+          <div class="row">
+            <div>
+              <label>Before EID</label>
+              <input id="deep-eid-before" type="text" placeholder="例如 575">
+            </div>
+            <div>
+              <label>After EID</label>
+              <input id="deep-eid-after" type="text" placeholder="例如 610">
+            </div>
+          </div>
+          <button id="eid-btn" type="submit">执行 EID 深挖</button>
+        </form>
+      </div>
+
+      <div class="chat-box">
+        <h3>UE 源码扫描</h3>
+        <form id="ue-scan-form">
+          <label>UE 项目根目录</label>
+          <input id="ue-project-root" type="text" placeholder="例如 G:\UGit\LetsgoDevelop2">
+          <button id="ue-scan-btn" type="submit">执行 UE 源码扫描</button>
+        </form>
+      </div>
+
+      <div class="chat-box">
+        <div id="chat-history" class="chat-history"></div>
+        <form id="chat-form">
+          <textarea id="chat-question" rows="3" placeholder="基于当前 session 继续提问，例如：为什么只有面部异常？"></textarea>
+          <button id="chat-btn" type="submit">发送追问</button>
+        </form>
+      </div>
+    </section>
+  </main>
+
+  <main id="workspace-cmp" class="layout layout-cmp tab-workspace">
+    <section class="panel form-panel">
+      <h2>renderdoc_cmp 比较</h2>
+      <form id="cmp-form">
+        <label>Base `.rdc` 路径</label>
+        <div class="input-with-button">
+          <input id="cmp-base-path" type="text" placeholder="例如 G:\Capture\base.rdc">
+          <button id="pick-cmp-base-path-btn" type="button" class="secondary-btn">浏览</button>
+        </div>
+        <input id="cmp-base-file" name="base_file" type="file" accept=".rdc" class="hidden">
+
+        <label>New `.rdc` 路径</label>
+        <div class="input-with-button">
+          <input id="cmp-new-path" type="text" placeholder="例如 G:\Capture\new.rdc">
+          <button id="pick-cmp-new-path-btn" type="button" class="secondary-btn">浏览</button>
+        </div>
+        <input id="cmp-new-file" name="new_file" type="file" accept=".rdc" class="hidden">
+
+        <div class="row">
+          <div>
+            <label>RenderDoc 目录（可选）</label>
+            <input id="cmp-renderdoc-dir" name="renderdoc_dir" type="text" placeholder="例如 C:\Program Files\RenderDoc">
+          </div>
+          <div>
+            <label>Malioc 路径（可选）</label>
+            <input id="cmp-malioc-path" name="malioc_path" type="text" placeholder="例如 C:\Path\to\malioc.exe">
+          </div>
+        </div>
+
+        <div class="checkbox-row">
+          <label><input id="cmp-strict-mode" type="checkbox"> Strict Mode</label>
+          <label><input id="cmp-verbose" type="checkbox"> Verbose</label>
+        </div>
+
+        <button id="cmp-run-btn" type="submit">执行性能 Diff</button>
+      </form>
+
+      <div class="health-block">
+        <h3>工具状态</h3>
+        <pre id="cmp-health-output">等待加载...</pre>
+      </div>
+    </section>
+
+    <section class="panel result-panel">
+      <h2>cmp 结果</h2>
+      <div id="cmp-summary" class="empty-state">还没有执行 renderdoc_cmp。</div>
+      <div id="cmp-report-link-wrap" class="report-link-wrap"></div>
+      <iframe id="cmp-report-frame" class="cmp-report-frame" title="renderdoc cmp report"></iframe>
+    </section>
+
+    <section class="panel session-panel">
+      <h2>cmp 历史</h2>
+      <div id="cmp-jobs-list" class="session-list"></div>
+      <div class="chat-box">
+        <h3>运行日志</h3>
+        <pre id="cmp-run-log" class="analysis-pre">暂无内容</pre>
+      </div>
+    </section>
+  </main>
+
+  <main id="workspace-perf" class="layout layout-perf tab-workspace">
+    <section class="panel form-panel">
+      <h2>单 RDC 性能分析</h2>
+      <form id="perf-form">
+        <label>RenderDoc `.rdc` 路径</label>
+        <div class="input-with-button">
+          <input id="perf-capture-path" type="text" placeholder="例如 G:\Capture\profile.rdc">
+          <button id="pick-perf-capture-path-btn" type="button" class="secondary-btn">浏览</button>
+        </div>
+        <input id="perf-capture-file" name="capture_file" type="file" accept=".rdc" class="hidden">
+        <button id="perf-run-btn" type="submit">执行性能分析</button>
+      </form>
+
+      <div class="health-block">
+        <h3>当前分析摘要</h3>
+        <div id="perf-summary" class="empty-state">还没有执行单 RDC 性能分析。</div>
+        <h3>计时提示</h3>
+        <div id="perf-warnings" class="session-list">
+          <div class="empty-state">当前没有额外的计时风险提示。</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel result-panel">
+      <h2>性能结果</h2>
+      <div class="perf-toolbar">
+        <div>
+          <label>排序维度</label>
+          <select id="perf-sort-field"></select>
+        </div>
+        <div>
+          <label>排序方向</label>
+          <select id="perf-sort-direction">
+            <option value="desc">从高到低</option>
+            <option value="asc">从低到高</option>
+          </select>
+        </div>
+      </div>
+      <div id="perf-table-wrap" class="perf-table-wrap">
+        <div class="empty-state">暂无性能结果。</div>
+      </div>
+    </section>
+
+    <section class="panel session-panel">
+      <h2>MobileSceneRender 开销</h2>
+      <div id="perf-chart-wrap" class="perf-chart-wrap">
+        <div class="empty-state">暂无饼图数据。</div>
+      </div>
+      <div id="perf-hotspot-hints" class="session-list"></div>
+
+      <div class="chat-box">
+        <h3>性能分析历史</h3>
+        <div id="perf-jobs-list" class="session-list"></div>
+      </div>
+
+      <div class="chat-box">
+        <h3>运行日志</h3>
+        <pre id="perf-run-log" class="analysis-pre">暂无内容</pre>
+      </div>
+    </section>
+  </main>
+
+  <main id="workspace-asset-export" class="layout tab-workspace">
+    <section class="panel form-panel">
+      <h2>资产批量导出</h2>
+      <form id="asset-pass-scan-form">
+        <label>RenderDoc `.rdc` 路径</label>
+        <div class="input-with-button">
+          <input id="asset-capture-source-path" type="text" placeholder="例如 G:\Capture\face_issue.rdc">
+          <button id="pick-asset-capture-path-btn" type="button" class="secondary-btn">浏览</button>
+        </div>
+        <input id="asset-capture-file" type="file" accept=".rdc" class="hidden">
+        <button id="asset-pass-scan-btn" type="submit">读取 Pass 列表</button>
+      </form>
+
+      <form id="asset-export-form">
+        <label>导出范围</label>
+        <select id="asset-export-scope">
+          <option value="single">单个 Pass</option>
+          <option value="range">Pass 区间</option>
+        </select>
+
+        <div class="row">
+          <div>
+            <label>单个 Pass EID</label>
+            <select id="asset-pass-name"></select>
+          </div>
+          <div>
+            <label>手动单个 EID</label>
+            <input id="asset-pass-manual-eid" type="text" placeholder="例如 5665，优先于下拉选择">
+          </div>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>起始 Pass EID</label>
+            <select id="asset-pass-start"></select>
+          </div>
+          <div>
+            <label>手动起始 EID</label>
+            <input id="asset-pass-start-manual-eid" type="text" placeholder="例如 5200，优先于下拉选择">
+          </div>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>结束 Pass EID</label>
+            <select id="asset-pass-end"></select>
+          </div>
+          <div>
+            <label>手动结束 EID</label>
+            <input id="asset-pass-end-manual-eid" type="text" placeholder="例如 5800，优先于下拉选择">
+          </div>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>贴图格式</label>
+            <select id="asset-texture-format">
+              <option value="png">PNG</option>
+              <option value="tga">TGA</option>
+              <option value="hdr">HDR</option>
+              <option value="exr">EXR</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="checkbox-row">
+          <label><input id="asset-export-fbx" type="checkbox" checked> 导出 FBX</label>
+          <label><input id="asset-export-obj" type="checkbox"> 兼容导出 OBJ</label>
+        </div>
+
+        <label>备注</label>
+        <textarea id="asset-export-notes" rows="3" placeholder="例如：按 UI Pass 顺序导出面部相关资产，后续需要做手工列映射"></textarea>
+
+        <button id="asset-export-create-btn" type="submit">保存导出任务</button>
+      </form>
+
+      <div class="health-block">
+        <h3>Pass 扫描结果</h3>
+        <pre id="asset-pass-scan-output">尚未读取 Pass 列表</pre>
+      </div>
+    </section>
+
+    <section class="panel result-panel">
+      <h2>CSV 列映射预览</h2>
+      <form id="asset-csv-inspect-form">
+        <label>CSV 或目录路径（可手填；多文件请每行一个路径）</label>
+        <div class="input-with-button input-with-button-multi">
+          <textarea id="asset-csv-source-path" rows="3" placeholder="例如：&#10;G:\Capture\a\mesh.csv&#10;G:\Capture\b\mesh.csv&#10;或单个目录路径"></textarea>
+          <button id="pick-asset-csv-path-btn" type="button" class="secondary-btn">浏览</button>
+          <button id="pick-asset-csv-dir-btn" type="button" class="secondary-btn">目录</button>
+        </div>
+        <input id="asset-csv-file" type="file" accept=".csv" class="hidden">
+        <button id="asset-csv-inspect-btn" type="submit">识别列映射</button>
+      </form>
+
+      <div id="asset-csv-inspect-summary" class="empty-state">支持单个 CSV、多个散点 CSV 路径，或单个目录。批处理时会自动选取第一个 CSV 作为映射预览样本。</div>
+
+      <div class="row">
+        <div>
+          <label>Position</label>
+          <select id="mapping-position"></select>
+        </div>
+        <div>
+          <label>Normal</label>
+          <select id="mapping-normal"></select>
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>UV0</label>
+          <select id="mapping-uv0"></select>
+        </div>
+        <div>
+          <label>UV1</label>
+          <select id="mapping-uv1"></select>
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>UV2</label>
+          <select id="mapping-uv2"></select>
+        </div>
+        <div>
+          <label>UV3</label>
+          <select id="mapping-uv3"></select>
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>Color</label>
+          <select id="mapping-color"></select>
+        </div>
+        <div>
+          <label>Tangent</label>
+          <select id="mapping-tangent"></select>
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>手工转换输出格式</label>
+          <select id="mapping-output-format">
+            <option value="fbx">FBX</option>
+            <option value="obj">OBJ</option>
+          </select>
+        </div>
+        <div>
+          <label>执行手工转换</label>
+          <button id="asset-csv-convert-btn" type="button">按当前映射转换 CSV/目录</button>
+        </div>
+      </div>
+
+      <h3>当前任务</h3>
+      <div id="asset-export-summary" class="empty-state">还没有资产导出任务。</div>
+      <h3>导出清单</h3>
+      <div id="asset-export-files" class="session-list"></div>
+      <h3>任务日志</h3>
+      <pre id="asset-export-log" class="analysis-pre">暂无内容</pre>
+    </section>
+
+    <section class="panel session-panel">
+      <h2>导出任务历史</h2>
+      <div id="asset-export-jobs-list" class="session-list"></div>
+      <div class="chat-box">
+        <h3>说明</h3>
+        <div class="empty-state">
+          当前阶段先完成可移植的作业配置、Pass 扫描和 CSV 列映射面板。
+          后续会把 RenderDoc 资产导出和内置 FBX/OBJ 转换执行链路接上。
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="asset-export-mapping-modal" class="modal-backdrop hidden">
+    <div class="modal-panel asset-export-mapping-modal-panel">
+      <h2>批量映射确认</h2>
+      <div id="asset-export-mapping-summary" class="empty-state">正在准备批量映射样本。</div>
+      <div id="asset-export-mapping-notes" class="empty-state">暂无额外提示。</div>
+
+      <div class="row">
+        <div>
+          <label>Position</label>
+          <select id="batch-mapping-position"></select>
+        </div>
+        <div>
+          <label>Normal</label>
+          <select id="batch-mapping-normal"></select>
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>UV0</label>
+          <select id="batch-mapping-uv0"></select>
+        </div>
+        <div>
+          <label>UV1</label>
+          <select id="batch-mapping-uv1"></select>
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>UV2</label>
+          <select id="batch-mapping-uv2"></select>
+        </div>
+        <div>
+          <label>UV3</label>
+          <select id="batch-mapping-uv3"></select>
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>Color</label>
+          <select id="batch-mapping-color"></select>
+        </div>
+        <div>
+          <label>Tangent</label>
+          <select id="batch-mapping-tangent"></select>
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button id="asset-export-mapping-confirm-btn" type="button">确认映射并开始导出</button>
+        <button id="asset-export-mapping-cancel-btn" type="button" class="secondary-btn">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="perf-preview-panel" class="perf-preview-panel hidden">
+    <div class="perf-preview-panel-header">
+      <div>
+        <div id="perf-preview-panel-title" class="title">线框预览</div>
+        <div id="perf-preview-panel-meta" class="meta"></div>
+      </div>
+      <button id="perf-preview-panel-close" type="button" class="secondary-btn">关闭</button>
+    </div>
+    <img id="perf-preview-panel-image" class="perf-preview-panel-image" alt="preview">
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
