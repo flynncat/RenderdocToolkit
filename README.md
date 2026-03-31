@@ -40,6 +40,12 @@
 python -m pip install -r requirements.txt
 ```
 
+如果需要手动安装打包依赖，也可以执行：
+
+```powershell
+python -m pip install pyinstaller
+```
+
 启动桌面工具：
 
 ```powershell
@@ -47,6 +53,47 @@ python launcher.py
 ```
 
 程序会启动本地服务，并以内嵌桌面窗口打开界面。
+
+### 打包绿色运行包
+
+项目根目录提供了一键打包脚本：
+
+```bat
+build_portable.bat
+```
+
+它会自动调用：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_portable.ps1
+```
+
+默认输出目录为：
+
+```text
+G:\RenderdocDiffTools\RenderdocDiffPortable
+```
+
+如果你想指定输出根目录，可以直接给 `.bat` 传参，参数会透传给 `build_portable.ps1`：
+
+```bat
+build_portable.bat -OutputRoot "D:\YourOutput"
+```
+
+打包脚本会自动完成以下步骤：
+
+- 关闭正在运行的旧绿色包进程
+- 清理项目内的 `build/` 和 `dist/`
+- 调用 `PyInstaller` 重新打包
+- 复制绿色包到目标输出目录
+- 生成绿色包内的 `user_data/config/settings.json`
+- 检查 `RenderdocDiffPortable\RenderdocDiffTools.exe` 是否生成成功，并在成功后自动打开输出文件夹
+
+打包完成后，直接运行以下文件即可：
+
+```text
+RenderdocDiffPortable\RenderdocDiffTools.exe
+```
 
 ### 首次配置
 
@@ -130,3 +177,4 @@ RenderdocDiffTools.spec  PyInstaller 打包配置
 
 - [RenderDoc Web UI 技术方案](docs/RENDERDOC_WEBUI_TECHNICAL_PLAN.md)
 - [RenderDoc 与 UE 自动诊断方案](docs/RENDERDOC_UE_AUTOMATION_PLAN.md)
+- [RenderDoc Comparison Tool](https://git.woa.com/xinhou/renderdoc_cmp/tree/v1.x/renderdoccmp)
