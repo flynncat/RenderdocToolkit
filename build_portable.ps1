@@ -1,5 +1,6 @@
 param(
-    [string]$OutputRoot = "G:\RenderdocDiffTools"
+    [string]$OutputRoot = "G:\RenderdocDiffTools",
+    [switch]$SkipSmokeTest
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,6 +11,45 @@ $BuildRoot = Join-Path $ProjectRoot "build"
 $SpecPath = Join-Path $ProjectRoot "RenderdocDiffTools.spec"
 $PortableDir = Join-Path $OutputRoot "RenderdocDiffPortable"
 $SourceSettingsPath = Join-Path $ProjectRoot "config\settings.json"
+$UserSettingsPath = Join-Path $ProjectRoot "user_data\config\settings.json"
+
+function Read-SettingsFile([string]$Path) {
+    if (-not (Test-Path $Path)) {
+        return $null
+    }
+    try {
+        return Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        return $null
+    }
+}
+
+function Get-FirstNonEmptyValue([object[]]$Values) {
+    foreach ($Value in $Values) {
+        if ($null -eq $Value) {
+            continue
+        }
+        $Text = [string]$Value
+        if (-not [string]::IsNullOrWhiteSpace($Text)) {
+            return $Text.Trim()
+        }
+    }
+    return ""
+}
+
+function Resolve-ExistingPath([object[]]$Candidates) {
+    foreach ($Candidate in $Candidates) {
+        $Text = Get-FirstNonEmptyValue @($Candidate)
+        if ($Text -and (Test-Path $Text)) {
+            try {
+                return (Resolve-Path $Text).Path
+            } catch {
+                return $Text
+            }
+        }
+    }
+    return ""
+}
 
 Write-Host "== Build RenderdocDiffTools portable ==" -ForegroundColor Cyan
 
@@ -19,14 +59,8 @@ if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
 
 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
 
-$SourceSettings = $null
-if (Test-Path $SourceSettingsPath) {
-    try {
-        $SourceSettings = Get-Content $SourceSettingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    } catch {
-        $SourceSettings = $null
-    }
-}
+$SourceSettings = Read-SettingsFile $SourceSettingsPath
+$UserSettings = Read-SettingsFile $UserSettingsPath
 
 $PortableExe = Join-Path $PortableDir "RenderdocDiffTools.exe"
 $PortableProcesses = @(Get-CimInstance Win32_Process -Filter "Name = 'RenderdocDiffTools.exe'" |
@@ -76,6 +110,40 @@ Copy-Item $BuiltDir $PortableDir -Recurse -Force
 $UserDataConfigDir = Join-Path $PortableDir "user_data\config"
 New-Item -ItemType Directory -Force -Path $UserDataConfigDir | Out-Null
 
+$SourceCmpRoot = ""
+if ($null -ne $SourceSettings) {
+    $SourceCmpRoot = [string]$SourceSettings.renderdoc_cmp_root
+}
+$UserCmpRoot = ""
+if ($null -ne $UserSettings) {
+    $UserCmpRoot = [string]$UserSettings.renderdoc_cmp_root
+}
+$SourceRenderdocPythonPath = ""
+if ($null -ne $SourceSettings) {
+    $SourceRenderdocPythonPath = [string]$SourceSettings.renderdoc_python_path
+}
+$UserRenderdocPythonPath = ""
+if ($null -ne $UserSettings) {
+    $UserRenderdocPythonPath = [string]$UserSettings.renderdoc_python_path
+}
+
+$DetectedCmpRoot = Resolve-ExistingPath @(
+    $env:RENDERDOC_WEBUI_CMP_ROOT,
+    $SourceCmpRoot,
+    $UserCmpRoot,
+    "G:\UGit\renderdoc_cmp\renderdoccmp",
+    "G:\UGit\renderdoc_cmp",
+    "D:\UGit\renderdoc_cmp\renderdoccmp",
+    "D:\UGit\renderdoc_cmp",
+    "C:\UGit\renderdoc_cmp\renderdoccmp",
+    "C:\UGit\renderdoc_cmp"
+)
+$DetectedRenderdocPythonPath = Get-FirstNonEmptyValue @(
+    $env:RENDERDOC_PYTHON_PATH,
+    $SourceRenderdocPythonPath,
+    $UserRenderdocPythonPath
+)
+
 $Settings = @{
     host = "127.0.0.1"
     port = 8010
@@ -85,8 +153,8 @@ $Settings = @{
     openai_model = if ($env:RENDERDOC_WEBUI_OPENAI_MODEL) { $env:RENDERDOC_WEBUI_OPENAI_MODEL } else { "" }
     openai_timeout_seconds = if ($env:RENDERDOC_WEBUI_OPENAI_TIMEOUT_SECONDS) { [double]$env:RENDERDOC_WEBUI_OPENAI_TIMEOUT_SECONDS } else { 60 }
     llm_max_context_chars = 24000
-    renderdoc_python_path = if ($env:RENDERDOC_PYTHON_PATH) { $env:RENDERDOC_PYTHON_PATH } elseif ($null -ne $SourceSettings -and $null -ne $SourceSettings.renderdoc_python_path) { [string]$SourceSettings.renderdoc_python_path } else { "" }
-    renderdoc_cmp_root = if ($null -ne $SourceSettings -and $null -ne $SourceSettings.renderdoc_cmp_root) { [string]$SourceSettings.renderdoc_cmp_root } else { "" }
+    renderdoc_python_path = $DetectedRenderdocPythonPath
+    renderdoc_cmp_root = $DetectedCmpRoot
     setup_completed = $true
 }
 
@@ -112,5 +180,17 @@ $ReadmeLines = @(
 $Readme = [string]::Join([Environment]::NewLine, $ReadmeLines)
 
 Set-Content -Path (Join-Path $PortableDir "README_PORTABLE.txt") -Value $Readme -Encoding UTF8
+
+if (-not $SkipSmokeTest) {
+    $SmokeTestScript = Join-Path $ProjectRoot "smoke_test_packaged.py"
+    if (-not (Test-Path $SmokeTestScript)) {
+        throw "Smoke test script not found: $SmokeTestScript"
+    }
+    Write-Host "== Run packaged regression ==" -ForegroundColor Cyan
+    python $SmokeTestScript
+    if ($LASTEXITCODE -ne 0) {
+        throw "Packaged regression failed."
+    }
+}
 
 Write-Host "Portable build created at: $PortableDir" -ForegroundColor Green
