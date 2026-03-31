@@ -1,0 +1,35 @@
+# Output directories
+output/
+*.zip
+*.zip.xml
+*_extracted/
+sample/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test outputs
+test_*.html
+test_*.png
+thumb_*.png
+
+# Logs
+*.log

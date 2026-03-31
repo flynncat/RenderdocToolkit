@@ -36,3 +36,8 @@ second_round_out/
 
 # Tool runtime noise
 **/__pycache__/
+external_tools/renderdoccmp/output/
+external_tools/renderdoccmp/**/*.zip
+external_tools/renderdoccmp/**/*.zip.xml
+external_tools/renderdoccmp/**/*_extracted/
+external_tools/renderdoccmp/**/__pycache__/

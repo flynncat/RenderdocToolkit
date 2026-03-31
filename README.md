@@ -86,7 +86,9 @@ build_portable.bat -OutputRoot "D:\YourOutput"
 - 清理项目内的 `build/` 和 `dist/`
 - 调用 `PyInstaller` 重新打包
 - 复制绿色包到目标输出目录
+- 打包仓库内置的 `external_tools/renderdoccmp` 运行时
 - 生成绿色包内的 `user_data/config/settings.json`
+- 自动执行绿色包冒烟测试
 - 检查 `RenderdocDiffPortable\RenderdocDiffTools.exe` 是否生成成功，并在成功后自动打开输出文件夹
 
 打包完成后，直接运行以下文件即可：
@@ -107,6 +109,8 @@ RenderdocDiffPortable\RenderdocDiffTools.exe
 - `renderdoc_cmp 根目录`
 
 如果不配置在线模型，工具会使用本地回退逻辑完成基础问答与分析流程。
+
+当前仓库已经内置 `renderdoc_cmp` 运行时，默认打包和绿色包运行不再依赖单独下载外部 `renderdoc_cmp` 仓库；只有当你想显式覆盖内置版本时，才需要额外填写 `renderdoc_cmp 根目录`。
 
 ## 使用文档
 

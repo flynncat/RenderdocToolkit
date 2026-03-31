@@ -10,6 +10,7 @@ $DistRoot = Join-Path $ProjectRoot "dist"
 $BuildRoot = Join-Path $ProjectRoot "build"
 $SpecPath = Join-Path $ProjectRoot "RenderdocDiffTools.spec"
 $PortableDir = Join-Path $OutputRoot "RenderdocDiffPortable"
+$BundledCmpRoot = Join-Path $ProjectRoot "external_tools\renderdoccmp"
 $SourceSettingsPath = Join-Path $ProjectRoot "config\settings.json"
 $UserSettingsPath = Join-Path $ProjectRoot "user_data\config\settings.json"
 
@@ -55,6 +56,9 @@ Write-Host "== Build RenderdocDiffTools portable ==" -ForegroundColor Cyan
 
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
     throw "Python not found."
+}
+if (-not (Test-Path (Join-Path $BundledCmpRoot "rdc_compare_ultimate.py"))) {
+    throw "Bundled renderdoc_cmp runtime not found: $BundledCmpRoot"
 }
 
 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
@@ -110,14 +114,6 @@ Copy-Item $BuiltDir $PortableDir -Recurse -Force
 $UserDataConfigDir = Join-Path $PortableDir "user_data\config"
 New-Item -ItemType Directory -Force -Path $UserDataConfigDir | Out-Null
 
-$SourceCmpRoot = ""
-if ($null -ne $SourceSettings) {
-    $SourceCmpRoot = [string]$SourceSettings.renderdoc_cmp_root
-}
-$UserCmpRoot = ""
-if ($null -ne $UserSettings) {
-    $UserCmpRoot = [string]$UserSettings.renderdoc_cmp_root
-}
 $SourceRenderdocPythonPath = ""
 if ($null -ne $SourceSettings) {
     $SourceRenderdocPythonPath = [string]$SourceSettings.renderdoc_python_path
@@ -127,21 +123,13 @@ if ($null -ne $UserSettings) {
     $UserRenderdocPythonPath = [string]$UserSettings.renderdoc_python_path
 }
 
-$DetectedCmpRoot = Resolve-ExistingPath @(
-    $env:RENDERDOC_WEBUI_CMP_ROOT,
-    $SourceCmpRoot,
-    $UserCmpRoot,
-    "G:\UGit\renderdoc_cmp\renderdoccmp",
-    "G:\UGit\renderdoc_cmp",
-    "D:\UGit\renderdoc_cmp\renderdoccmp",
-    "D:\UGit\renderdoc_cmp",
-    "C:\UGit\renderdoc_cmp\renderdoccmp",
-    "C:\UGit\renderdoc_cmp"
-)
 $DetectedRenderdocPythonPath = Get-FirstNonEmptyValue @(
     $env:RENDERDOC_PYTHON_PATH,
     $SourceRenderdocPythonPath,
     $UserRenderdocPythonPath
+)
+$ConfiguredCmpRoot = Get-FirstNonEmptyValue @(
+    $env:RENDERDOC_WEBUI_CMP_ROOT
 )
 
 $Settings = @{
@@ -154,7 +142,8 @@ $Settings = @{
     openai_timeout_seconds = if ($env:RENDERDOC_WEBUI_OPENAI_TIMEOUT_SECONDS) { [double]$env:RENDERDOC_WEBUI_OPENAI_TIMEOUT_SECONDS } else { 60 }
     llm_max_context_chars = 24000
     renderdoc_python_path = $DetectedRenderdocPythonPath
-    renderdoc_cmp_root = $DetectedCmpRoot
+    # Leave cmp root empty by default so packaged builds use the bundled runtime under external_tools/renderdoccmp.
+    renderdoc_cmp_root = $ConfiguredCmpRoot
     setup_completed = $true
 }
 
@@ -187,6 +176,8 @@ if (-not $SkipSmokeTest) {
         throw "Smoke test script not found: $SmokeTestScript"
     }
     Write-Host "== Run packaged regression ==" -ForegroundColor Cyan
+    $env:RENDERDOC_PORTABLE_OUTPUT_ROOT = $OutputRoot
+    $env:RENDERDOC_PORTABLE_EXE = $PortableExe
     python $SmokeTestScript
     if ($LASTEXITCODE -ne 0) {
         throw "Packaged regression failed."

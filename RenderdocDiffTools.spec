@@ -11,7 +11,7 @@ datas = [
     ("app/static", "app/static"),
     (".cursor/skills/renderdoc-compare-diagnose", ".cursor/skills/renderdoc-compare-diagnose"),
     ("docs", "docs"),
-    (r"G:\UGit\renderdoc_cmp\renderdoccmp", "external_tools/renderdoccmp"),
+    ("external_tools/renderdoccmp", "external_tools/renderdoccmp"),
 ]
 
 a = Analysis(

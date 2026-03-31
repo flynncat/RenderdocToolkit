@@ -85,7 +85,9 @@ def _get_setting(name: str, default: str = "") -> str:
     }
     mapped = key_map.get(name)
     if mapped and mapped in SETTINGS:
-        return str(SETTINGS[mapped])
+        value = str(SETTINGS[mapped]).strip()
+        if value != "":
+            return value
     return default
 
 

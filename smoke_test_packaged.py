@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import time
 import urllib.parse
@@ -12,8 +13,14 @@ from typing import Any
 from playwright.async_api import async_playwright
 
 
-PROJECT_ROOT = Path(r"G:\RenderdocSKillEvn")
-EXE_PATH = Path(r"G:\RenderdocDiffTools\RenderdocDiffPortable\RenderdocDiffTools.exe")
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_OUTPUT_ROOT = Path(os.getenv("RENDERDOC_PORTABLE_OUTPUT_ROOT", r"G:\RenderdocDiffTools"))
+EXE_PATH = Path(
+    os.getenv(
+        "RENDERDOC_PORTABLE_EXE",
+        str(DEFAULT_OUTPUT_ROOT / "RenderdocDiffPortable" / "RenderdocDiffTools.exe"),
+    )
+)
 USER_DATA = EXE_PATH.parent / "user_data"
 LOG_PATH = USER_DATA / "logs" / "launcher.log"
 
@@ -51,19 +58,19 @@ def wait_for_health(base_url: str, timeout_seconds: int = 30) -> dict[str, Any]:
     raise RuntimeError(f"健康检查超时: {last_error}")
 
 
-def choose_rdc_files() -> tuple[Path, Path]:
+def choose_rdc_files() -> tuple[Path, Path] | None:
     captures = sorted(PROJECT_ROOT.glob("*.rdc"))
     if len(captures) < 2:
-        raise RuntimeError("未找到足够的 .rdc 测试文件")
+        return None
     return captures[0], captures[1]
 
 
-def choose_csv_file() -> Path:
+def choose_csv_file() -> Path | None:
     candidates = sorted(PROJECT_ROOT.glob("*.csv"))
     if not candidates:
         candidates = sorted((PROJECT_ROOT / "export_jobs").rglob("*.csv"))
     if not candidates:
-        raise RuntimeError("未找到 CSV 测试文件")
+        return None
     return candidates[0]
 
 
@@ -120,6 +127,12 @@ def build_convert_mapping(inspect_result: dict[str, Any]) -> dict[str, str]:
     }
     ensure(bool(mapping["position"]), "CSV 自动识别没有给出 position 列")
     return mapping
+
+
+def choose_optional_fixtures() -> tuple[tuple[Path, Path] | None, Path | None]:
+    captures = choose_rdc_files()
+    csv_path = choose_csv_file()
+    return captures, csv_path
 
 
 def run_api_regression(base_url: str, before_rdc: Path, after_rdc: Path, csv_path: Path) -> dict[str, Any]:
@@ -243,6 +256,19 @@ def run_api_regression(base_url: str, before_rdc: Path, after_rdc: Path, csv_pat
     return results
 
 
+def run_basic_api_smoke(base_url: str) -> dict[str, Any]:
+    health = wait_for_health(base_url)
+    ensure(bool(health.get("rdc", {}).get("ok")), "RenderDoc CLI 健康检查失败")
+    ensure(bool(health.get("renderdoc_cmp", {}).get("ok")), "内置 renderdoc_cmp 健康检查失败")
+    return {
+        "mode": "basic",
+        "health": {
+            "rdc": bool(health.get("rdc", {}).get("ok")),
+            "cmp": bool(health.get("renderdoc_cmp", {}).get("ok")),
+        },
+    }
+
+
 async def close_setup_if_needed(page: Any) -> None:
     close_button = page.locator("#setup-close-btn")
     if await close_button.count():
@@ -337,9 +363,51 @@ async def run_ui_regression(base_url: str, before_rdc: Path, after_rdc: Path, cs
     ensure(not actionable_console_errors, f"UI 控制台报错: {actionable_console_errors[:1]}")
 
 
+async def run_basic_ui_smoke(base_url: str) -> None:
+    console_errors: list[str] = []
+    page_errors: list[str] = []
+    dialogs: list[str] = []
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(channel="msedge", headless=True)
+        page = await browser.new_page(viewport={"width": 1600, "height": 980}, device_scale_factor=1)
+        page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+
+        def handle_console(message: Any) -> None:
+            if message.type == "error":
+                text = message.text or ""
+                if "favicon" not in text.lower():
+                    console_errors.append(text)
+
+        page.on("console", handle_console)
+
+        async def handle_dialog(dialog: Any) -> None:
+            dialogs.append(dialog.message)
+            await dialog.accept()
+
+        page.on("dialog", handle_dialog)
+
+        await page.goto(base_url, wait_until="networkidle")
+        await close_setup_if_needed(page)
+
+        for tab_name in ("diagnose", "cmp", "perf", "asset-export"):
+            await page.click(f'.tab-btn[data-tab="{tab_name}"]')
+            workspace = page.locator(f"#workspace-{tab_name}")
+            await workspace.wait_for(state="visible", timeout=5000)
+
+        await browser.close()
+
+    ensure(not dialogs, f"UI 交互出现弹窗错误: {dialogs[:1]}")
+    ensure(not page_errors, f"UI 出现未捕获异常: {page_errors[:1]}")
+    actionable_console_errors = [item for item in console_errors if "TypeError" in item or "ReferenceError" in item or "Failed to fetch" in item]
+    ensure(not actionable_console_errors, f"UI 控制台报错: {actionable_console_errors[:1]}")
+
+
 def main() -> None:
-    before_rdc, after_rdc = choose_rdc_files()
-    csv_path = choose_csv_file()
+    if not EXE_PATH.exists():
+        raise RuntimeError(f"未找到绿色包可执行文件: {EXE_PATH}")
+
+    capture_pair, csv_path = choose_optional_fixtures()
     stop_existing_portable_processes()
     cleanup_old_log()
 
@@ -353,9 +421,16 @@ def main() -> None:
             json.dumps({"rdc": health["rdc"]["ok"], "cmp": health["renderdoc_cmp"]["ok"]}, ensure_ascii=False),
         )
 
-        results = run_api_regression(base_url, before_rdc, after_rdc, csv_path)
-        asyncio.run(run_ui_regression(base_url, before_rdc, after_rdc, csv_path))
-        print("ui_regression: passed")
+        if capture_pair and csv_path:
+            before_rdc, after_rdc = capture_pair
+            results = run_api_regression(base_url, before_rdc, after_rdc, csv_path)
+            asyncio.run(run_ui_regression(base_url, before_rdc, after_rdc, csv_path))
+            print("ui_regression: passed")
+        else:
+            results = run_basic_api_smoke(base_url)
+            asyncio.run(run_basic_ui_smoke(base_url))
+            print("ui_smoke: basic")
+            print("fixture_notice: 未找到本地 .rdc/.csv 测试数据，已退化为启动与页面基础冒烟")
         print("summary:", json.dumps(results, ensure_ascii=False))
     finally:
         stop_process_tree(proc.pid)
