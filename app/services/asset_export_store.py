@@ -25,6 +25,7 @@ class AssetExportStore:
             job_dir / "inputs",
             job_dir / "exports" / "csv",
             job_dir / "exports" / "models",
+            job_dir / "exports" / "shaders",
             job_dir / "exports" / "textures",
             job_dir / "artifacts",
         ):
@@ -52,6 +53,7 @@ class AssetExportStore:
                 "selected_passes": [],
                 "csv_files": [],
                 "model_files": [],
+                "shader_files": [],
                 "texture_files": [],
                 "failed_items": [],
             },

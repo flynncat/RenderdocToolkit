@@ -76,6 +76,7 @@ class AssetExportService:
         model_files: List[str] = []
         csv_files: List[str] = []
         texture_files: List[str] = []
+        shader_files: List[str] = []
 
         self.store.write_text_artifact(job_id, "artifacts/job.log", "资产导出开始\n")
         self.store.update_metadata(
@@ -173,15 +174,20 @@ class AssetExportService:
                             "mesh_obj": "",
                             "mesh_fbx": "",
                             "mesh_csv": "",
+                            "shader_vertex": "",
+                            "shader_fragment": "",
+                            "shader_params": "",
                             "textures": [],
                         }
                         pass_manifest["draws"].append(draw_manifest)
 
                         model_dir = output_root / "models" / pass_slug
                         csv_dir = output_root / "csv" / pass_slug
+                        shader_dir = output_root / "shaders" / pass_slug
                         texture_dir = output_root / "textures" / pass_slug
                         model_dir.mkdir(parents=True, exist_ok=True)
                         csv_dir.mkdir(parents=True, exist_ok=True)
+                        shader_dir.mkdir(parents=True, exist_ok=True)
                         texture_dir.mkdir(parents=True, exist_ok=True)
 
                         mesh_obj_path = model_dir / f"{draw_slug}.obj"
@@ -246,6 +252,46 @@ class AssetExportService:
                                 )
                                 self._append_log(job_id, f"[mesh-failed] eid={eid} convert={exc}")
 
+                        if direct_replay is None:
+                            failed_items.append(
+                                {
+                                    "type": "shader-export",
+                                    "pass_name": pass_item["name"],
+                                    "eid": eid,
+                                    "reason": direct_replay_error or "direct replay unavailable",
+                                }
+                            )
+                            self._append_log(job_id, f"[shader-failed] eid={eid} export={direct_replay_error or 'direct replay unavailable'}")
+                        else:
+                            try:
+                                shader_info = direct_replay.export_draw_shader_bundle(
+                                    eid=str(eid),
+                                    output_dir=shader_dir,
+                                    base_name=draw_slug,
+                                )
+                                for stage_key, target_key in (("vertex", "shader_vertex"), ("fragment", "shader_fragment")):
+                                    stage_item = (shader_info.get("stages") or {}).get(stage_key) or {}
+                                    stage_path = self._stringify(stage_item.get("path"))
+                                    if not stage_path:
+                                        continue
+                                    artifact_path = self._artifact_ref(job_dir, Path(stage_path))
+                                    draw_manifest[target_key] = artifact_path
+                                    shader_files.append(artifact_path)
+                                shader_params_path = self._stringify(shader_info.get("params_path"))
+                                if shader_params_path:
+                                    draw_manifest["shader_params"] = self._artifact_ref(job_dir, Path(shader_params_path))
+                                    shader_files.append(draw_manifest["shader_params"])
+                            except Exception as exc:
+                                failed_items.append(
+                                    {
+                                        "type": "shader-export",
+                                        "pass_name": pass_item["name"],
+                                        "eid": eid,
+                                        "reason": str(exc),
+                                    }
+                                )
+                                self._append_log(job_id, f"[shader-failed] eid={eid} error={exc}")
+
                         try:
                             bindings_payload = self._run_json(["rdc", "bindings", str(eid), "--json"])
                             texture_bindings = self._extract_texture_bindings(str(eid), bindings_payload, texture_resources)
@@ -305,6 +351,7 @@ class AssetExportService:
                         "selected_passes": manifest["selected_passes"],
                         "csv_files": csv_files,
                         "model_files": model_files,
+                        "shader_files": shader_files,
                         "texture_files": texture_files,
                         "failed_items": failed_items,
                     },

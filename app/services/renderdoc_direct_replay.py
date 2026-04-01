@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import gc
+import json
 import struct
 import sys
 import threading
@@ -424,11 +425,184 @@ class RenderdocDirectReplay:
             "stage": "vsin",
         }
 
+    def export_draw_shader_bundle(
+        self,
+        *,
+        eid: str | int,
+        output_dir: str | Path,
+        base_name: str,
+    ) -> Dict[str, Any]:
+        if self.controller is None or self.rd is None:
+            raise RuntimeError("RenderDoc replay is not opened")
+
+        event_id = int(str(eid).strip())
+        self._set_frame_event(event_id)
+        pipe = self.controller.GetPipelineState()
+        pipeline_object = pipe.GetGraphicsPipelineObject()
+        output_root = Path(output_dir)
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        stages: Dict[str, Dict[str, Any]] = {}
+        params_payload: Dict[str, Any] = {
+            "eid": str(event_id),
+            "stages": {},
+        }
+
+        for stage_key, stage_enum, file_suffix in (
+            ("vertex", self.rd.ShaderStage.Vertex, "vs"),
+            ("fragment", self.rd.ShaderStage.Pixel, "fs"),
+        ):
+            stage_payload = self._collect_shader_stage_data(
+                pipe=pipe,
+                pipeline_object=pipeline_object,
+                stage_enum=stage_enum,
+            )
+            if stage_payload is None:
+                continue
+
+            source_path = output_root / f"{base_name}_{file_suffix}.glsl"
+            source_path.write_text(
+                self._build_shader_source_text(stage_key, stage_payload),
+                encoding="utf-8",
+            )
+            stages[stage_key] = {
+                "path": str(source_path),
+                "target": stage_payload["selected_target"],
+                "entry_point": stage_payload["entry_point"],
+                "resource_id": stage_payload["resource_id"],
+            }
+            params_payload["stages"][stage_key] = {
+                "resource_id": stage_payload["resource_id"],
+                "entry_point": stage_payload["entry_point"],
+                "selected_target": stage_payload["selected_target"],
+                "available_targets": stage_payload["available_targets"],
+                "source_debug_information": stage_payload["source_debug_information"],
+                "constant_blocks": stage_payload["constant_blocks"],
+                "read_only_resources": stage_payload["read_only_resources"],
+                "read_write_resources": stage_payload["read_write_resources"],
+                "samplers": stage_payload["samplers"],
+            }
+
+        params_path = output_root / f"{base_name}_shader_params.json"
+        params_path.write_text(json.dumps(params_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {
+            "eid": str(event_id),
+            "stages": stages,
+            "params_path": str(params_path),
+        }
+
     def _set_frame_event(self, eid: int) -> None:
         if self._current_eid == eid:
             return
         self.controller.SetFrameEvent(eid, True)
         self._current_eid = eid
+
+    def _collect_shader_stage_data(
+        self,
+        *,
+        pipe: Any,
+        pipeline_object: Any,
+        stage_enum: Any,
+    ) -> Optional[Dict[str, Any]]:
+        reflection = pipe.GetShaderReflection(stage_enum)
+        if reflection is None:
+            return None
+
+        shader_id = self._stringify(getattr(reflection, "resourceId", None))
+        if not shader_id or shader_id == "ResourceId::0":
+            return None
+
+        entry_point = self._stringify(pipe.GetShaderEntryPoint(stage_enum))
+        available_targets = [self._stringify(item) for item in list(self.controller.GetDisassemblyTargets(True)) if self._stringify(item)]
+        selected_target = self._pick_shader_target(available_targets)
+        disassembly = self.controller.DisassembleShader(pipeline_object, reflection, selected_target or "")
+
+        return {
+            "resource_id": shader_id,
+            "entry_point": entry_point,
+            "available_targets": available_targets,
+            "selected_target": selected_target,
+            "source_debug_information": bool(getattr(reflection, "sourceDebugInformation", False)),
+            "disassembly": disassembly,
+            "constant_blocks": self._collect_constant_blocks(
+                pipe=pipe,
+                pipeline_object=pipeline_object,
+                reflection=reflection,
+                stage_enum=stage_enum,
+                entry_point=entry_point,
+            ),
+            "read_only_resources": self._serialize_shader_bindings(getattr(reflection, "readOnlyResources", []) or []),
+            "read_write_resources": self._serialize_shader_bindings(getattr(reflection, "readWriteResources", []) or []),
+            "samplers": self._serialize_shader_bindings(getattr(reflection, "samplers", []) or []),
+        }
+
+    def _collect_constant_blocks(
+        self,
+        *,
+        pipe: Any,
+        pipeline_object: Any,
+        reflection: Any,
+        stage_enum: Any,
+        entry_point: str,
+    ) -> list[Dict[str, Any]]:
+        result: list[Dict[str, Any]] = []
+        for block_index, block in enumerate(list(getattr(reflection, "constantBlocks", []) or [])):
+            binding_set = int(getattr(block, "fixedBindSetOrSpace", 0) or 0)
+            binding_slot = int(getattr(block, "fixedBindNumber", block_index) or block_index)
+            block_payload: Dict[str, Any] = {
+                "index": block_index,
+                "name": self._stringify(getattr(block, "name", "")) or f"cbuffer_{block_index}",
+                "bind_set_or_space": binding_set,
+                "bind_number": binding_slot,
+                "byte_size": int(getattr(block, "byteSize", 0) or 0),
+                "buffer_backed": bool(getattr(block, "bufferBacked", False)),
+                "compile_constants": bool(getattr(block, "compileConstants", False)),
+                "variables": [],
+                "resource_id": "",
+                "error": "",
+            }
+            try:
+                bound_block = self._resolve_constant_block_binding(pipe, stage_enum, block_index, binding_set, binding_slot)
+                resource_id = getattr(getattr(bound_block, "descriptor", None), "resource", None)
+                block_payload["resource_id"] = self._stringify(resource_id)
+                values = self.controller.GetCBufferVariableContents(
+                    pipeline_object,
+                    getattr(reflection, "resourceId"),
+                    stage_enum,
+                    entry_point,
+                    block_index,
+                    resource_id,
+                    0,
+                    0,
+                )
+                block_payload["variables"] = [self._serialize_shader_variable(item) for item in list(values or [])]
+            except Exception as exc:
+                block_payload["error"] = str(exc)
+            result.append(block_payload)
+        return result
+
+    def _resolve_constant_block_binding(
+        self,
+        pipe: Any,
+        stage_enum: Any,
+        block_index: int,
+        binding_set: int,
+        binding_slot: int,
+    ) -> Any:
+        candidates = [
+            (binding_set, binding_slot),
+            (0, binding_slot),
+            (0, block_index),
+        ]
+        last_error: Optional[Exception] = None
+        for set_idx, bind_idx in candidates:
+            try:
+                return pipe.GetConstantBlock(stage_enum, set_idx, bind_idx)
+            except Exception as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("无法解析 constant block 绑定")
 
     def _get_action(self, eid: int) -> Any:
         if eid in self._action_map:
@@ -563,6 +737,93 @@ class RenderdocDirectReplay:
             except (TypeError, ValueError):
                 continue
         return 0.0
+
+    @staticmethod
+    def _pick_shader_target(targets: list[str]) -> str:
+        if not targets:
+            return ""
+        lowered = [(item, item.lower()) for item in targets]
+        for keyword in ("glsl", "opengl"):
+            for original, text in lowered:
+                if keyword in text:
+                    return original
+        return targets[0]
+
+    @staticmethod
+    def _build_shader_source_text(stage_key: str, payload: Dict[str, Any]) -> str:
+        target = str(payload.get("selected_target") or "").strip()
+        resource_id = str(payload.get("resource_id") or "").strip()
+        header = [
+            f"// Stage: {stage_key}",
+            f"// Shader ResourceId: {resource_id or '-'}",
+            f"// Entry Point: {payload.get('entry_point') or '-'}",
+            f"// RenderDoc Target: {target or 'default'}",
+        ]
+        if "glsl" not in target.lower():
+            header.append("// Note: RenderDoc did not expose a GLSL target for this shader, so this file contains the best available text output.")
+        return "\n".join(header) + "\n\n" + str(payload.get("disassembly") or "")
+
+    def _serialize_shader_variable(self, variable: Any) -> Dict[str, Any]:
+        members = [self._serialize_shader_variable(item) for item in list(getattr(variable, "members", []) or [])]
+        variable_type = getattr(variable, "type", None)
+        base_type = self._stringify(getattr(variable_type, "baseType", "")) or self._stringify(getattr(variable, "type", ""))
+        payload: Dict[str, Any] = {
+            "name": self._stringify(getattr(variable, "name", "")),
+            "type": base_type.split(".")[-1] if "." in base_type else base_type,
+            "rows": int(getattr(variable, "rows", 0) or 0),
+            "columns": int(getattr(variable, "columns", 0) or 0),
+            "members": members,
+        }
+        if not members:
+            payload["value"] = self._extract_shader_variable_value(variable, payload["type"])
+        return payload
+
+    def _extract_shader_variable_value(self, variable: Any, type_name: str) -> Any:
+        total = max(int(getattr(variable, "rows", 0) or 0) * int(getattr(variable, "columns", 0) or 0), 1)
+        source_attr = {
+            "Float": "f32v",
+            "Double": "f64v",
+            "Half": "f16v",
+            "SInt": "s32v",
+            "UInt": "u32v",
+            "SShort": "s16v",
+            "UShort": "u16v",
+            "SLong": "s64v",
+            "ULong": "u64v",
+            "SByte": "s8v",
+            "UByte": "u8v",
+            "Bool": "u32v",
+            "Enum": "s32v",
+        }.get(type_name, "f32v")
+        raw = list(getattr(getattr(variable, "value", None), source_attr, ())[:total])
+        if type_name == "Bool":
+            raw = [bool(item) for item in raw]
+        rows = max(int(getattr(variable, "rows", 0) or 0), 1)
+        columns = max(int(getattr(variable, "columns", 0) or 0), 1)
+        if rows == 1 and columns == 1:
+            return raw[0] if raw else 0
+        if rows == 1:
+            return raw
+        matrix = []
+        for row_idx in range(rows):
+            start = row_idx * columns
+            matrix.append(raw[start : start + columns])
+        return matrix
+
+    def _serialize_shader_bindings(self, items: list[Any]) -> list[Dict[str, Any]]:
+        result: list[Dict[str, Any]] = []
+        for item in list(items or []):
+            result.append(
+                {
+                    "name": self._stringify(getattr(item, "name", "")),
+                    "bind_set_or_space": int(getattr(item, "fixedBindSetOrSpace", 0) or 0),
+                    "bind_number": int(getattr(item, "fixedBindNumber", 0) or 0),
+                    "array_size": int(getattr(item, "bindArraySize", 1) or 1),
+                    "is_texture": bool(getattr(item, "isTexture", False)),
+                    "is_read_only": bool(getattr(item, "isReadOnly", False)),
+                }
+            )
+        return result
 
     @staticmethod
     def _import_renderdoc():

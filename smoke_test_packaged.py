@@ -230,6 +230,28 @@ def run_api_regression(base_url: str, before_rdc: Path, after_rdc: Path, csv_pat
     )
     job_id = export_result["metadata"]["job_id"]
     ensure(export_result.get("metadata", {}).get("status") == "completed", "资产导出任务未完成")
+    exported_draws = [
+        draw
+        for pass_item in (export_result.get("manifest") or {}).get("items", [])
+        for draw in (pass_item.get("draws") or [])
+    ]
+    shader_draw = next(
+        (
+            draw
+            for draw in exported_draws
+            if draw.get("shader_vertex") and draw.get("shader_fragment") and draw.get("shader_params")
+        ),
+        None,
+    )
+    ensure(shader_draw is not None, "资产导出未生成 VS/FS shader 及参数文件")
+    params_url = (
+        f"{base_url}/api/asset-export/jobs/{job_id}/artifact?path="
+        f"{urllib.parse.quote(str(shader_draw.get('shader_params') or ''))}"
+    )
+    with urllib.request.urlopen(params_url, timeout=60) as response:
+        shader_params = json.loads(response.read().decode("utf-8"))
+    ensure(bool((shader_params.get("stages") or {}).get("vertex")), "shader 参数文件缺少 vertex 阶段")
+    ensure(bool((shader_params.get("stages") or {}).get("fragment")), "shader 参数文件缺少 fragment 阶段")
     print("export_job:", job_id, export_result["metadata"]["status"])
     results["export_job_id"] = job_id
 

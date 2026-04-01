@@ -782,6 +782,7 @@ function renderAssetExportSummary(detail) {
     <div><strong>说明:</strong> ${progress.message || "-"}</div>
     <div><strong>CSV:</strong> ${(result.csv_files || []).length}</div>
     <div><strong>模型:</strong> ${(result.model_files || []).length}</div>
+    <div><strong>Shader:</strong> ${(result.shader_files || []).length}</div>
     <div><strong>贴图:</strong> ${(result.texture_files || []).length}</div>
     <div><strong>失败:</strong> ${(result.failed_items || []).length}</div>
   `;
@@ -849,6 +850,15 @@ function renderAssetExportFiles(jobId, manifest) {
       }
       if (draw.mesh_fbx) {
         links.push(`<a href="/api/asset-export/jobs/${jobId}/artifact?path=${encodeURIComponent(draw.mesh_fbx)}" target="_blank" rel="noopener">FBX</a>`);
+      }
+      if (draw.shader_vertex) {
+        links.push(`<a href="/api/asset-export/jobs/${jobId}/artifact?path=${encodeURIComponent(draw.shader_vertex)}" target="_blank" rel="noopener">VS GLSL</a>`);
+      }
+      if (draw.shader_fragment) {
+        links.push(`<a href="/api/asset-export/jobs/${jobId}/artifact?path=${encodeURIComponent(draw.shader_fragment)}" target="_blank" rel="noopener">FS GLSL</a>`);
+      }
+      if (draw.shader_params) {
+        links.push(`<a href="/api/asset-export/jobs/${jobId}/artifact?path=${encodeURIComponent(draw.shader_params)}" target="_blank" rel="noopener">参数</a>`);
       }
       const textureLinks = (draw.textures || []).slice(0, 4).map((path, index) =>
         `<a href="/api/asset-export/jobs/${jobId}/artifact?path=${encodeURIComponent(path)}" target="_blank" rel="noopener">贴图${index + 1}</a>`
