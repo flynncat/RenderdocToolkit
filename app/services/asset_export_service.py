@@ -630,6 +630,18 @@ class AssetExportService:
             begin_eid = int(raw.get("begin_eid") or 0)
             end_eid = int(raw.get("end_eid") or 0)
             return self._filter_draws_by_eid_range(all_draws, begin_eid, end_eid)
+        if pass_item.get("source") == "marker":
+            target_name = pass_item.get("name", "")
+            begin_eid = self._parse_eid_value(pass_item.get("first_eid"))
+            end_eid = self._parse_eid_value(pass_item.get("last_eid"))
+            marker_draws = [draw for draw in all_draws if self._extract_draw_pass_group(draw) == target_name]
+            if begin_eid is not None and end_eid is not None:
+                return [
+                    draw
+                    for draw in marker_draws
+                    if begin_eid <= (self._parse_eid_value(self._extract_eid(draw)) or -1) <= end_eid
+                ]
+            return marker_draws
         if pass_item.get("source") == "render-pass":
             raw = pass_item.get("raw") if isinstance(pass_item.get("raw"), dict) else {}
             begin_eid = int(raw.get("begin_eid") or 0)
@@ -685,14 +697,18 @@ class AssetExportService:
 
     def _build_marker_passes_from_draws(self, draws: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         marker_items: List[Dict[str, Any]] = []
-        marker_map: Dict[str, Dict[str, Any]] = {}
+        marker_occurrence_map: Dict[str, int] = {}
+        current_item: Optional[Dict[str, Any]] = None
         for draw in draws:
             marker_name = self._extract_draw_pass_group(draw)
             if not self._is_useful_marker_name(marker_name):
+                current_item = None
                 continue
-            marker_id = f"marker:{self._slugify(marker_name) or 'marker'}"
             eid = self._extract_eid(draw)
-            if marker_id not in marker_map:
+            if current_item is None or current_item.get("name") != marker_name:
+                marker_occurrence = marker_occurrence_map.get(marker_name, 0) + 1
+                marker_occurrence_map[marker_name] = marker_occurrence
+                marker_id = f"marker:{self._slugify(marker_name) or 'marker'}:{marker_occurrence}"
                 item = {
                     "index": -1,
                     "id": marker_id,
@@ -703,11 +719,11 @@ class AssetExportService:
                     "first_eid": eid or "",
                     "last_eid": eid or "",
                     "draw_count": 0,
-                    "raw": {"marker": marker_name},
+                    "raw": {"marker": marker_name, "occurrence": marker_occurrence},
                 }
-                marker_map[marker_id] = item
                 marker_items.append(item)
-            item = marker_map[marker_id]
+                current_item = item
+            item = current_item
             item["draw_count"] += 1
             if eid:
                 if not item["first_eid"]:
@@ -812,7 +828,7 @@ class AssetExportService:
         name = str(item.get("name") or item.get("display_name") or "").strip()
         first_eid = str(item.get("first_eid") or "").strip()
         last_eid = str(item.get("last_eid") or "").strip()
-        if item.get("source") == "render-pass" and first_eid and last_eid and first_eid != last_eid:
+        if item.get("source") in {"render-pass", "marker"} and first_eid and last_eid and first_eid != last_eid:
             return f"EID {first_eid}-{last_eid} | {name}"
         if first_eid:
             return f"EID {first_eid} | {name}"
