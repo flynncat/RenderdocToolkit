@@ -476,7 +476,13 @@ class RenderdocDirectReplay:
                 "entry_point": stage_payload["entry_point"],
                 "selected_target": stage_payload["selected_target"],
                 "available_targets": stage_payload["available_targets"],
+                "export_mode": stage_payload["export_mode"],
                 "source_debug_information": stage_payload["source_debug_information"],
+                "debug_info_encoding": stage_payload["debug_info_encoding"],
+                "debug_files": [
+                    {"filename": item.get("filename", "")}
+                    for item in list(stage_payload.get("debug_files") or [])
+                ],
                 "constant_blocks": stage_payload["constant_blocks"],
                 "read_only_resources": stage_payload["read_only_resources"],
                 "read_write_resources": stage_payload["read_write_resources"],
@@ -514,8 +520,15 @@ class RenderdocDirectReplay:
 
         entry_point = self._stringify(pipe.GetShaderEntryPoint(stage_enum))
         available_targets = [self._stringify(item) for item in list(self.controller.GetDisassemblyTargets(True)) if self._stringify(item)]
+        debug_info = getattr(reflection, "debugInfo", None)
+        debug_files = self._extract_shader_debug_files(debug_info)
+        source_text = self._select_debug_source_text(debug_files)
         selected_target = self._pick_shader_target(available_targets)
-        disassembly = self.controller.DisassembleShader(pipeline_object, reflection, selected_target or "")
+        disassembly = ""
+        export_mode = "source"
+        if not source_text:
+            export_mode = "disassembly"
+            disassembly = self.controller.DisassembleShader(pipeline_object, reflection, selected_target or "")
 
         return {
             "resource_id": shader_id,
@@ -523,6 +536,10 @@ class RenderdocDirectReplay:
             "available_targets": available_targets,
             "selected_target": selected_target,
             "source_debug_information": bool(getattr(reflection, "sourceDebugInformation", False)),
+            "debug_info_encoding": self._stringify(getattr(debug_info, "encoding", "")) if debug_info is not None else "",
+            "debug_files": debug_files,
+            "source_text": source_text,
+            "export_mode": export_mode,
             "disassembly": disassembly,
             "constant_blocks": self._collect_constant_blocks(
                 pipe=pipe,
@@ -753,15 +770,44 @@ class RenderdocDirectReplay:
     def _build_shader_source_text(stage_key: str, payload: Dict[str, Any]) -> str:
         target = str(payload.get("selected_target") or "").strip()
         resource_id = str(payload.get("resource_id") or "").strip()
+        export_mode = str(payload.get("export_mode") or "disassembly").strip()
         header = [
             f"// Stage: {stage_key}",
             f"// Shader ResourceId: {resource_id or '-'}",
             f"// Entry Point: {payload.get('entry_point') or '-'}",
             f"// RenderDoc Target: {target or 'default'}",
+            f"// Export Mode: {export_mode}",
         ]
+        if export_mode == "source":
+            debug_files = list(payload.get("debug_files") or [])
+            if debug_files:
+                header.append(f"// Source File: {debug_files[0].get('filename') or '-'}")
+            header.append("// Note: Exported from RenderDoc shader debug/source files.")
+            return "\n".join(header) + "\n\n" + str(payload.get("source_text") or "")
         if "glsl" not in target.lower():
             header.append("// Note: RenderDoc did not expose a GLSL target for this shader, so this file contains the best available text output.")
         return "\n".join(header) + "\n\n" + str(payload.get("disassembly") or "")
+
+    def _extract_shader_debug_files(self, debug_info: Any) -> list[Dict[str, str]]:
+        result: list[Dict[str, str]] = []
+        if debug_info is None:
+            return result
+        for item in list(getattr(debug_info, "files", []) or []):
+            result.append(
+                {
+                    "filename": self._stringify(getattr(item, "filename", "")),
+                    "contents": str(getattr(item, "contents", "") or ""),
+                }
+            )
+        return result
+
+    @staticmethod
+    def _select_debug_source_text(debug_files: list[Dict[str, str]]) -> str:
+        for item in debug_files:
+            contents = str(item.get("contents") or "")
+            if contents.strip():
+                return contents
+        return ""
 
     def _serialize_shader_variable(self, variable: Any) -> Dict[str, Any]:
         members = [self._serialize_shader_variable(item) for item in list(getattr(variable, "members", []) or [])]
