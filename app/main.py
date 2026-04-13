@@ -14,40 +14,37 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 import app.config as app_config
-from app.services.analyzer import AnalyzerService
 from app.services.asset_export_service import AssetExportService
 from app.services.asset_export_store import AssetExportStore
-from app.services.chat_engine import ChatEngine
-from app.services.csv_model_converter import ColumnMapping, CsvModelConverter
-from app.services.eid_deep_dive import EidDeepDiveService
+from app.services.csv_model_converter import CsvModelConverter
+from app.services.fragment_glsl_to_ue426_custom_hlsl import FragmentGlslToUe426CustomHlslService
 from app.services.renderdoc_cmp_service import RenderdocCmpService
 from app.services.renderdoc_perf_service import RenderdocPerfService
 from app.services.renderdoc_perf_store import RenderdocPerfStore
-from app.services.session_store import SessionStore
-from app.services.ue_source_scanner import UESourceScannerService
+from app.services.subprocess_utils import hidden_subprocess_kwargs
+from app.services.ue_pure_graph_t3d_builder import UePureGraphT3DBuilder
+from app.services.ue_material_t3d_builder import UeMaterialT3DBuilder
 
 
-app = FastAPI(title="RenderDoc Compare Diagnose UI", version="0.1.0")
+app = FastAPI(title="RenderDoc Tools UI", version="0.1.0")
 app.mount("/static", StaticFiles(directory=app_config.STATIC_DIR), name="static")
 app.mount("/cmp-session-files", StaticFiles(directory=app_config.CMP_SESSION_ROOT), name="cmp-session-files")
 app.mount("/export-job-files", StaticFiles(directory=app_config.EXPORT_JOB_ROOT), name="export-job-files")
 app.mount("/perf-session-files", StaticFiles(directory=app_config.PERF_SESSION_ROOT), name="perf-session-files")
 templates = Jinja2Templates(directory=str(app_config.TEMPLATE_DIR))
 
-store = SessionStore()
 asset_export_store = AssetExportStore()
 perf_store = RenderdocPerfStore()
-analyzer = AnalyzerService()
-chat_engine = ChatEngine()
-eid_deep_dive_service = EidDeepDiveService()
-ue_source_scanner = UESourceScannerService()
 cmp_service = RenderdocCmpService()
 perf_service = RenderdocPerfService(perf_store)
 csv_model_converter = CsvModelConverter()
 asset_export_service = AssetExportService(asset_export_store, csv_model_converter)
+fragment_glsl_to_ue_service = FragmentGlslToUe426CustomHlslService()
+ue_material_t3d_builder = UeMaterialT3DBuilder()
+ue_pure_graph_t3d_builder = UePureGraphT3DBuilder()
 
 
-def _run_shell_command(command: list[str]) -> tuple[bool, str]:
+def _run_shell_command(command: list[str], timeout_seconds: float | None = None) -> tuple[bool, str]:
     try:
         proc = subprocess.run(
             command,
@@ -56,9 +53,19 @@ def _run_shell_command(command: list[str]) -> tuple[bool, str]:
             encoding="utf-8",
             errors="replace",
             shell=False,
+            timeout=timeout_seconds,
+            **hidden_subprocess_kwargs(),
         )
     except FileNotFoundError as exc:
         return False, str(exc)
+    except subprocess.TimeoutExpired as exc:
+        partial_output = ""
+        if exc.stdout:
+            partial_output += str(exc.stdout)
+        if exc.stderr:
+            partial_output += ("\n" if partial_output else "") + str(exc.stderr)
+        detail = partial_output.strip() or "command timed out"
+        return False, f"{detail}\n[timeout after {timeout_seconds}s]".strip()
     output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
     return proc.returncode == 0, output.strip()
 
@@ -83,6 +90,34 @@ def _require_existing_file(path_text: str, suffix: str, label: str) -> Path:
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=400, detail=f"{label} 不存在: {path}")
     return path
+
+
+def _require_existing_text_file(path_text: str, label: str, allowed_suffixes: tuple[str, ...]) -> Path:
+    path_text = (path_text or "").strip()
+    if not path_text:
+        raise HTTPException(status_code=400, detail=f"{label} 不能为空")
+    path = Path(path_text).expanduser()
+    if allowed_suffixes and path.suffix.lower() not in {item.lower() for item in allowed_suffixes}:
+        allowed_text = " / ".join(allowed_suffixes)
+        raise HTTPException(status_code=400, detail=f"{label} 必须是 {allowed_text} 文件")
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=400, detail=f"{label} 不存在: {path}")
+    return path
+
+
+def _load_optional_text_file(
+    path_text: str,
+    label: str,
+    allowed_suffixes: tuple[str, ...],
+) -> tuple[str, str]:
+    raw = (path_text or "").strip()
+    if not raw:
+        return "", "未提供，已按空值处理。"
+    try:
+        file_path = _require_existing_text_file(raw, label, allowed_suffixes)
+    except HTTPException:
+        return "", f"未找到，已忽略: {raw}"
+    return file_path.read_text(encoding="utf-8", errors="replace"), f"已读取: {file_path}"
 
 
 def _split_path_entries(path_text: str) -> list[str]:
@@ -251,10 +286,17 @@ def _run_csv_conversion_for_job(
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"{csv_file.stem}.{output_format}"
         try:
+            headers = csv_model_converter.read_headers(csv_file)
+            suggested_mapping = csv_model_converter.suggest_mapping(csv_file)
+            applied_mapping, mapping_notes = csv_model_converter.merge_override_mapping(
+                headers,
+                suggested_mapping,
+                mapping,
+            )
             csv_model_converter.convert(
                 csv_path=csv_file,
                 output_path=output_path,
-                mapping=ColumnMapping(**mapping),
+                mapping=applied_mapping,
                 fmt=output_format,
             )
         except Exception as exc:
@@ -267,6 +309,9 @@ def _run_csv_conversion_for_job(
                 "csv_source_path": str(csv_file),
                 "output_format": output_format.upper(),
                 "output_path": output_ref,
+                "mapping_suggested": suggested_mapping.to_dict(),
+                "mapping_applied": applied_mapping.to_dict(),
+                "mapping_notes": mapping_notes,
             }
         )
         if output_ref not in model_files:
@@ -293,37 +338,19 @@ def _run_csv_conversion_for_job(
     return asset_export_store.get_job_detail(job_id)
 
 
-def _session_capture_paths(session_id: str) -> tuple[Path, Path]:
-    metadata = store.load_metadata(session_id)
-    inputs = metadata.get("inputs", {})
-    before_source = (inputs.get("before_source_path") or "").strip()
-    after_source = (inputs.get("after_source_path") or "").strip()
-    if before_source and after_source:
-        before_path = Path(before_source)
-        after_path = Path(after_source)
-        if before_path.exists() and after_path.exists():
-            return before_path, after_path
-
-    session_dir = Path(store.session_root) / session_id
-    before_path = session_dir / "inputs" / "before.rdc"
-    after_path = session_dir / "inputs" / "after.rdc"
-    return before_path, after_path
-
-
 def _refresh_runtime_services() -> None:
     global cmp_service
     global perf_service
-    global chat_engine
     cmp_service = RenderdocCmpService()
     perf_service = RenderdocPerfService(perf_store)
-    chat_engine = ChatEngine()
 
 
 def _health_payload() -> dict:
     python_ok = True
     python_version = platform.python_version()
-    rdc_ok, rdc_output = _run_shell_command(["rdc", "--version"])
-    doctor_ok, doctor_output = _run_shell_command(["rdc", "doctor"])
+    rdc_ok, rdc_output = _run_shell_command(["rdc", "--version"], timeout_seconds=5)
+    # `rdc doctor` can hang in some packaged environments, so keep health checks responsive.
+    doctor_ok, doctor_output = _run_shell_command(["rdc", "doctor"], timeout_seconds=5)
     settings = app_config.current_settings()
     return {
         "python": {
@@ -337,10 +364,6 @@ def _health_payload() -> dict:
         "doctor": {
             "ok": doctor_ok,
             "output": doctor_output,
-        },
-        "analysis_script": {
-            "ok": app_config.ANALYZER_SCRIPT.exists(),
-            "path": str(app_config.ANALYZER_SCRIPT),
         },
         "renderdoc_cmp": {
             "ok": app_config.RENDERDOC_CMP_SCRIPT.exists(),
@@ -424,19 +447,6 @@ async def save_settings(
     return _health_payload()
 
 
-@app.get("/api/sessions")
-async def list_sessions() -> list[dict]:
-    return store.list_sessions()
-
-
-@app.get("/api/sessions/{session_id}")
-async def get_session(session_id: str) -> dict:
-    try:
-        return store.get_session_detail(session_id)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="session 不存在")
-
-
 @app.get("/api/renderdoc-cmp/jobs")
 async def list_cmp_jobs() -> list[dict]:
     return cmp_service.list_jobs()
@@ -486,75 +496,6 @@ async def get_asset_export_job(job_id: str) -> dict:
         return asset_export_store.get_job_detail(job_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="资产导出任务不存在")
-
-
-@app.post("/api/analyze/by-path")
-async def analyze_by_path(
-    before_path: str = Form(...),
-    after_path: str = Form(...),
-    pass_name: str = Form(...),
-    issue: str = Form(...),
-    eid_before: str = Form(""),
-    eid_after: str = Form(""),
-) -> dict:
-    if not pass_name.strip():
-        raise HTTPException(status_code=400, detail="pass 为必填项")
-    if not issue.strip():
-        raise HTTPException(status_code=400, detail="问题描述为必填项")
-
-    before_capture = _require_existing_file(before_path, ".rdc", "before_path")
-    after_capture = _require_existing_file(after_path, ".rdc", "after_path")
-
-    metadata = store.create_session(
-        pass_name=pass_name.strip(),
-        issue=issue.strip(),
-        eid_before=eid_before.strip(),
-        eid_after=eid_after.strip(),
-    )
-    session_id = metadata["session_id"]
-    session_dir = Path(store.session_root) / session_id
-    analysis_dir = session_dir / "analysis"
-
-    store.update_metadata(
-        session_id,
-        {
-            "status": "running",
-            "inputs": {
-                "before_file": str(before_capture),
-                "after_file": str(after_capture),
-                "before_source_path": str(before_capture),
-                "after_source_path": str(after_capture),
-            },
-        },
-    )
-
-    try:
-        analyzer.run_initial_analysis(
-            before_file=before_capture,
-            after_file=after_capture,
-            pass_name=pass_name.strip(),
-            issue=issue.strip(),
-            out_dir=analysis_dir,
-        )
-        analysis_json = store.load_analysis_json(session_id) or {}
-        ranked = analysis_json.get("ranked_causes", [])
-        top = ranked[0] if ranked else {}
-        store.update_metadata(
-            session_id,
-            {
-                "status": "completed",
-                "summary": {
-                    "title": issue.strip()[:40] or "RenderDoc 分析",
-                    "top_cause": top.get("title", ""),
-                    "confidence": top.get("confidence", ""),
-                },
-            },
-        )
-    except Exception as exc:
-        store.update_metadata(session_id, {"status": "failed"})
-        raise HTTPException(status_code=500, detail=f"分析失败: {exc}") from exc
-
-    return store.get_session_detail(session_id)
 
 
 @app.post("/api/renderdoc-cmp/compare/by-path")
@@ -852,6 +793,7 @@ async def create_asset_export_job(
                 color=color,
                 tangent=tangent,
             ),
+            isolated=True,
         )
     except Exception as exc:
         asset_export_store.update_metadata(
@@ -968,6 +910,7 @@ async def create_asset_export_job_by_path(
                 color=color,
                 tangent=tangent,
             ),
+            isolated=True,
         )
     except Exception as exc:
         asset_export_store.update_metadata(
@@ -1182,6 +1125,81 @@ async def convert_asset_export_csv_standalone(
     )
 
 
+@app.post("/api/shader-tools/fragment-to-ue-custom")
+async def convert_fragment_to_ue_custom(
+    fragment_source: str = Form(...),
+    vertex_source: str = Form(""),
+    shader_params_json: str = Form(""),
+) -> dict:
+    try:
+        legacy_payload = fragment_glsl_to_ue_service.convert(
+            fragment_source=fragment_source,
+            vertex_source=vertex_source,
+            shader_params_json=shader_params_json,
+        )
+        t3d_payload = ue_material_t3d_builder.build(
+            fragment_source=fragment_source,
+            vertex_source=vertex_source,
+            shader_params_json=shader_params_json,
+        )
+        pure_graph_payload = ue_pure_graph_t3d_builder.build(
+            fragment_source=fragment_source,
+            vertex_source=vertex_source,
+            shader_params_json=shader_params_json,
+        )
+        legacy_payload.update(t3d_payload)
+        legacy_payload.update(pure_graph_payload)
+        return legacy_payload
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"fragment shader 转 UE Custom 节点失败: {exc}") from exc
+
+
+@app.post("/api/shader-tools/fragment-to-ue-custom/by-path")
+async def convert_fragment_to_ue_custom_by_path(
+    fragment_path: str = Form(...),
+    vertex_path: str = Form(""),
+    shader_params_path: str = Form(""),
+) -> dict:
+    fragment_file = _require_existing_text_file(fragment_path, "fragment_path", (".glsl", ".frag", ".txt"))
+    vertex_source, vertex_status = _load_optional_text_file(vertex_path, "vertex_path", (".glsl", ".vert", ".txt"))
+    shader_params_json, shader_params_status = _load_optional_text_file(
+        shader_params_path,
+        "shader_params_path",
+        (".json", ".txt"),
+    )
+
+    try:
+        legacy_payload = fragment_glsl_to_ue_service.convert(
+            fragment_source=fragment_file.read_text(encoding="utf-8", errors="replace"),
+            vertex_source=vertex_source,
+            shader_params_json=shader_params_json,
+        )
+        t3d_payload = ue_material_t3d_builder.build(
+            fragment_source=fragment_file.read_text(encoding="utf-8", errors="replace"),
+            vertex_source=vertex_source,
+            shader_params_json=shader_params_json,
+        )
+        pure_graph_payload = ue_pure_graph_t3d_builder.build(
+            fragment_source=fragment_file.read_text(encoding="utf-8", errors="replace"),
+            vertex_source=vertex_source,
+            shader_params_json=shader_params_json,
+        )
+        legacy_payload.update(t3d_payload)
+        legacy_payload.update(pure_graph_payload)
+        legacy_payload["path_status"] = {
+            "fragment_path": f"已读取: {fragment_file}",
+            "vertex_path": vertex_status,
+            "shader_params_path": shader_params_status,
+        }
+        return legacy_payload
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"fragment shader 转 UE Custom 节点失败: {exc}") from exc
+
+
 @app.get("/api/asset-export/jobs/{job_id}/artifact")
 async def get_asset_export_artifact(job_id: str, path: str) -> FileResponse:
     try:
@@ -1204,81 +1222,6 @@ async def get_asset_export_artifact(job_id: str, path: str) -> FileResponse:
     if not candidate.exists() or not candidate.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")
     return FileResponse(path=str(candidate), filename=candidate.name)
-
-
-@app.post("/api/analyze")
-async def analyze(
-    before_file: UploadFile = File(...),
-    after_file: UploadFile = File(...),
-    pass_name: str = Form(...),
-    issue: str = Form(...),
-    eid_before: str = Form(""),
-    eid_after: str = Form(""),
-) -> dict:
-    if not pass_name.strip():
-        raise HTTPException(status_code=400, detail="pass 为必填项")
-    if not issue.strip():
-        raise HTTPException(status_code=400, detail="问题描述为必填项")
-
-    _ensure_rdc_file(before_file.filename)
-    _ensure_rdc_file(after_file.filename)
-
-    metadata = store.create_session(
-        pass_name=pass_name.strip(),
-        issue=issue.strip(),
-        eid_before=eid_before.strip(),
-        eid_after=eid_after.strip(),
-    )
-    session_id = metadata["session_id"]
-
-    before_path = Path(store.save_input_file(session_id, "before.rdc", await before_file.read()))
-    after_path = Path(store.save_input_file(session_id, "after.rdc", await after_file.read()))
-
-    store.update_metadata(
-        session_id,
-        {
-            "status": "running",
-            "inputs": {
-                "before_file": str(before_path.relative_to(before_path.parents[1])),
-                "after_file": str(after_path.relative_to(after_path.parents[1])),
-            },
-        },
-    )
-
-    analysis_dir = Path(before_path.parents[1]) / "analysis"
-    try:
-        artifacts = analyzer.run_initial_analysis(
-            before_file=before_path,
-            after_file=after_path,
-            pass_name=pass_name.strip(),
-            issue=issue.strip(),
-            out_dir=analysis_dir,
-        )
-        analysis_json = store.load_analysis_json(session_id) or {}
-        ranked = analysis_json.get("ranked_causes", [])
-        top = ranked[0] if ranked else {}
-        store.update_metadata(
-            session_id,
-            {
-                "status": "completed",
-                "artifacts": {
-                    "analysis_md": "analysis/analysis.md",
-                    "analysis_json": "analysis/analysis.json",
-                    "raw_diff": "analysis/raw_diff.txt",
-                    "run_log": "analysis/run_log.txt",
-                },
-                "summary": {
-                    "title": issue.strip()[:40] or "RenderDoc 分析",
-                    "top_cause": top.get("title", ""),
-                    "confidence": top.get("confidence", ""),
-                },
-            },
-        )
-    except Exception as exc:
-        store.update_metadata(session_id, {"status": "failed"})
-        raise HTTPException(status_code=500, detail=f"分析失败: {exc}") from exc
-
-    return store.get_session_detail(session_id)
 
 
 @app.post("/api/renderdoc-cmp/compare")
@@ -1348,119 +1291,6 @@ async def run_renderdoc_perf(capture_file: UploadFile = File(...)) -> dict:
     except Exception as exc:
         perf_service.store.update_metadata(job_id, {"status": "failed"})
         raise HTTPException(status_code=500, detail=f"性能分析失败: {exc}") from exc
-
-
-@app.post("/api/sessions/{session_id}/chat")
-async def chat(
-    session_id: str,
-    question: str = Form(...),
-) -> dict:
-    if not question.strip():
-        raise HTTPException(status_code=400, detail="问题不能为空")
-    try:
-        session_detail = store.get_session_detail(session_id)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="session 不存在")
-
-    store.append_chat(session_id, "user", question.strip())
-    result = chat_engine.answer(question.strip(), session_detail)
-    store.append_chat(session_id, "assistant", result["answer"], result.get("sources"))
-    return {
-        "session_id": session_id,
-        **result,
-        "chat_history": store.load_chat(session_id),
-    }
-
-
-@app.post("/api/sessions/{session_id}/eid-deep-dive")
-async def eid_deep_dive(
-    session_id: str,
-    eid_before: str = Form(...),
-    eid_after: str = Form(...),
-) -> dict:
-    if not eid_before.strip() or not eid_after.strip():
-        raise HTTPException(status_code=400, detail="before/after EID 都不能为空")
-
-    try:
-        metadata = store.load_metadata(session_id)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="session 不存在")
-
-    before_path, after_path = _session_capture_paths(session_id)
-    if not before_path.exists() or not after_path.exists():
-        raise HTTPException(status_code=400, detail="session 输入文件缺失")
-
-    session_dir = Path(store.session_root) / session_id
-    analysis_dir = session_dir / "analysis"
-    try:
-        eid_deep_dive_service.run(
-            before_capture=before_path,
-            after_capture=after_path,
-            eid_before=eid_before.strip(),
-            eid_after=eid_after.strip(),
-            out_dir=analysis_dir,
-        )
-        deep_json = store.load_eid_deep_dive_json(session_id) or {}
-        summary = deep_json.get("summary") or {}
-        top_hypothesis = summary.get("top_hypothesis") or {}
-        store.update_metadata(
-            session_id,
-            {
-                "inputs": {
-                    "eid_before": eid_before.strip(),
-                    "eid_after": eid_after.strip(),
-                },
-                "artifacts": {
-                    "eid_deep_dive_md": "analysis/eid_deep_dive.md",
-                    "eid_deep_dive_json": "analysis/eid_deep_dive.json",
-                },
-                "summary": {
-                    "top_cause": top_hypothesis.get("title", summary.get("conclusion", metadata.get("summary", {}).get("top_cause", ""))),
-                    "confidence": top_hypothesis.get("confidence", summary.get("confidence", metadata.get("summary", {}).get("confidence", ""))),
-                },
-            },
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"EID 深挖失败: {exc}") from exc
-
-    return store.get_session_detail(session_id)
-
-
-@app.post("/api/sessions/{session_id}/ue-source-scan")
-async def ue_source_scan(
-    session_id: str,
-    project_root: str = Form(...),
-) -> dict:
-    if not project_root.strip():
-        raise HTTPException(status_code=400, detail="project_root 不能为空")
-    try:
-        session_detail = store.get_session_detail(session_id)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="session 不存在")
-
-    session_dir = Path(store.session_root) / session_id
-    analysis_dir = session_dir / "analysis"
-    try:
-        ue_source_scanner.run(Path(project_root.strip()), session_detail, analysis_dir)
-        ue_scan_json = store.load_ue_scan_json(session_id) or {}
-        summary = ue_scan_json.get("summary") or {}
-        store.update_metadata(
-            session_id,
-            {
-                "artifacts": {
-                    "ue_scan_md": "analysis/ue_scan.md",
-                    "ue_scan_json": "analysis/ue_scan.json",
-                },
-                "summary": {
-                    "top_cause": session_detail["metadata"].get("summary", {}).get("top_cause", ""),
-                    "confidence": session_detail["metadata"].get("summary", {}).get("confidence", ""),
-                },
-            },
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"UE 源码扫描失败: {exc}") from exc
-
-    return store.get_session_detail(session_id)
 
 
 if __name__ == "__main__":

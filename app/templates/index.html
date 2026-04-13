@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RenderDoc 对比分析 Web UI</title>
+  <title>RenderDoc 工具集</title>
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
   <header class="topbar">
     <div>
       <h1>RenderDoc 工具集</h1>
-      <p>在同一界面中切换使用问题诊断工具与性能 diff 工具。</p>
+      <p>在同一界面中切换使用性能分析、性能 Diff 与资产批量导出工具。</p>
     </div>
     <div class="topbar-actions">
       <button id="open-setup-btn" class="secondary-btn">环境设置</button>
@@ -21,26 +21,11 @@
   <div id="setup-modal" class="modal-backdrop hidden">
     <div class="modal-panel">
       <h2>首启环境检查向导</h2>
-      <p>请确认 RenderDoc、LLM 和性能 diff 工具路径配置正确。保存后会立即应用到当前实例。</p>
+      <p>请确认 RenderDoc 和 `renderdoc_cmp` 相关路径配置正确。保存后会立即应用到当前实例。</p>
 
       <form id="setup-form">
         <label>RenderDoc Python Path</label>
         <input id="setup-renderdoc-python-path" type="text" placeholder="例如 C:\Users\...\rdc\renderdoc 或 C:\Program Files\RenderDoc">
-
-        <label>LLM Provider</label>
-        <select id="setup-llm-provider">
-          <option value="local">local</option>
-          <option value="openai_compatible">openai_compatible</option>
-        </select>
-
-        <label>OpenAI-compatible Base URL</label>
-        <input id="setup-openai-base-url" type="text" placeholder="例如 https://api.deepseek.com/v1">
-
-        <label>OpenAI-compatible API Key</label>
-        <input id="setup-openai-api-key" type="password" placeholder="输入你的 API Key">
-
-        <label>OpenAI-compatible Model</label>
-        <input id="setup-openai-model" type="text" placeholder="例如 deepseek-chat">
 
         <label>renderdoc_cmp 根目录</label>
         <input id="setup-cmp-root" type="text" placeholder="例如 G:\UGit\renderdoc_cmp\renderdoccmp">
@@ -57,106 +42,74 @@
   </div>
 
   <nav class="tabs">
-    <button class="tab-btn active" data-tab="diagnose">问题诊断</button>
+    <button class="tab-btn active" data-tab="perf">性能</button>
     <button class="tab-btn" data-tab="cmp">性能 Diff</button>
-    <button class="tab-btn" data-tab="perf">性能</button>
     <button class="tab-btn" data-tab="asset-export">资产批量导出</button>
   </nav>
 
-  <main id="workspace-diagnose" class="layout tab-workspace active">
+  <main id="workspace-perf" class="layout layout-perf tab-workspace active">
     <section class="panel form-panel">
-      <h2>新建分析</h2>
-      <form id="analyze-form">
-        <label>Before `.rdc` 路径</label>
+      <h2>单 RDC 性能分析</h2>
+      <form id="perf-form">
+        <label>RenderDoc `.rdc` 路径</label>
         <div class="input-with-button">
-          <input id="before-path" type="text" placeholder="例如 G:\Capture\before.rdc">
-          <button id="pick-before-path-btn" type="button" class="secondary-btn">浏览</button>
+          <input id="perf-capture-path" type="text" placeholder="例如 G:\Capture\profile.rdc">
+          <button id="pick-perf-capture-path-btn" type="button" class="secondary-btn">浏览</button>
         </div>
-        <input id="before-file" name="before_file" type="file" accept=".rdc" class="hidden">
-
-        <label>After `.rdc` 路径</label>
-        <div class="input-with-button">
-          <input id="after-path" type="text" placeholder="例如 G:\Capture\after.rdc">
-          <button id="pick-after-path-btn" type="button" class="secondary-btn">浏览</button>
-        </div>
-        <input id="after-file" name="after_file" type="file" accept=".rdc" class="hidden">
-
-        <label>目标 Pass</label>
-        <input id="pass-name" name="pass_name" type="text" placeholder="例如 M_Matcap_Glitter_SSS_Trans SK_OG_069_Wai_001" required>
-
-        <label>问题描述</label>
-        <textarea id="issue" name="issue" rows="4" placeholder="例如：面部亮度异常，只有脸发亮，身体正常" required></textarea>
-
-        <div class="row">
-          <div>
-            <label>EID Before（可选）</label>
-            <input id="eid-before" name="eid_before" type="text" placeholder="例如 575">
-          </div>
-          <div>
-            <label>EID After（可选）</label>
-            <input id="eid-after" name="eid_after" type="text" placeholder="例如 610">
-          </div>
-        </div>
-
-        <button id="analyze-btn" type="submit">开始分析</button>
+        <input id="perf-capture-file" name="capture_file" type="file" accept=".rdc" class="hidden">
+        <button id="perf-run-btn" type="submit">执行性能分析</button>
       </form>
 
       <div class="health-block">
         <h3>环境状态</h3>
         <pre id="health-output">正在加载...</pre>
       </div>
+
+      <div class="health-block">
+        <h3>当前分析摘要</h3>
+        <div id="perf-summary" class="empty-state">还没有执行单 RDC 性能分析。</div>
+        <h3>计时提示</h3>
+        <div id="perf-warnings" class="session-list">
+          <div class="empty-state">当前没有额外的计时风险提示。</div>
+        </div>
+      </div>
     </section>
 
     <section class="panel result-panel">
-      <h2>当前 Session</h2>
-      <div id="session-summary" class="empty-state">还没有分析结果。</div>
-
-      <h3>首轮报告</h3>
-      <pre id="analysis-output" class="analysis-pre">暂无内容</pre>
-
-      <h3>EID 深挖报告</h3>
-      <pre id="eid-output" class="analysis-pre">暂无内容</pre>
-
-      <h3>UE 源码扫描报告</h3>
-      <pre id="ue-scan-output" class="analysis-pre">暂无内容</pre>
+      <h2>性能结果</h2>
+      <div class="perf-toolbar">
+        <div>
+          <label>排序维度</label>
+          <select id="perf-sort-field"></select>
+        </div>
+        <div>
+          <label>排序方向</label>
+          <select id="perf-sort-direction">
+            <option value="desc">从高到低</option>
+            <option value="asc">从低到高</option>
+          </select>
+        </div>
+      </div>
+      <div id="perf-table-wrap" class="perf-table-wrap">
+        <div class="empty-state">暂无性能结果。</div>
+      </div>
     </section>
 
     <section class="panel session-panel">
-      <h2>Session 与追问</h2>
-      <div id="sessions-list" class="session-list"></div>
+      <h2>MobileSceneRender 开销</h2>
+      <div id="perf-chart-wrap" class="perf-chart-wrap">
+        <div class="empty-state">暂无饼图数据。</div>
+      </div>
+      <div id="perf-hotspot-hints" class="session-list"></div>
 
       <div class="chat-box">
-        <h3>EID 深挖</h3>
-        <form id="eid-form">
-          <div class="row">
-            <div>
-              <label>Before EID</label>
-              <input id="deep-eid-before" type="text" placeholder="例如 575">
-            </div>
-            <div>
-              <label>After EID</label>
-              <input id="deep-eid-after" type="text" placeholder="例如 610">
-            </div>
-          </div>
-          <button id="eid-btn" type="submit">执行 EID 深挖</button>
-        </form>
+        <h3>性能分析历史</h3>
+        <div id="perf-jobs-list" class="session-list"></div>
       </div>
 
       <div class="chat-box">
-        <h3>UE 源码扫描</h3>
-        <form id="ue-scan-form">
-          <label>UE 项目根目录</label>
-          <input id="ue-project-root" type="text" placeholder="例如 G:\UGit\LetsgoDevelop2">
-          <button id="ue-scan-btn" type="submit">执行 UE 源码扫描</button>
-        </form>
-      </div>
-
-      <div class="chat-box">
-        <div id="chat-history" class="chat-history"></div>
-        <form id="chat-form">
-          <textarea id="chat-question" rows="3" placeholder="基于当前 session 继续提问，例如：为什么只有面部异常？"></textarea>
-          <button id="chat-btn" type="submit">发送追问</button>
-        </form>
+        <h3>运行日志</h3>
+        <pre id="perf-run-log" class="analysis-pre">暂无内容</pre>
       </div>
     </section>
   </main>
@@ -217,68 +170,6 @@
       <div class="chat-box">
         <h3>运行日志</h3>
         <pre id="cmp-run-log" class="analysis-pre">暂无内容</pre>
-      </div>
-    </section>
-  </main>
-
-  <main id="workspace-perf" class="layout layout-perf tab-workspace">
-    <section class="panel form-panel">
-      <h2>单 RDC 性能分析</h2>
-      <form id="perf-form">
-        <label>RenderDoc `.rdc` 路径</label>
-        <div class="input-with-button">
-          <input id="perf-capture-path" type="text" placeholder="例如 G:\Capture\profile.rdc">
-          <button id="pick-perf-capture-path-btn" type="button" class="secondary-btn">浏览</button>
-        </div>
-        <input id="perf-capture-file" name="capture_file" type="file" accept=".rdc" class="hidden">
-        <button id="perf-run-btn" type="submit">执行性能分析</button>
-      </form>
-
-      <div class="health-block">
-        <h3>当前分析摘要</h3>
-        <div id="perf-summary" class="empty-state">还没有执行单 RDC 性能分析。</div>
-        <h3>计时提示</h3>
-        <div id="perf-warnings" class="session-list">
-          <div class="empty-state">当前没有额外的计时风险提示。</div>
-        </div>
-      </div>
-    </section>
-
-    <section class="panel result-panel">
-      <h2>性能结果</h2>
-      <div class="perf-toolbar">
-        <div>
-          <label>排序维度</label>
-          <select id="perf-sort-field"></select>
-        </div>
-        <div>
-          <label>排序方向</label>
-          <select id="perf-sort-direction">
-            <option value="desc">从高到低</option>
-            <option value="asc">从低到高</option>
-          </select>
-        </div>
-      </div>
-      <div id="perf-table-wrap" class="perf-table-wrap">
-        <div class="empty-state">暂无性能结果。</div>
-      </div>
-    </section>
-
-    <section class="panel session-panel">
-      <h2>MobileSceneRender 开销</h2>
-      <div id="perf-chart-wrap" class="perf-chart-wrap">
-        <div class="empty-state">暂无饼图数据。</div>
-      </div>
-      <div id="perf-hotspot-hints" class="session-list"></div>
-
-      <div class="chat-box">
-        <h3>性能分析历史</h3>
-        <div id="perf-jobs-list" class="session-list"></div>
-      </div>
-
-      <div class="chat-box">
-        <h3>运行日志</h3>
-        <pre id="perf-run-log" class="analysis-pre">暂无内容</pre>
       </div>
     </section>
   </main>
@@ -356,7 +247,7 @@
         <label>备注</label>
         <textarea id="asset-export-notes" rows="3" placeholder="例如：按 UI Pass 顺序导出面部相关资产，后续需要做手工列映射"></textarea>
 
-        <button id="asset-export-create-btn" type="submit">保存导出任务</button>
+        <button id="asset-export-create-btn" type="submit">确认范围并准备批量映射</button>
       </form>
 
       <div class="health-block">
@@ -378,7 +269,7 @@
         <button id="asset-csv-inspect-btn" type="submit">识别列映射</button>
       </form>
 
-      <div id="asset-csv-inspect-summary" class="empty-state">支持单个 CSV、多个散点 CSV 路径，或单个目录。批处理时会自动选取第一个 CSV 作为映射预览样本。</div>
+      <div id="asset-csv-inspect-summary" class="empty-state">支持单个 CSV、多个散点 CSV 路径，或单个目录。批处理时会先展示一个样本 CSV 的预览结果，真正转换时会对每个 CSV 单独自动识别，并对缺失列自动回退。</div>
 
       <div class="row">
         <div>
@@ -434,7 +325,7 @@
         </div>
         <div>
           <label>执行手工转换</label>
-          <button id="asset-csv-convert-btn" type="button">按当前映射转换 CSV/目录</button>
+          <button id="asset-csv-convert-btn" type="button">按当前映射开始批量转换</button>
         </div>
       </div>
 
@@ -452,9 +343,78 @@
       <div class="chat-box">
         <h3>说明</h3>
         <div class="empty-state">
-          当前阶段先完成可移植的作业配置、Pass 扫描和 CSV 列映射面板。
-          后续会把 RenderDoc 资产导出和内置 FBX/OBJ 转换执行链路接上。
+          批量映射确认只会在导出前弹出一次，用样本 draw 预览列结构。
+          真正执行时会对每个 draw 或 CSV 单独自动识别，并对不适用的手动覆盖字段自动回退。
         </div>
+      </div>
+      <div class="chat-box">
+        <h3>FS GLSL -> UE4.26 Custom 节点</h3>
+        <form id="shader-convert-form">
+          <label>Fragment Shader 路径</label>
+          <div class="input-with-button">
+            <input id="shader-fragment-path" type="text" placeholder="例如 G:\抓帧\...\eid_288_-_fs.glsl">
+            <button id="pick-shader-fragment-path-btn" type="button" class="secondary-btn">浏览</button>
+          </div>
+          <div id="shader-fragment-path-hint" class="field-hint">必填：必须提供 fragment shader 文件。</div>
+
+          <label>Vertex Shader 路径（可选）</label>
+          <div class="input-with-button">
+            <input id="shader-vertex-path" type="text" placeholder="例如 G:\抓帧\...\eid_288_-_vs.glsl">
+            <button id="pick-shader-vertex-path-btn" type="button" class="secondary-btn">浏览</button>
+          </div>
+          <div id="shader-vertex-path-hint" class="field-hint">可选：未提供时会跳过 vertex custom node。</div>
+
+          <label>Shader Params 路径（可选）</label>
+          <div class="input-with-button">
+            <input id="shader-params-path" type="text" placeholder="例如 G:\抓帧\...\eid_288_-_shader_params.json">
+            <button id="pick-shader-params-path-btn" type="button" class="secondary-btn">浏览</button>
+          </div>
+          <div id="shader-params-path-hint" class="field-hint">可选：未提供时默认值信息会留空。</div>
+
+          <button id="shader-convert-btn" type="submit">生成 UE4.26 Custom 节点复制包</button>
+        </form>
+
+        <div id="shader-convert-summary" class="empty-state">这里会生成 fragment/vertex 的 Custom 节点信息，以及可直接粘贴到 UE4.26 材质图的 T3D 文本。</div>
+
+        <label>Fragment 输出类型</label>
+        <textarea id="shader-output-spec" rows="3" readonly placeholder="等待生成..."></textarea>
+        <button id="shader-copy-output-btn" type="button" class="secondary-btn">复制输出类型</button>
+
+        <label>Fragment 输入清单</label>
+        <textarea id="shader-input-spec" rows="8" readonly placeholder="等待生成..."></textarea>
+        <button id="shader-copy-inputs-btn" type="button" class="secondary-btn">复制输入清单</button>
+
+        <label>Fragment HLSL 代码</label>
+        <textarea id="shader-hlsl-code" rows="14" readonly placeholder="等待生成..."></textarea>
+        <button id="shader-copy-hlsl-btn" type="button" class="secondary-btn">复制 HLSL</button>
+
+        <label>Vertex HLSL 代码</label>
+        <textarea id="shader-vertex-hlsl-code" rows="14" readonly placeholder="等待生成..."></textarea>
+        <button id="shader-copy-vertex-hlsl-btn" type="button" class="secondary-btn">复制 Vertex HLSL</button>
+
+        <label>Vertex 节点摘要</label>
+        <textarea id="shader-vertex-summary" rows="8" readonly placeholder="等待生成..."></textarea>
+        <button id="shader-copy-vertex-summary-btn" type="button" class="secondary-btn">复制 Vertex 摘要</button>
+
+        <label>纯 UE Shader Graph 摘要</label>
+        <textarea id="shader-pure-graph-summary" rows="5" readonly placeholder="等待生成..."></textarea>
+        <button id="shader-copy-pure-graph-summary-btn" type="button" class="secondary-btn">复制纯图摘要</button>
+
+        <label>纯 UE Shader Graph T3D</label>
+        <textarea id="shader-pure-graph-t3d" rows="18" readonly placeholder="等待生成..."></textarea>
+        <button id="shader-copy-pure-graph-t3d-btn" type="button" class="secondary-btn">复制纯图 T3D</button>
+
+        <label>纯图不支持项</label>
+        <textarea id="shader-pure-graph-unsupported" rows="8" readonly placeholder="等待生成..."></textarea>
+        <button id="shader-copy-pure-graph-unsupported-btn" type="button" class="secondary-btn">复制纯图不支持项</button>
+
+        <label>UE4.26 T3D 文本</label>
+        <textarea id="shader-t3d-text" rows="18" readonly placeholder="等待生成..."></textarea>
+        <button id="shader-copy-t3d-btn" type="button" class="secondary-btn">复制 T3D</button>
+
+        <label>完整复制包</label>
+        <textarea id="shader-copy-package" rows="18" readonly placeholder="等待生成..."></textarea>
+        <button id="shader-copy-package-btn" type="button" class="secondary-btn">复制完整包</button>
       </div>
     </section>
   </main>

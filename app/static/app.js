@@ -1,4 +1,3 @@
-let currentSessionId = null;
 let currentCmpJobId = null;
 let currentPerfJobId = null;
 let currentExportJobId = null;
@@ -79,6 +78,44 @@ async function fetchJson(url, options = {}) {
   return data;
 }
 
+async function copyTextFromElement(elementId) {
+  const element = document.getElementById(elementId);
+  const text = element ? (element.value || element.textContent || "") : "";
+  if (!text) {
+    throw new Error("当前没有可复制的内容。");
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  if (element && typeof element.select === "function") {
+    element.focus();
+    element.select();
+    const ok = document.execCommand("copy");
+    if (ok) {
+      return;
+    }
+  }
+  throw new Error("当前环境不支持剪贴板写入。");
+}
+
+function setSummaryBusy(elementId, lines) {
+  const element = document.getElementById(elementId);
+  if (!element) {
+    return;
+  }
+  const rows = (lines || []).map((line) => `<div>${escapeHtml(line)}</div>`).join("");
+  element.innerHTML = rows || '<div class="empty-state">处理中...</div>';
+}
+
+function setLogBusy(elementId, text) {
+  const element = document.getElementById(elementId);
+  if (!element) {
+    return;
+  }
+  element.textContent = text || "处理中，请稍候...";
+}
+
 function escapeHtml(value) {
   return String(value == null ? "" : value)
     .split("&").join("&amp;")
@@ -114,10 +151,6 @@ function renderHealth(health) {
 function fillSetupForm(statusPayload) {
   const settings = statusPayload.settings || {};
   document.getElementById("setup-renderdoc-python-path").value = settings.renderdoc_python_path || "";
-  document.getElementById("setup-llm-provider").value = settings.llm_provider || "local";
-  document.getElementById("setup-openai-base-url").value = settings.openai_base_url || "";
-  document.getElementById("setup-openai-api-key").value = settings.openai_api_key || "";
-  document.getElementById("setup-openai-model").value = settings.openai_model || "";
   document.getElementById("setup-cmp-root").value = settings.renderdoc_cmp_root || "";
   document.getElementById("setup-status-output").textContent = JSON.stringify(statusPayload, null, 2);
 }
@@ -138,79 +171,6 @@ function hideAssetExportMappingModal() {
   document.getElementById("asset-export-mapping-modal").classList.add("hidden");
   pendingAssetExportDraft = null;
   pendingAssetExportPreview = null;
-}
-
-function renderSessionSummary(detail) {
-  const metadata = detail.metadata || {};
-  const summary = metadata.summary || {};
-  const inputs = metadata.inputs || {};
-  document.getElementById("session-summary").innerHTML = `
-    <div><strong>Session:</strong> ${metadata.session_id || "-"}</div>
-    <div><strong>状态:</strong> ${metadata.status || "-"}</div>
-    <div><strong>Pass:</strong> ${inputs.pass_name || "-"}</div>
-    <div><strong>问题:</strong> ${inputs.issue || "-"}</div>
-    <div><strong>Top 原因:</strong> ${summary.top_cause || "暂无"}</div>
-    <div><strong>置信度:</strong> ${summary.confidence || "暂无"}</div>
-  `;
-  document.getElementById("analysis-output").textContent = detail.analysis_markdown || "暂无报告";
-  document.getElementById("eid-output").textContent = detail.eid_deep_dive_markdown || "暂无内容";
-  document.getElementById("ue-scan-output").textContent = detail.ue_scan_markdown || "暂无内容";
-  document.getElementById("deep-eid-before").value = inputs.eid_before || "";
-  document.getElementById("deep-eid-after").value = inputs.eid_after || "";
-  if (!document.getElementById("ue-project-root").value) {
-    document.getElementById("ue-project-root").value = "G:\\UGit\\LetsgoDevelop2";
-  }
-}
-
-function renderSessions(sessions) {
-  const container = document.getElementById("sessions-list");
-  container.innerHTML = "";
-
-  if (!sessions.length) {
-    container.innerHTML = '<div class="empty-state">暂无 session</div>';
-    return;
-  }
-
-  sessions.forEach((item) => {
-    const inputs = item.inputs || {};
-    const summary = item.summary || {};
-    const div = document.createElement("div");
-    div.className = "session-item" + (item.session_id === currentSessionId ? " active" : "");
-    div.innerHTML = `
-      <div class="title">${summary.title || item.session_id}</div>
-      <div class="meta">${item.updated_at || ""}</div>
-      <div class="meta">Pass: ${inputs.pass_name || "-"}</div>
-      <div class="meta">状态: ${item.status || "-"}</div>
-    `;
-    div.addEventListener("click", async () => {
-      await loadSession(item.session_id);
-    });
-    container.appendChild(div);
-  });
-}
-
-function renderChat(history) {
-  const container = document.getElementById("chat-history");
-  container.innerHTML = "";
-
-  if (!history || !history.length) {
-    container.innerHTML = '<div class="empty-state">当前 session 还没有追问记录。</div>';
-    return;
-  }
-
-  history.forEach((item) => {
-    const block = document.createElement("div");
-    block.className = `chat-message ${item.role}`;
-    const sources = item.sources && item.sources.length
-      ? `<div class="sources">来源: ${item.sources.join(", ")}</div>`
-      : "";
-    block.innerHTML = `
-      <div class="chat-role">${item.role} · ${item.created_at || ""}</div>
-      <div>${item.content || ""}</div>
-      ${sources}
-    `;
-    container.appendChild(block);
-  });
 }
 
 function switchTab(tabName) {
@@ -234,11 +194,6 @@ async function loadSetupStatus() {
   if (status.wizard && status.wizard.needs_setup) {
     showSetupModal();
   }
-}
-
-async function loadSessions() {
-  const sessions = await fetchJson("/api/sessions");
-  renderSessions(sessions);
 }
 
 function renderCmpSummary(detail) {
@@ -735,6 +690,7 @@ function renderAssetExportMappingPreview(preview, draft) {
     <div><strong>样本 Draw:</strong> EID ${preview.sample_eid || "-"} | ${preview.sample_draw_label || "-"}</div>
     <div><strong>阶段:</strong> ${(preview.sample_stage || "vsin").toUpperCase()}</div>
     <div><strong>列数:</strong> ${(preview.headers || []).length}</div>
+    <div><strong>执行规则:</strong> 这里只确认一次样本映射；真正导出时会对每个 draw 单独自动识别，并对缺失列自动回退。</div>
   `;
   const warnings = (preview.skipped_attributes || []).map((item) => `<div class="meta">${escapeHtml(item)}</div>`).join("");
   document.getElementById("asset-export-mapping-notes").innerHTML = warnings || '<div class="meta">当前样本未发现被跳过的顶点属性。</div>';
@@ -755,12 +711,14 @@ function renderAssetCsvInspectSummary(data) {
       <div><strong>批处理模式:</strong> 共识别 ${count} 个 CSV</div>
       <div><strong>预览样本:</strong> ${data.inspect_csv_path || data.csv_name || "-"}</div>
       <div><strong>预览文件:</strong> ${previewPaths.join("<br>") || "-"}</div>
+      <div><strong>执行规则:</strong> 预览只展示样本 CSV；真正转换时会对每个 CSV 单独自动识别，并对缺失列自动回退。</div>
     `;
     return;
   }
   summary.innerHTML = `
     <div><strong>单文件模式:</strong> ${data.inspect_csv_path || data.csv_name || "-"}</div>
     <div><strong>表头列数:</strong> ${(data.headers || []).length}</div>
+    <div><strong>执行规则:</strong> 当前文件会按自动识别结果进行转换，你手动指定的列会优先覆盖。</div>
   `;
 }
 
@@ -769,6 +727,7 @@ function renderAssetExportSummary(detail) {
   const input = metadata.input || {};
   const progress = metadata.progress || {};
   const result = metadata.result || {};
+  const outputRoot = result.output_root || ((metadata.artifacts || {}).output_root) || "";
   document.getElementById("asset-export-summary").innerHTML = `
     <div><strong>Job:</strong> ${metadata.job_id || "-"}</div>
     <div><strong>状态:</strong> ${metadata.status || "-"}</div>
@@ -777,7 +736,7 @@ function renderAssetExportSummary(detail) {
     <div><strong>起止:</strong> ${input.pass_start || "-"} -> ${input.pass_end || "-"}</div>
     <div><strong>格式:</strong> FBX=${String(input.export_fbx == null ? false : input.export_fbx)} / OBJ=${String(input.export_obj == null ? false : input.export_obj)}</div>
     <div><strong>贴图:</strong> ${input.texture_format || "-"}</div>
-    <div><strong>导出目录:</strong> ${result.output_root || ((metadata.artifacts || {}).output_root) || "未设置"}</div>
+    <div><strong>导出目录:</strong> ${outputRoot || "未设置"}</div>
     <div><strong>阶段:</strong> ${progress.stage || "-"}</div>
     <div><strong>说明:</strong> ${progress.message || "-"}</div>
     <div><strong>CSV:</strong> ${(result.csv_files || []).length}</div>
@@ -785,7 +744,14 @@ function renderAssetExportSummary(detail) {
     <div><strong>Shader:</strong> ${(result.shader_files || []).length}</div>
     <div><strong>贴图:</strong> ${(result.texture_files || []).length}</div>
     <div><strong>失败:</strong> ${(result.failed_items || []).length}</div>
+    ${outputRoot ? `<div><button id="asset-export-open-output-btn" type="button" class="secondary-btn">打开输出目录</button></div>` : ""}
   `;
+  const openButton = document.getElementById("asset-export-open-output-btn");
+  if (openButton) {
+    openButton.addEventListener("click", () => {
+      revealDesktopPath(outputRoot);
+    });
+  }
   document.getElementById("asset-export-log").textContent = detail.job_log || "暂无日志";
   renderAssetExportFiles(metadata.job_id, detail.manifest || {});
 }
@@ -829,6 +795,9 @@ function renderAssetExportFiles(jobId, manifest) {
     block.className = "session-item";
     const lines = manualConversions.map((item) => `
       <div class="meta">${item.csv_name || "-"} -> <a href="/api/asset-export/jobs/${jobId}/artifact?path=${encodeURIComponent(item.output_path)}" target="_blank" rel="noopener">${item.output_format || "文件"}</a> · ${item.output_path || ""}</div>
+      <div class="meta">自动识别: ${Object.entries(item.mapping_suggested || {}).filter(([, value]) => value).map(([key, value]) => `${key}=${value}`).join(" | ") || "无"}</div>
+      <div class="meta">实际映射: ${Object.entries(item.mapping_applied || {}).filter(([, value]) => value).map(([key, value]) => `${key}=${value}`).join(" | ") || "无"}</div>
+      <div class="meta">${(item.mapping_notes || []).length ? (item.mapping_notes || []).join("；") : "未发生字段回退。"}</div>
     `).join("");
     block.innerHTML = `
       <div class="title">手工 CSV 转换</div>
@@ -886,6 +855,144 @@ function renderAssetExportFiles(jobId, manifest) {
   });
 }
 
+function formatShaderOutputText(output) {
+  if (!output || !output.ue_output_type) {
+    return "";
+  }
+  return [
+    `Name: ${output.name || "-"}`,
+    `OutputType: ${output.ue_output_type || "-"}`,
+    `GLSL Type: ${output.glsl_type || "-"}`,
+  ].join("\n");
+}
+
+function formatShaderInputsText(inputs) {
+  const items = Array.isArray(inputs) ? inputs : [];
+  if (!items.length) {
+    return "无";
+  }
+  return items.map((item) => {
+    const parts = [
+      `${item.name || "-"}: ${item.ue_input_type || "-"} (GLSL ${item.glsl_type || "-"})`,
+    ];
+    if (item.default_value !== null && item.default_value !== undefined && item.default_value !== "") {
+      parts.push(`default=${JSON.stringify(item.default_value)}`);
+    }
+    if (item.source_hint) {
+      parts.push(`vertex_hint=${item.source_hint}`);
+    }
+    return parts.join(" ; ");
+  }).join("\n");
+}
+
+function formatShaderStageSummary(stage) {
+  if (!stage) {
+    return "未生成";
+  }
+  const outputs = (stage.outputs || []).map((item) => `${item.name}: ${item.ue_output_type}`).join(" | ") || "无";
+  const inputs = (stage.inputs || []).map((item) => item.name || "-").join(" | ") || "无";
+  const rootMapping = stage.root_mapping || null;
+  const rootSlots = rootMapping ? (rootMapping.recommended_root_slots || []).join(" | ") || "无" : "无";
+  const rootConfidence = rootMapping ? (rootMapping.confidence || "-") : "-";
+  const rootSummary = rootMapping ? (rootMapping.summary || "无") : "无";
+  const rootRationale = rootMapping ? (rootMapping.rationale || []).join("；") || "无" : "无";
+  const warnings = (stage.warnings || []).join("；") || "无";
+  const unsupported = (stage.unsupported || []).join("；") || "无";
+  return [
+    `Stage: ${stage.stage || "-"}`,
+    `Outputs: ${outputs}`,
+    `Inputs: ${inputs}`,
+    `BuiltIn Mapping: ${rootSummary}`,
+    `Suggested Root Slots: ${rootSlots}`,
+    `Confidence: ${rootConfidence}`,
+    `Rationale: ${rootRationale}`,
+    `Warnings: ${warnings}`,
+    `Unsupported: ${unsupported}`,
+  ].join("\n");
+}
+
+function renderShaderPathStatus(status) {
+  const payload = status || {};
+  const fragmentHint = document.getElementById("shader-fragment-path-hint");
+  const vertexHint = document.getElementById("shader-vertex-path-hint");
+  const paramsHint = document.getElementById("shader-params-path-hint");
+  fragmentHint.textContent = payload.fragment_path || "必填：必须提供 fragment shader 文件。";
+  vertexHint.textContent = payload.vertex_path || "可选：未提供时会跳过 vertex custom node。";
+  paramsHint.textContent = payload.shader_params_path || "可选：未提供时默认值信息会留空。";
+}
+
+function renderShaderConvertResult(data) {
+  const summary = document.getElementById("shader-convert-summary");
+  const notes = (data.notes || []).map((item) => `备注: ${item}`);
+  const warnings = (data.warnings || []).map((item) => `警告: ${item}`);
+  const unsupported = (data.unsupported || []).map((item) => `不支持: ${item}`);
+  const lines = [data.summary || "", data.t3d_summary || "", ...notes, ...warnings, ...unsupported].filter(Boolean);
+  summary.innerHTML = lines.length
+    ? lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("")
+    : '<div class="empty-state">转换完成，但没有额外说明。</div>';
+  document.getElementById("shader-output-spec").value = formatShaderOutputText(data.output || {});
+  document.getElementById("shader-input-spec").value = formatShaderInputsText(data.inputs || []);
+  document.getElementById("shader-hlsl-code").value = data.hlsl_code || "";
+  document.getElementById("shader-vertex-hlsl-code").value = data.vertex_hlsl_code || ((data.vertex_stage || {}).hlsl_code || "");
+  document.getElementById("shader-vertex-summary").value = formatShaderStageSummary(data.vertex_stage || null);
+  document.getElementById("shader-pure-graph-summary").value = data.pure_graph_summary || "";
+  document.getElementById("shader-pure-graph-t3d").value = data.pure_graph_t3d_text || "";
+  document.getElementById("shader-pure-graph-unsupported").value = (data.pure_graph_unsupported || []).join("\n");
+  document.getElementById("shader-t3d-text").value = data.t3d_text || "";
+  document.getElementById("shader-copy-package").value = data.t3d_copy_package || data.copy_package || "";
+  renderShaderPathStatus(data.path_status || {});
+}
+
+async function handleShaderConvert(event) {
+  event.preventDefault();
+  const button = document.getElementById("shader-convert-btn");
+  const fragmentPath = document.getElementById("shader-fragment-path").value.trim();
+  const vertexPath = document.getElementById("shader-vertex-path").value.trim();
+  const shaderParamsPath = document.getElementById("shader-params-path").value.trim();
+  if (!fragmentPath) {
+    alert("请先填写 Fragment Shader 路径。");
+    return;
+  }
+
+  button.disabled = true;
+  button.textContent = "转换中...";
+  setSummaryBusy("shader-convert-summary", [
+    "状态: 运行中",
+    "说明: 正在生成 UE4.26 Custom 节点与 T3D 复制包，请稍候...",
+  ]);
+  renderShaderPathStatus({
+    fragment_path: fragmentPath ? "正在读取 fragment shader..." : "必填：必须提供 fragment shader 文件。",
+    vertex_path: vertexPath ? "正在尝试读取 vertex shader..." : "未提供，按空值处理。",
+    shader_params_path: shaderParamsPath ? "正在尝试读取 shader params..." : "未提供，按空值处理。",
+  });
+  document.getElementById("shader-output-spec").value = "";
+  document.getElementById("shader-input-spec").value = "";
+  document.getElementById("shader-hlsl-code").value = "";
+  document.getElementById("shader-vertex-hlsl-code").value = "";
+  document.getElementById("shader-vertex-summary").value = "";
+  document.getElementById("shader-pure-graph-summary").value = "";
+  document.getElementById("shader-pure-graph-t3d").value = "";
+  document.getElementById("shader-pure-graph-unsupported").value = "";
+  document.getElementById("shader-t3d-text").value = "";
+  document.getElementById("shader-copy-package").value = "";
+  try {
+    const formData = new FormData();
+    formData.append("fragment_path", fragmentPath);
+    formData.append("vertex_path", vertexPath);
+    formData.append("shader_params_path", shaderParamsPath);
+    const data = await fetchJson("/api/shader-tools/fragment-to-ue-custom/by-path", {
+      method: "POST",
+      body: formData,
+    });
+    renderShaderConvertResult(data);
+  } catch (error) {
+    alert(error.message || "shader 转换失败");
+  } finally {
+    button.disabled = false;
+    button.textContent = "生成 UE4.26 Custom 节点复制包";
+  }
+}
+
 async function loadCmpJobs() {
   const jobs = await fetchJson("/api/renderdoc-cmp/jobs");
   renderCmpJobs(jobs);
@@ -922,61 +1029,6 @@ async function loadAssetExportJob(jobId) {
   await loadAssetExportJobs();
 }
 
-async function loadSession(sessionId) {
-  const detail = await fetchJson(`/api/sessions/${sessionId}`);
-  currentSessionId = sessionId;
-  renderSessionSummary(detail);
-  renderChat(detail.chat_history || []);
-  await loadSessions();
-}
-
-async function handleAnalyze(event) {
-  event.preventDefault();
-
-  const beforePath = document.getElementById("before-path").value.trim();
-  const afterPath = document.getElementById("after-path").value.trim();
-  const button = document.getElementById("analyze-btn");
-  button.disabled = true;
-  button.textContent = "分析中...";
-
-  try {
-    let response;
-    if (beforePath && afterPath) {
-      const formData = new FormData();
-      formData.append("before_path", beforePath);
-      formData.append("after_path", afterPath);
-      formData.append("pass_name", document.getElementById("pass-name").value.trim());
-      formData.append("issue", document.getElementById("issue").value.trim());
-      formData.append("eid_before", document.getElementById("eid-before").value.trim());
-      formData.append("eid_after", document.getElementById("eid-after").value.trim());
-      response = await fetch("/api/analyze/by-path", {
-        method: "POST",
-        body: formData,
-      });
-    } else {
-      const form = document.getElementById("analyze-form");
-      const formData = new FormData(form);
-      response = await fetch("/api/analyze", {
-        method: "POST",
-        body: formData,
-      });
-    }
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.detail || "分析失败");
-    }
-    currentSessionId = data.metadata.session_id;
-    renderSessionSummary(data);
-    renderChat(data.chat_history || []);
-    await loadSessions();
-  } catch (error) {
-    alert(error.message);
-  } finally {
-    button.disabled = false;
-    button.textContent = "开始分析";
-  }
-}
-
 async function handleCmpRun(event) {
   event.preventDefault();
 
@@ -990,6 +1042,13 @@ async function handleCmpRun(event) {
   const button = document.getElementById("cmp-run-btn");
   button.disabled = true;
   button.textContent = "运行中...";
+  setSummaryBusy("cmp-summary", [
+    "状态: 运行中",
+    `Base: ${basePath || document.getElementById('cmp-base-file').files[0]?.name || "-"}`,
+    `New: ${newPath || document.getElementById('cmp-new-file').files[0]?.name || "-"}`,
+    "说明: 正在执行性能 Diff，请稍候...",
+  ]);
+  setLogBusy("cmp-run-log", "正在执行 renderdoc_cmp，请稍候...");
 
   try {
     let response;
@@ -1046,6 +1105,12 @@ async function handlePerfRun(event) {
   const button = document.getElementById("perf-run-btn");
   button.disabled = true;
   button.textContent = "分析中...";
+  setSummaryBusy("perf-summary", [
+    "状态: 运行中",
+    `Capture: ${capturePath || document.getElementById('perf-capture-file').files[0]?.name || "-"}`,
+    "说明: 正在执行单帧性能分析，请稍候...",
+  ]);
+  setLogBusy("perf-run-log", "正在读取 draw/counter 并分析性能，请稍候...");
 
   try {
     let response;
@@ -1084,52 +1149,13 @@ async function handlePerfRun(event) {
   }
 }
 
-async function handleChat(event) {
-  event.preventDefault();
-
-  if (!currentSessionId) {
-    alert("请先完成一次分析并选中 session。");
-    return;
-  }
-
-  const question = document.getElementById("chat-question").value.trim();
-  if (!question) {
-    alert("请输入追问内容。");
-    return;
-  }
-
-  const formData = new FormData();
-  formData.append("question", question);
-
-  const button = document.getElementById("chat-btn");
-  button.disabled = true;
-  button.textContent = "发送中...";
-
-  try {
-    const response = await fetch(`/api/sessions/${currentSessionId}/chat`, {
-      method: "POST",
-      body: formData,
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.detail || "追问失败");
-    }
-    renderChat(data.chat_history || []);
-    document.getElementById("chat-question").value = "";
-  } catch (error) {
-    alert(error.message);
-  } finally {
-    button.disabled = false;
-    button.textContent = "发送追问";
-  }
-}
-
 async function handleAssetPassScan(event) {
   event.preventDefault();
   const capturePath = document.getElementById("asset-capture-source-path").value.trim();
   const button = document.getElementById("asset-pass-scan-btn");
   button.disabled = true;
   button.textContent = "读取中...";
+  setLogBusy("asset-pass-scan-output", "正在读取 Pass 列表，请稍候...");
   try {
     let response;
     if (capturePath) {
@@ -1170,6 +1196,10 @@ async function handleAssetCsvInspect(event) {
   const button = document.getElementById("asset-csv-inspect-btn");
   button.disabled = true;
   button.textContent = "识别中...";
+  setSummaryBusy("asset-csv-inspect-summary", [
+    "状态: 运行中",
+    "说明: 正在识别 CSV 列映射，请稍候...",
+  ]);
   try {
     let response;
     if (csvPath) {
@@ -1209,7 +1239,7 @@ async function handleAssetExportCreate(event) {
   event.preventDefault();
   const button = document.getElementById("asset-export-create-btn");
   button.disabled = true;
-  button.textContent = "准备映射中...";
+  button.textContent = "正在准备样本映射...";
   try {
     const draft = buildAssetExportDraft();
     if (!draft.exportFbx && !draft.exportObj) {
@@ -1224,12 +1254,19 @@ async function handleAssetExportCreate(event) {
     alert(error.message);
   } finally {
     button.disabled = false;
-    button.textContent = "保存导出任务";
+    button.textContent = "确认范围并准备批量映射";
   }
 }
 
 async function submitAssetExportDraft(draft, mapping) {
   let response;
+  setSummaryBusy("asset-export-summary", [
+    "状态: 运行中",
+    `范围: ${draft.exportScope || "-"}`,
+    `单 Pass: ${draft.passName || "-"}`,
+    "说明: 正在导出资产与 shader，请稍候...",
+  ]);
+  setLogBusy("asset-export-log", "正在执行资产导出，请稍候...");
   const commonForm = new FormData();
   commonForm.append("export_scope", draft.exportScope);
   commonForm.append("pass_id", draft.passId);
@@ -1351,104 +1388,12 @@ async function handleAssetCsvConvert() {
     currentExportJobId = (((data || {}).metadata || {}).job_id) || currentExportJobId;
     renderAssetExportSummary(data);
     await loadAssetExportJobs();
-    const outputRoot = (((data || {}).metadata || {}).result || {}).output_root
-      || ((((data || {}).metadata || {}).artifacts || {}).output_root)
-      || "";
-    if (outputRoot) {
-      window.setTimeout(() => {
-        revealDesktopPath(outputRoot);
-      }, 50);
-    }
     switchTab("asset-export");
   } catch (error) {
     alert(error.message);
   } finally {
     button.disabled = false;
-    button.textContent = "按当前映射转换 CSV";
-  }
-}
-
-async function handleEidDeepDive(event) {
-  event.preventDefault();
-
-  if (!currentSessionId) {
-    alert("请先完成一次分析并选中 session。");
-    return;
-  }
-
-  const eidBefore = document.getElementById("deep-eid-before").value.trim();
-  const eidAfter = document.getElementById("deep-eid-after").value.trim();
-  if (!eidBefore || !eidAfter) {
-    alert("请填写 before/after EID。");
-    return;
-  }
-
-  const formData = new FormData();
-  formData.append("eid_before", eidBefore);
-  formData.append("eid_after", eidAfter);
-
-  const button = document.getElementById("eid-btn");
-  button.disabled = true;
-  button.textContent = "深挖中...";
-
-  try {
-    const response = await fetch(`/api/sessions/${currentSessionId}/eid-deep-dive`, {
-      method: "POST",
-      body: formData,
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.detail || "EID 深挖失败");
-    }
-    renderSessionSummary(data);
-    renderChat(data.chat_history || []);
-    await loadSessions();
-  } catch (error) {
-    alert(error.message);
-  } finally {
-    button.disabled = false;
-    button.textContent = "执行 EID 深挖";
-  }
-}
-
-async function handleUEScan(event) {
-  event.preventDefault();
-
-  if (!currentSessionId) {
-    alert("请先完成一次分析并选中 session。");
-    return;
-  }
-
-  const projectRoot = document.getElementById("ue-project-root").value.trim();
-  if (!projectRoot) {
-    alert("请填写 UE 项目根目录。");
-    return;
-  }
-
-  const formData = new FormData();
-  formData.append("project_root", projectRoot);
-
-  const button = document.getElementById("ue-scan-btn");
-  button.disabled = true;
-  button.textContent = "扫描中...";
-
-  try {
-    const response = await fetch(`/api/sessions/${currentSessionId}/ue-source-scan`, {
-      method: "POST",
-      body: formData,
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.detail || "UE 源码扫描失败");
-    }
-    renderSessionSummary(data);
-    renderChat(data.chat_history || []);
-    await loadSessions();
-  } catch (error) {
-    alert(error.message);
-  } finally {
-    button.disabled = false;
-    button.textContent = "执行 UE 源码扫描";
+    button.textContent = "按当前映射开始批量转换";
   }
 }
 
@@ -1457,10 +1402,10 @@ async function handleSetupSave(event) {
 
   const formData = new FormData();
   formData.append("renderdoc_python_path", document.getElementById("setup-renderdoc-python-path").value.trim());
-  formData.append("llm_provider", document.getElementById("setup-llm-provider").value.trim());
-  formData.append("openai_base_url", document.getElementById("setup-openai-base-url").value.trim());
-  formData.append("openai_api_key", document.getElementById("setup-openai-api-key").value.trim());
-  formData.append("openai_model", document.getElementById("setup-openai-model").value.trim());
+  formData.append("llm_provider", "local");
+  formData.append("openai_base_url", "");
+  formData.append("openai_api_key", "");
+  formData.append("openai_model", "");
   formData.append("renderdoc_cmp_root", document.getElementById("setup-cmp-root").value.trim());
   formData.append("setup_completed", "true");
 
@@ -1492,28 +1437,96 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
   btn.addEventListener("click", () => switchTab(btn.dataset.tab));
 });
 
-document.getElementById("analyze-form").addEventListener("submit", handleAnalyze);
 document.getElementById("cmp-form").addEventListener("submit", handleCmpRun);
 document.getElementById("perf-form").addEventListener("submit", handlePerfRun);
 document.getElementById("asset-pass-scan-form").addEventListener("submit", handleAssetPassScan);
 document.getElementById("asset-export-form").addEventListener("submit", handleAssetExportCreate);
 document.getElementById("asset-csv-inspect-form").addEventListener("submit", handleAssetCsvInspect);
 document.getElementById("asset-csv-convert-btn").addEventListener("click", handleAssetCsvConvert);
-document.getElementById("chat-form").addEventListener("submit", handleChat);
-document.getElementById("eid-form").addEventListener("submit", handleEidDeepDive);
-document.getElementById("ue-scan-form").addEventListener("submit", handleUEScan);
+document.getElementById("shader-convert-form").addEventListener("submit", handleShaderConvert);
 document.getElementById("setup-form").addEventListener("submit", handleSetupSave);
 document.getElementById("refresh-health-btn").addEventListener("click", loadHealth);
 document.getElementById("open-setup-btn").addEventListener("click", showSetupModal);
 document.getElementById("setup-close-btn").addEventListener("click", hideSetupModal);
 document.getElementById("asset-export-mapping-confirm-btn").addEventListener("click", handleAssetExportMappingConfirm);
 document.getElementById("asset-export-mapping-cancel-btn").addEventListener("click", hideAssetExportMappingModal);
-document.getElementById("pick-before-path-btn").addEventListener("click", () => pickDesktopFile("pick_rdc_file", "before-path"));
-document.getElementById("pick-after-path-btn").addEventListener("click", () => pickDesktopFile("pick_rdc_file", "after-path"));
+document.getElementById("shader-copy-output-btn").addEventListener("click", async () => {
+  try {
+    await copyTextFromElement("shader-output-spec");
+  } catch (error) {
+    alert(error.message || "复制失败");
+  }
+});
+document.getElementById("shader-copy-inputs-btn").addEventListener("click", async () => {
+  try {
+    await copyTextFromElement("shader-input-spec");
+  } catch (error) {
+    alert(error.message || "复制失败");
+  }
+});
+document.getElementById("shader-copy-hlsl-btn").addEventListener("click", async () => {
+  try {
+    await copyTextFromElement("shader-hlsl-code");
+  } catch (error) {
+    alert(error.message || "复制失败");
+  }
+});
+document.getElementById("shader-copy-vertex-hlsl-btn").addEventListener("click", async () => {
+  try {
+    await copyTextFromElement("shader-vertex-hlsl-code");
+  } catch (error) {
+    alert(error.message || "复制失败");
+  }
+});
+document.getElementById("shader-copy-vertex-summary-btn").addEventListener("click", async () => {
+  try {
+    await copyTextFromElement("shader-vertex-summary");
+  } catch (error) {
+    alert(error.message || "复制失败");
+  }
+});
+document.getElementById("shader-copy-pure-graph-summary-btn").addEventListener("click", async () => {
+  try {
+    await copyTextFromElement("shader-pure-graph-summary");
+  } catch (error) {
+    alert(error.message || "复制失败");
+  }
+});
+document.getElementById("shader-copy-pure-graph-t3d-btn").addEventListener("click", async () => {
+  try {
+    await copyTextFromElement("shader-pure-graph-t3d");
+  } catch (error) {
+    alert(error.message || "复制失败");
+  }
+});
+document.getElementById("shader-copy-pure-graph-unsupported-btn").addEventListener("click", async () => {
+  try {
+    await copyTextFromElement("shader-pure-graph-unsupported");
+  } catch (error) {
+    alert(error.message || "复制失败");
+  }
+});
+document.getElementById("shader-copy-t3d-btn").addEventListener("click", async () => {
+  try {
+    await copyTextFromElement("shader-t3d-text");
+  } catch (error) {
+    alert(error.message || "复制失败");
+  }
+});
+document.getElementById("shader-copy-package-btn").addEventListener("click", async () => {
+  try {
+    await copyTextFromElement("shader-copy-package");
+  } catch (error) {
+    alert(error.message || "复制失败");
+  }
+});
 document.getElementById("pick-cmp-base-path-btn").addEventListener("click", () => pickDesktopFile("pick_rdc_file", "cmp-base-path"));
 document.getElementById("pick-cmp-new-path-btn").addEventListener("click", () => pickDesktopFile("pick_rdc_file", "cmp-new-path"));
 document.getElementById("pick-perf-capture-path-btn").addEventListener("click", () => pickDesktopFile("pick_rdc_file", "perf-capture-path"));
 document.getElementById("pick-asset-capture-path-btn").addEventListener("click", () => pickDesktopFile("pick_rdc_file", "asset-capture-source-path"));
+document.getElementById("pick-shader-fragment-path-btn").addEventListener("click", () => pickDesktopFile("pick_any_file", "shader-fragment-path"));
+document.getElementById("pick-shader-vertex-path-btn").addEventListener("click", () => pickDesktopFile("pick_any_file", "shader-vertex-path"));
+document.getElementById("pick-shader-params-path-btn").addEventListener("click", () => pickDesktopFile("pick_any_file", "shader-params-path"));
 document.getElementById("pick-asset-csv-path-btn").addEventListener("click", () => pickDesktopCsvFiles("asset-csv-source-path"));
 document.getElementById("pick-asset-csv-dir-btn").addEventListener("click", () => pickDesktopDirectory("asset-csv-source-path"));
 document.getElementById("perf-sort-field").addEventListener("change", renderPerfTable);
@@ -1584,7 +1597,6 @@ document.addEventListener("click", (event) => {
 });
 loadHealth();
 loadSetupStatus();
-loadSessions();
 loadCmpJobs();
 loadPerfJobs();
 loadAssetExportJobs();
