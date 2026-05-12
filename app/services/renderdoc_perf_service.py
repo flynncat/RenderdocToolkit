@@ -60,8 +60,19 @@ class RenderdocPerfService:
         return self.store.get_job_detail(job_id)
 
     def analyze_capture(self, job_id: str, capture_path: Path, renderdoc_dir: str = "") -> Dict[str, Any]:
-        from app.services.renderdoc_runtime_resolver import resolve_renderdoc_runtime
+        from app.services.renderdoc_runtime_resolver import (
+            resolve_renderdoc_runtime,
+            capture_needs_foreign_renderdoc,
+        )
         rd_ctx = resolve_renderdoc_runtime(renderdoc_dir)
+
+        if capture_needs_foreign_renderdoc(capture_path):
+            if rd_ctx.renderdoc_cmd_path:
+                return self._analyze_capture_via_xml(job_id, capture_path, rd_ctx)
+            raise RuntimeError(
+                "当前 capture 文件格式与已安装的 RenderDoc 不兼容，"
+                "且未指定包含 renderdoccmd 的自定义 RenderDoc 目录。"
+            )
 
         job_dir = self.store.job_path(job_id)
         preview_dir = job_dir / "artifacts" / "previews"
@@ -205,6 +216,74 @@ class RenderdocPerfService:
             "url": url,
             "kind": "wireframe_overlay",
         }
+
+    def _analyze_capture_via_xml(
+        self,
+        job_id: str,
+        capture_path: Path,
+        rd_ctx: Any,
+    ) -> Dict[str, Any]:
+        """Fallback path: convert the capture to XML with the task-specific
+        ``renderdoccmd`` and extract analysis from the structured XML data.
+        Used when the capture format is not readable by the standard renderdoc
+        Python module (e.g. older/custom RenderDoc builds).
+        """
+        from app.services.renderdoc_runtime_resolver import convert_capture_to_xml
+        from app.services.renderdoc_xml_analyzer import analyze_capture_xml
+
+        job_dir = self.store.job_path(job_id)
+        work_dir = job_dir / "workdir"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        xml_path = convert_capture_to_xml(capture_path, rd_ctx.renderdoc_cmd_path, work_dir)
+        if xml_path is None:
+            raise RuntimeError(
+                f"无法用自定义 renderdoccmd 转换 capture 为 XML。"
+                f"renderdoccmd={rd_ctx.renderdoc_cmd_path}"
+            )
+
+        analysis = analyze_capture_xml(xml_path)
+        analysis["capture_path"] = str(capture_path)
+        analysis["capture_name"] = capture_path.name
+
+        self.store.write_json_artifact(job_id, "artifacts/perf_analysis.json", analysis)
+        run_log = (
+            f"[capture] {capture_path}\n"
+            f"[renderdoc] dir={rd_ctx.renderdoc_dir} cmd={rd_ctx.renderdoc_cmd_path} source={rd_ctx.source}\n"
+            f"[mode] xml_fallback\n"
+            f"[xml] {xml_path}\n"
+            f"[draws] {analysis['overview']['draw_count']}\n"
+            f"[triangles] {analysis['overview']['total_triangles']}\n"
+        )
+        self.store.write_text_artifact(job_id, "artifacts/perf_run_log.txt", run_log)
+
+        overview = analysis.get("overview", {})
+        pass_chart = analysis.get("pass_chart", [])
+        rows = analysis.get("rows", [])
+        metadata = self.store.update_metadata(
+            job_id,
+            {
+                "status": "completed",
+                "inputs": {
+                    "capture_file": str(capture_path),
+                    "renderdoc_dir_requested": rd_ctx.renderdoc_dir,
+                    "renderdoc_dir_resolved": rd_ctx.renderdoc_dir,
+                    "renderdoc_python_path": rd_ctx.renderdoc_python_path,
+                    "renderdoc_source": rd_ctx.source,
+                    "analysis_mode": "xml_fallback",
+                },
+                "summary": {
+                    "row_count": len(rows),
+                    "total_gpu_duration_ms": 0.0,
+                    "hottest_pass": pass_chart[0]["name"] if pass_chart else "",
+                    "total_triangles": overview.get("total_triangles", 0),
+                    "analysis_mode": "xml_fallback",
+                },
+            },
+        )
+        detail = self.store.get_job_detail(job_id)
+        detail["metadata"] = metadata
+        return detail
 
     def _load_draws_payload(self, capture_path: Path) -> Any:
         return self._run_session_json(capture_path, ["rdc", "draws", "--json"])
