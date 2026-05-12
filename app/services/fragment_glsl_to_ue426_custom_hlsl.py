@@ -303,6 +303,68 @@ float2 unpackHalf2x16_emu(uint u)
             "used_input_names": used_input_names,
         }
 
+    def convert_standalone_hlsl(
+        self,
+        *,
+        fragment_source: str,
+        shader_params_json: str = "",
+    ) -> dict[str, Any]:
+        """Pure GLSL→HLSL syntax conversion without UE-specific expressions.
+
+        Returns a dict with ``hlsl_code``, ``warnings``, etc.  The output
+        is a self-contained HLSL fragment shader that can be compiled by DXC.
+        """
+        warnings: list[str] = []
+        unsupported: list[str] = []
+
+        fragment_source = self._normalize_source(fragment_source)
+        cleaned = self._strip_renderdoc_header(fragment_source)
+        main_range = self._find_main_block(cleaned)
+        if main_range is None:
+            raise ValueError("未在 fragment shader 中找到 void main()。")
+
+        prefix = cleaned[: main_range["start"]].strip()
+        prefix, helper_markers = self._extract_known_helper_blocks(prefix)
+        body = cleaned[main_range["body_start"] : main_range["body_end"]].strip()
+
+        declarations = self._parse_global_declarations(prefix, warnings, unsupported)
+
+        translated_body = self._translate_body(body, unsupported)
+        const_locals = [
+            self._translate_statement(item["statement"], unsupported)
+            for item in declarations["const"]
+        ]
+
+        lines: list[str] = []
+        lines.extend(self._build_support_helpers_hlsl(helper_markers, translated_body))
+
+        for cat in ("uniform", "in"):
+            for item in declarations[cat]:
+                hlsl_type = self.GLSL_TYPE_TO_HLSL.get(item["type"], item["type"])
+                lines.append(f"{hlsl_type} {item['name']};")
+
+        for item in declarations["out"]:
+            hlsl_type = self.GLSL_TYPE_TO_HLSL.get(item["type"], item["type"])
+            lines.append(f"{hlsl_type} {item['name']};")
+
+        lines.append("")
+        lines.append("void main_standalone()")
+        lines.append("{")
+        for decl in const_locals:
+            if decl:
+                lines.append(f"    {decl}")
+        for line in translated_body.splitlines():
+            lines.append(f"    {line}" if line.strip() else "")
+        lines.append("}")
+
+        hlsl_code = "\n".join(lines).strip()
+        return {
+            "hlsl_code": hlsl_code,
+            "warnings": warnings,
+            "unsupported": unsupported,
+            "mode": "standalone_hlsl",
+        }
+
     def _build_internal_matrix_decls(
         self,
         uniform_declarations: list[dict[str, str]],

@@ -17,13 +17,10 @@ import app.config as app_config
 from app.services.asset_export_service import AssetExportService
 from app.services.asset_export_store import AssetExportStore
 from app.services.csv_model_converter import CsvModelConverter
-from app.services.fragment_glsl_to_ue426_custom_hlsl import FragmentGlslToUe426CustomHlslService
 from app.services.renderdoc_cmp_service import RenderdocCmpService
 from app.services.renderdoc_perf_service import RenderdocPerfService
 from app.services.renderdoc_perf_store import RenderdocPerfStore
 from app.services.subprocess_utils import hidden_subprocess_kwargs
-from app.services.ue_pure_graph_t3d_builder import UePureGraphT3DBuilder
-from app.services.ue_material_t3d_builder import UeMaterialT3DBuilder
 
 
 app = FastAPI(title="RenderDoc Tools UI", version="0.1.0")
@@ -39,9 +36,6 @@ cmp_service = RenderdocCmpService()
 perf_service = RenderdocPerfService(perf_store)
 csv_model_converter = CsvModelConverter()
 asset_export_service = AssetExportService(asset_export_store, csv_model_converter)
-fragment_glsl_to_ue_service = FragmentGlslToUe426CustomHlslService()
-ue_material_t3d_builder = UeMaterialT3DBuilder()
-ue_pure_graph_t3d_builder = UePureGraphT3DBuilder()
 
 
 def _run_shell_command(command: list[str], timeout_seconds: float | None = None) -> tuple[bool, str]:
@@ -544,7 +538,10 @@ async def run_renderdoc_cmp_by_path(
 
 
 @app.post("/api/renderdoc-perf/analyze/by-path")
-async def run_renderdoc_perf_by_path(capture_path: str = Form(...)) -> dict:
+async def run_renderdoc_perf_by_path(
+    capture_path: str = Form(...),
+    renderdoc_dir: str = Form(""),
+) -> dict:
     capture_file = _require_existing_file(capture_path, ".rdc", "capture_path")
     title = f"renderdoc_perf: {capture_file.name}"
     metadata = perf_service.create_job(title=title)
@@ -555,11 +552,12 @@ async def run_renderdoc_perf_by_path(capture_path: str = Form(...)) -> dict:
             "status": "running",
             "inputs": {
                 "capture_file": str(capture_file),
+                "renderdoc_dir_requested": renderdoc_dir.strip(),
             },
         },
     )
     try:
-        return perf_service.analyze_capture_isolated(job_id, capture_file)
+        return perf_service.analyze_capture_isolated(job_id, capture_file, renderdoc_dir=renderdoc_dir)
     except Exception as exc:
         perf_service.store.update_metadata(job_id, {"status": "failed"})
         raise HTTPException(status_code=500, detail=f"性能分析失败: {exc}") from exc
@@ -1125,81 +1123,6 @@ async def convert_asset_export_csv_standalone(
     )
 
 
-@app.post("/api/shader-tools/fragment-to-ue-custom")
-async def convert_fragment_to_ue_custom(
-    fragment_source: str = Form(...),
-    vertex_source: str = Form(""),
-    shader_params_json: str = Form(""),
-) -> dict:
-    try:
-        legacy_payload = fragment_glsl_to_ue_service.convert(
-            fragment_source=fragment_source,
-            vertex_source=vertex_source,
-            shader_params_json=shader_params_json,
-        )
-        t3d_payload = ue_material_t3d_builder.build(
-            fragment_source=fragment_source,
-            vertex_source=vertex_source,
-            shader_params_json=shader_params_json,
-        )
-        pure_graph_payload = ue_pure_graph_t3d_builder.build(
-            fragment_source=fragment_source,
-            vertex_source=vertex_source,
-            shader_params_json=shader_params_json,
-        )
-        legacy_payload.update(t3d_payload)
-        legacy_payload.update(pure_graph_payload)
-        return legacy_payload
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"fragment shader 转 UE Custom 节点失败: {exc}") from exc
-
-
-@app.post("/api/shader-tools/fragment-to-ue-custom/by-path")
-async def convert_fragment_to_ue_custom_by_path(
-    fragment_path: str = Form(...),
-    vertex_path: str = Form(""),
-    shader_params_path: str = Form(""),
-) -> dict:
-    fragment_file = _require_existing_text_file(fragment_path, "fragment_path", (".glsl", ".frag", ".txt"))
-    vertex_source, vertex_status = _load_optional_text_file(vertex_path, "vertex_path", (".glsl", ".vert", ".txt"))
-    shader_params_json, shader_params_status = _load_optional_text_file(
-        shader_params_path,
-        "shader_params_path",
-        (".json", ".txt"),
-    )
-
-    try:
-        legacy_payload = fragment_glsl_to_ue_service.convert(
-            fragment_source=fragment_file.read_text(encoding="utf-8", errors="replace"),
-            vertex_source=vertex_source,
-            shader_params_json=shader_params_json,
-        )
-        t3d_payload = ue_material_t3d_builder.build(
-            fragment_source=fragment_file.read_text(encoding="utf-8", errors="replace"),
-            vertex_source=vertex_source,
-            shader_params_json=shader_params_json,
-        )
-        pure_graph_payload = ue_pure_graph_t3d_builder.build(
-            fragment_source=fragment_file.read_text(encoding="utf-8", errors="replace"),
-            vertex_source=vertex_source,
-            shader_params_json=shader_params_json,
-        )
-        legacy_payload.update(t3d_payload)
-        legacy_payload.update(pure_graph_payload)
-        legacy_payload["path_status"] = {
-            "fragment_path": f"已读取: {fragment_file}",
-            "vertex_path": vertex_status,
-            "shader_params_path": shader_params_status,
-        }
-        return legacy_payload
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"fragment shader 转 UE Custom 节点失败: {exc}") from exc
-
-
 @app.get("/api/asset-export/jobs/{job_id}/artifact")
 async def get_asset_export_artifact(job_id: str, path: str) -> FileResponse:
     try:
@@ -1271,7 +1194,10 @@ async def run_renderdoc_cmp(
 
 
 @app.post("/api/renderdoc-perf/analyze")
-async def run_renderdoc_perf(capture_file: UploadFile = File(...)) -> dict:
+async def run_renderdoc_perf(
+    capture_file: UploadFile = File(...),
+    renderdoc_dir: str = Form(""),
+) -> dict:
     _ensure_rdc_file(capture_file.filename)
     title = f"renderdoc_perf: {capture_file.filename}"
     metadata = perf_service.create_job(title=title)
@@ -1283,14 +1209,101 @@ async def run_renderdoc_perf(capture_file: UploadFile = File(...)) -> dict:
             "status": "running",
             "inputs": {
                 "capture_file": str(Path(saved_capture).relative_to(Path(saved_capture).parents[1])),
+                "renderdoc_dir_requested": renderdoc_dir.strip(),
             },
         },
     )
     try:
-        return perf_service.analyze_capture_isolated(job_id, saved_capture)
+        return perf_service.analyze_capture_isolated(job_id, saved_capture, renderdoc_dir=renderdoc_dir)
     except Exception as exc:
         perf_service.store.update_metadata(job_id, {"status": "failed"})
         raise HTTPException(status_code=500, detail=f"性能分析失败: {exc}") from exc
+
+
+
+
+@app.post("/api/visual-probe/run")
+async def run_visual_probe(
+    capture_path: str = Form(...),
+    eid: str = Form(...),
+    stage: str = Form("ps"),
+    ssim_threshold: str = Form("0.995"),
+    max_probes: str = Form("200"),
+    compile_only: str = Form("true"),
+    use_llm: str = Form("false"),
+) -> dict:
+    rdc_path = _require_existing_file(capture_path, ".rdc", "RDC 路径")
+    try:
+        eid_int = int(eid)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="EID 必须为整数")
+
+    try:
+        threshold = float(ssim_threshold)
+    except ValueError:
+        threshold = 0.995
+
+    try:
+        max_p = int(max_probes)
+    except ValueError:
+        max_p = 200
+
+    is_compile_only = compile_only.lower() in ("true", "1", "yes", "on")
+    is_use_llm = use_llm.lower() in ("true", "1", "yes", "on")
+
+    export_root = Path(str(rdc_path).rsplit(".", 1)[0] + "_RenderdocDiffExport")
+    shader_dir = export_root / "shaders"
+    glsl_source = ""
+    params_json = ""
+
+    eid_pattern = f"*{eid_int}*"
+    if shader_dir.exists():
+        for eid_dir in shader_dir.iterdir():
+            if eid_dir.is_dir() and str(eid_int) in eid_dir.name:
+                for fs in eid_dir.glob("*_fs.glsl"):
+                    glsl_source = fs.read_text(encoding="utf-8", errors="replace")
+                    break
+                for pf in eid_dir.glob("*_shader_params.json"):
+                    params_json = pf.read_text(encoding="utf-8", errors="replace")
+                    break
+                break
+
+    if not glsl_source:
+        raise HTTPException(
+            status_code=400,
+            detail=f"未找到 EID {eid_int} 的 fragment shader。请先通过资产导出功能导出 shader。",
+        )
+
+    from app.services.visual_probe_simplifier import VisualProbeSimplifier
+    from app.services.llm_shader_simplifier import LlmShaderSimplifier
+
+    llm_simp = LlmShaderSimplifier() if is_use_llm else None
+    probe = VisualProbeSimplifier(llm_simplifier=llm_simp)
+
+    output_dir = export_root / "visual_probe_sessions" / f"EID_{eid_int}"
+
+    try:
+        result = probe.run(
+            capture_path=rdc_path,
+            eid=eid_int,
+            original_glsl=glsl_source,
+            shader_params_json=params_json,
+            output_dir=output_dir,
+            stage=stage,
+            ssim_threshold=threshold,
+            max_probes=max_p,
+            compile_only=is_compile_only,
+            use_llm=is_use_llm,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"视觉探针简化失败: {exc}") from exc
+
+    return {
+        "success": True,
+        **result.to_dict(),
+        "final_source": result.final_source,
+        "static_simplified_source": result.static_simplified_source,
+    }
 
 
 if __name__ == "__main__":

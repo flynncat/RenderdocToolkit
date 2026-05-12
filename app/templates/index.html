@@ -45,6 +45,7 @@
     <button class="tab-btn active" data-tab="perf">性能</button>
     <button class="tab-btn" data-tab="cmp">性能 Diff</button>
     <button class="tab-btn" data-tab="asset-export">资产批量导出</button>
+    <button class="tab-btn" data-tab="shader-simplify">Shader 简化</button>
   </nav>
 
   <main id="workspace-perf" class="layout layout-perf tab-workspace active">
@@ -57,6 +58,13 @@
           <button id="pick-perf-capture-path-btn" type="button" class="secondary-btn">浏览</button>
         </div>
         <input id="perf-capture-file" name="capture_file" type="file" accept=".rdc" class="hidden">
+
+        <label>RenderDoc 目录（可选）</label>
+        <div class="input-with-button">
+          <input id="perf-renderdoc-dir" name="renderdoc_dir" type="text" placeholder="例如 C:\Program Files\RenderDoc">
+          <button id="pick-perf-renderdoc-dir-btn" type="button" class="secondary-btn">浏览</button>
+        </div>
+
         <button id="perf-run-btn" type="submit">执行性能分析</button>
       </form>
 
@@ -135,7 +143,10 @@
         <div class="row">
           <div>
             <label>RenderDoc 目录（可选）</label>
-            <input id="cmp-renderdoc-dir" name="renderdoc_dir" type="text" placeholder="例如 C:\Program Files\RenderDoc">
+            <div class="input-with-button">
+              <input id="cmp-renderdoc-dir" name="renderdoc_dir" type="text" placeholder="例如 C:\Program Files\RenderDoc">
+              <button id="pick-cmp-renderdoc-dir-btn" type="button" class="secondary-btn">浏览</button>
+            </div>
           </div>
           <div>
             <label>Malioc 路径（可选）</label>
@@ -347,77 +358,136 @@
           真正执行时会对每个 draw 或 CSV 单独自动识别，并对不适用的手动覆盖字段自动回退。
         </div>
       </div>
-      <div class="chat-box">
-        <h3>FS GLSL -> UE4.26 Custom 节点</h3>
-        <form id="shader-convert-form">
-          <label>Fragment Shader 路径</label>
-          <div class="input-with-button">
-            <input id="shader-fragment-path" type="text" placeholder="例如 G:\抓帧\...\eid_288_-_fs.glsl">
-            <button id="pick-shader-fragment-path-btn" type="button" class="secondary-btn">浏览</button>
+    </section>
+  </main>
+
+  <main id="workspace-shader-simplify" class="layout layout-shader-simplify tab-workspace">
+    <section class="panel form-panel">
+      <h2>视觉探针 Shader 简化</h2>
+      <form id="vp-form">
+        <label>RenderDoc `.rdc` 路径</label>
+        <div class="input-with-button">
+          <input id="vp-capture-path" type="text" placeholder="例如 G:\抓帧\蛋仔描边抓帧\DZ_ZMXT-frame5080.rdc">
+          <button id="pick-vp-capture-btn" type="button" class="secondary-btn">浏览</button>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>EID</label>
+            <input id="vp-eid" type="text" placeholder="例如 253">
           </div>
-          <div id="shader-fragment-path-hint" class="field-hint">必填：必须提供 fragment shader 文件。</div>
-
-          <label>Vertex Shader 路径（可选）</label>
-          <div class="input-with-button">
-            <input id="shader-vertex-path" type="text" placeholder="例如 G:\抓帧\...\eid_288_-_vs.glsl">
-            <button id="pick-shader-vertex-path-btn" type="button" class="secondary-btn">浏览</button>
+          <div>
+            <label>Stage</label>
+            <select id="vp-stage">
+              <option value="ps" selected>Fragment (PS)</option>
+              <option value="vs">Vertex (VS)</option>
+            </select>
           </div>
-          <div id="shader-vertex-path-hint" class="field-hint">可选：未提供时会跳过 vertex custom node。</div>
+        </div>
 
-          <label>Shader Params 路径（可选）</label>
-          <div class="input-with-button">
-            <input id="shader-params-path" type="text" placeholder="例如 G:\抓帧\...\eid_288_-_shader_params.json">
-            <button id="pick-shader-params-path-btn" type="button" class="secondary-btn">浏览</button>
+        <div class="row">
+          <div>
+            <label>SSIM 阈值</label>
+            <input id="vp-ssim-threshold" type="text" value="0.995" placeholder="0.995">
           </div>
-          <div id="shader-params-path-hint" class="field-hint">可选：未提供时默认值信息会留空。</div>
+          <div>
+            <label>最大探针数</label>
+            <input id="vp-max-probes" type="text" value="200" placeholder="200">
+          </div>
+        </div>
 
-          <button id="shader-convert-btn" type="submit">生成 UE4.26 Custom 节点复制包</button>
-        </form>
+        <div class="checkbox-row">
+          <label><input id="vp-compile-only" type="checkbox" checked> 仅编译验证（无 SSIM 比对）</label>
+          <label><input id="vp-use-llm" type="checkbox"> 启用 LLM 辅助简化</label>
+        </div>
 
-        <div id="shader-convert-summary" class="empty-state">这里会生成 fragment/vertex 的 Custom 节点信息，以及可直接粘贴到 UE4.26 材质图的 T3D 文本。</div>
+        <button id="vp-run-btn" type="submit">执行视觉探针简化</button>
+      </form>
 
-        <label>Fragment 输出类型</label>
-        <textarea id="shader-output-spec" rows="3" readonly placeholder="等待生成..."></textarea>
-        <button id="shader-copy-output-btn" type="button" class="secondary-btn">复制输出类型</button>
+      <div id="vp-progress-area" class="hidden">
+        <div class="vp-progress-bar-container">
+          <div id="vp-progress-bar" class="vp-progress-bar" style="width:0%"></div>
+        </div>
+        <div id="vp-progress-text" class="vp-progress-text">准备中...</div>
+      </div>
 
-        <label>Fragment 输入清单</label>
-        <textarea id="shader-input-spec" rows="8" readonly placeholder="等待生成..."></textarea>
-        <button id="shader-copy-inputs-btn" type="button" class="secondary-btn">复制输入清单</button>
+      <div id="vp-completion-log" class="hidden">
+        <h3>完成日志</h3>
+        <pre id="vp-completion-log-text" class="analysis-pre"></pre>
+      </div>
+    </section>
 
-        <label>Fragment HLSL 代码</label>
-        <textarea id="shader-hlsl-code" rows="14" readonly placeholder="等待生成..."></textarea>
-        <button id="shader-copy-hlsl-btn" type="button" class="secondary-btn">复制 HLSL</button>
+    <section class="panel result-panel">
+      <h2 id="vp-result-heading">简化结果</h2>
+      <div id="vp-result-summary" class="empty-state">尚未执行简化。填写 RDC 路径和 EID 后点击执行。</div>
 
-        <label>Vertex HLSL 代码</label>
-        <textarea id="shader-vertex-hlsl-code" rows="14" readonly placeholder="等待生成..."></textarea>
-        <button id="shader-copy-vertex-hlsl-btn" type="button" class="secondary-btn">复制 Vertex HLSL</button>
+      <div id="vp-result-detail" class="hidden">
+        <div class="vp-metrics-row">
+          <div class="vp-metric-card">
+            <div id="vp-lines-original" class="vp-metric-value">—</div>
+            <div class="vp-metric-label">原始行数</div>
+          </div>
+          <div class="vp-metric-card">
+            <div id="vp-lines-static" class="vp-metric-value">—</div>
+            <div class="vp-metric-label">静态简化</div>
+          </div>
+          <div class="vp-metric-card">
+            <div id="vp-lines-final" class="vp-metric-value highlight">—</div>
+            <div class="vp-metric-label">最终行数</div>
+          </div>
+          <div class="vp-metric-card">
+            <div id="vp-reduction-pct" class="vp-metric-value highlight">—</div>
+            <div class="vp-metric-label">总缩减率</div>
+          </div>
+        </div>
 
-        <label>Vertex 节点摘要</label>
-        <textarea id="shader-vertex-summary" rows="8" readonly placeholder="等待生成..."></textarea>
-        <button id="shader-copy-vertex-summary-btn" type="button" class="secondary-btn">复制 Vertex 摘要</button>
+        <div class="vp-metrics-row">
+          <div class="vp-metric-card small">
+            <div id="vp-total-probes" class="vp-metric-value">—</div>
+            <div class="vp-metric-label">总探针</div>
+          </div>
+          <div class="vp-metric-card small accepted">
+            <div id="vp-accepted-probes" class="vp-metric-value">—</div>
+            <div class="vp-metric-label">接受</div>
+          </div>
+          <div class="vp-metric-card small rejected">
+            <div id="vp-rejected-probes" class="vp-metric-value">—</div>
+            <div class="vp-metric-label">拒绝</div>
+          </div>
+          <div class="vp-metric-card small">
+            <div id="vp-compile-failed" class="vp-metric-value">—</div>
+            <div class="vp-metric-label">编译失败</div>
+          </div>
+        </div>
 
-        <label>纯 UE Shader Graph 摘要</label>
-        <textarea id="shader-pure-graph-summary" rows="5" readonly placeholder="等待生成..."></textarea>
-        <button id="shader-copy-pure-graph-summary-btn" type="button" class="secondary-btn">复制纯图摘要</button>
+        <h3>探针步骤</h3>
+        <div id="vp-probe-steps" class="vp-probe-list"></div>
 
-        <label>纯 UE Shader Graph T3D</label>
-        <textarea id="shader-pure-graph-t3d" rows="18" readonly placeholder="等待生成..."></textarea>
-        <button id="shader-copy-pure-graph-t3d-btn" type="button" class="secondary-btn">复制纯图 T3D</button>
+        <h3>最终简化 GLSL</h3>
+        <div class="textarea-with-copy">
+          <textarea id="vp-final-source" rows="18" readonly></textarea>
+          <button id="vp-copy-final-btn" type="button" class="secondary-btn copy-btn">复制</button>
+        </div>
+      </div>
+    </section>
 
-        <label>纯图不支持项</label>
-        <textarea id="shader-pure-graph-unsupported" rows="8" readonly placeholder="等待生成..."></textarea>
-        <button id="shader-copy-pure-graph-unsupported-btn" type="button" class="secondary-btn">复制纯图不支持项</button>
-
-        <label>UE4.26 T3D 文本</label>
-        <textarea id="shader-t3d-text" rows="18" readonly placeholder="等待生成..."></textarea>
-        <button id="shader-copy-t3d-btn" type="button" class="secondary-btn">复制 T3D</button>
-
-        <label>完整复制包</label>
-        <textarea id="shader-copy-package" rows="18" readonly placeholder="等待生成..."></textarea>
-        <button id="shader-copy-package-btn" type="button" class="secondary-btn">复制完整包</button>
+    <section class="panel session-panel">
+      <h2>说明</h2>
+      <div class="empty-state">
+        <p><strong>视觉探针简化</strong>会自动：</p>
+        <ol style="text-align:left;padding-left:20px;margin:8px 0;">
+          <li>进行 L0-L4 静态简化</li>
+          <li>分析预处理指令（#define, #if, #extension）</li>
+          <li>探测 Uniform 贡献度</li>
+          <li>探测 if/else 各分支的影响</li>
+          <li>探测语句级别的影响</li>
+        </ol>
+        <p>每个探针修改后通过 RenderDoc 回放验证，只保留不影响画面的简化。</p>
+        <p style="color:#8b949e;font-size:0.85em;">仅编译验证模式速度更快，但不做像素比对。</p>
       </div>
     </section>
   </main>
+
 
   <div id="asset-export-mapping-modal" class="modal-backdrop hidden">
     <div class="modal-panel asset-export-mapping-modal-panel">
@@ -486,6 +556,7 @@
     </div>
     <img id="perf-preview-panel-image" class="perf-preview-panel-image" alt="preview">
   </div>
+
 
   <script src="/static/app.js"></script>
 </body>

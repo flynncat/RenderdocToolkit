@@ -200,12 +200,18 @@ function renderCmpSummary(detail) {
   const metadata = detail.metadata || {};
   const inputs = metadata.inputs || {};
   const reportUrl = detail.report_url || "";
+  const cmpRdSource = (inputs.renderdoc_source || "").trim();
+  const cmpRdResolved = (inputs.renderdoc_dir_resolved || "").trim();
+  const cmpRdLine = cmpRdResolved
+    ? `<div><strong>RenderDoc:</strong> ${escapeHtml(cmpRdResolved)}${cmpRdSource ? ` (${escapeHtml(cmpRdSource)})` : ""}</div>`
+    : "";
   document.getElementById("cmp-summary").innerHTML = `
     <div><strong>Job:</strong> ${metadata.job_id || "-"}</div>
     <div><strong>状态:</strong> ${metadata.status || "-"}</div>
     <div><strong>Base:</strong> ${inputs.base_file || "-"}</div>
     <div><strong>New:</strong> ${inputs.new_file || "-"}</div>
     <div><strong>Strict:</strong> ${String(inputs.strict_mode == null ? "-" : inputs.strict_mode)}</div>
+    ${cmpRdLine}
   `;
   document.getElementById("cmp-run-log").textContent = detail.run_log || "暂无日志";
   const linkWrap = document.getElementById("cmp-report-link-wrap");
@@ -246,10 +252,16 @@ function renderPerfSummary(detail) {
   const overview = analysis.overview || {};
   const captureInfo = analysis.capture_info || {};
   currentPerfAnalysis = analysis;
+  const rdSource = (inputs.renderdoc_source || "").trim();
+  const rdResolved = (inputs.renderdoc_dir_resolved || "").trim();
+  const rdLine = rdResolved
+    ? `<div><strong>RenderDoc:</strong> ${escapeHtml(rdResolved)}${rdSource ? ` (${escapeHtml(rdSource)})` : ""}</div>`
+    : "";
   document.getElementById("perf-summary").innerHTML = `
     <div><strong>Job:</strong> ${metadata.job_id || "-"}</div>
     <div><strong>状态:</strong> ${metadata.status || "-"}</div>
-    <div><strong>Capture:</strong> ${(metadata.inputs || {}).capture_file || "-"}</div>
+    <div><strong>Capture:</strong> ${inputs.capture_file || "-"}</div>
+    ${rdLine}
     <div><strong>驱动:</strong> ${captureInfo.driver_name || "-"}</div>
     <div><strong>总 GPU:</strong> ${Number(overview.total_gpu_duration_ms || 0).toFixed(3)} ms</div>
     <div><strong>Draw 数:</strong> ${overview.draw_count || 0}</div>
@@ -855,143 +867,7 @@ function renderAssetExportFiles(jobId, manifest) {
   });
 }
 
-function formatShaderOutputText(output) {
-  if (!output || !output.ue_output_type) {
-    return "";
-  }
-  return [
-    `Name: ${output.name || "-"}`,
-    `OutputType: ${output.ue_output_type || "-"}`,
-    `GLSL Type: ${output.glsl_type || "-"}`,
-  ].join("\n");
-}
-
-function formatShaderInputsText(inputs) {
-  const items = Array.isArray(inputs) ? inputs : [];
-  if (!items.length) {
-    return "无";
-  }
-  return items.map((item) => {
-    const parts = [
-      `${item.name || "-"}: ${item.ue_input_type || "-"} (GLSL ${item.glsl_type || "-"})`,
-    ];
-    if (item.default_value !== null && item.default_value !== undefined && item.default_value !== "") {
-      parts.push(`default=${JSON.stringify(item.default_value)}`);
-    }
-    if (item.source_hint) {
-      parts.push(`vertex_hint=${item.source_hint}`);
-    }
-    return parts.join(" ; ");
-  }).join("\n");
-}
-
-function formatShaderStageSummary(stage) {
-  if (!stage) {
-    return "未生成";
-  }
-  const outputs = (stage.outputs || []).map((item) => `${item.name}: ${item.ue_output_type}`).join(" | ") || "无";
-  const inputs = (stage.inputs || []).map((item) => item.name || "-").join(" | ") || "无";
-  const rootMapping = stage.root_mapping || null;
-  const rootSlots = rootMapping ? (rootMapping.recommended_root_slots || []).join(" | ") || "无" : "无";
-  const rootConfidence = rootMapping ? (rootMapping.confidence || "-") : "-";
-  const rootSummary = rootMapping ? (rootMapping.summary || "无") : "无";
-  const rootRationale = rootMapping ? (rootMapping.rationale || []).join("；") || "无" : "无";
-  const warnings = (stage.warnings || []).join("；") || "无";
-  const unsupported = (stage.unsupported || []).join("；") || "无";
-  return [
-    `Stage: ${stage.stage || "-"}`,
-    `Outputs: ${outputs}`,
-    `Inputs: ${inputs}`,
-    `BuiltIn Mapping: ${rootSummary}`,
-    `Suggested Root Slots: ${rootSlots}`,
-    `Confidence: ${rootConfidence}`,
-    `Rationale: ${rootRationale}`,
-    `Warnings: ${warnings}`,
-    `Unsupported: ${unsupported}`,
-  ].join("\n");
-}
-
-function renderShaderPathStatus(status) {
-  const payload = status || {};
-  const fragmentHint = document.getElementById("shader-fragment-path-hint");
-  const vertexHint = document.getElementById("shader-vertex-path-hint");
-  const paramsHint = document.getElementById("shader-params-path-hint");
-  fragmentHint.textContent = payload.fragment_path || "必填：必须提供 fragment shader 文件。";
-  vertexHint.textContent = payload.vertex_path || "可选：未提供时会跳过 vertex custom node。";
-  paramsHint.textContent = payload.shader_params_path || "可选：未提供时默认值信息会留空。";
-}
-
-function renderShaderConvertResult(data) {
-  const summary = document.getElementById("shader-convert-summary");
-  const notes = (data.notes || []).map((item) => `备注: ${item}`);
-  const warnings = (data.warnings || []).map((item) => `警告: ${item}`);
-  const unsupported = (data.unsupported || []).map((item) => `不支持: ${item}`);
-  const lines = [data.summary || "", data.t3d_summary || "", ...notes, ...warnings, ...unsupported].filter(Boolean);
-  summary.innerHTML = lines.length
-    ? lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("")
-    : '<div class="empty-state">转换完成，但没有额外说明。</div>';
-  document.getElementById("shader-output-spec").value = formatShaderOutputText(data.output || {});
-  document.getElementById("shader-input-spec").value = formatShaderInputsText(data.inputs || []);
-  document.getElementById("shader-hlsl-code").value = data.hlsl_code || "";
-  document.getElementById("shader-vertex-hlsl-code").value = data.vertex_hlsl_code || ((data.vertex_stage || {}).hlsl_code || "");
-  document.getElementById("shader-vertex-summary").value = formatShaderStageSummary(data.vertex_stage || null);
-  document.getElementById("shader-pure-graph-summary").value = data.pure_graph_summary || "";
-  document.getElementById("shader-pure-graph-t3d").value = data.pure_graph_t3d_text || "";
-  document.getElementById("shader-pure-graph-unsupported").value = (data.pure_graph_unsupported || []).join("\n");
-  document.getElementById("shader-t3d-text").value = data.t3d_text || "";
-  document.getElementById("shader-copy-package").value = data.t3d_copy_package || data.copy_package || "";
-  renderShaderPathStatus(data.path_status || {});
-}
-
-async function handleShaderConvert(event) {
-  event.preventDefault();
-  const button = document.getElementById("shader-convert-btn");
-  const fragmentPath = document.getElementById("shader-fragment-path").value.trim();
-  const vertexPath = document.getElementById("shader-vertex-path").value.trim();
-  const shaderParamsPath = document.getElementById("shader-params-path").value.trim();
-  if (!fragmentPath) {
-    alert("请先填写 Fragment Shader 路径。");
-    return;
-  }
-
-  button.disabled = true;
-  button.textContent = "转换中...";
-  setSummaryBusy("shader-convert-summary", [
-    "状态: 运行中",
-    "说明: 正在生成 UE4.26 Custom 节点与 T3D 复制包，请稍候...",
-  ]);
-  renderShaderPathStatus({
-    fragment_path: fragmentPath ? "正在读取 fragment shader..." : "必填：必须提供 fragment shader 文件。",
-    vertex_path: vertexPath ? "正在尝试读取 vertex shader..." : "未提供，按空值处理。",
-    shader_params_path: shaderParamsPath ? "正在尝试读取 shader params..." : "未提供，按空值处理。",
-  });
-  document.getElementById("shader-output-spec").value = "";
-  document.getElementById("shader-input-spec").value = "";
-  document.getElementById("shader-hlsl-code").value = "";
-  document.getElementById("shader-vertex-hlsl-code").value = "";
-  document.getElementById("shader-vertex-summary").value = "";
-  document.getElementById("shader-pure-graph-summary").value = "";
-  document.getElementById("shader-pure-graph-t3d").value = "";
-  document.getElementById("shader-pure-graph-unsupported").value = "";
-  document.getElementById("shader-t3d-text").value = "";
-  document.getElementById("shader-copy-package").value = "";
-  try {
-    const formData = new FormData();
-    formData.append("fragment_path", fragmentPath);
-    formData.append("vertex_path", vertexPath);
-    formData.append("shader_params_path", shaderParamsPath);
-    const data = await fetchJson("/api/shader-tools/fragment-to-ue-custom/by-path", {
-      method: "POST",
-      body: formData,
-    });
-    renderShaderConvertResult(data);
-  } catch (error) {
-    alert(error.message || "shader 转换失败");
-  } finally {
-    button.disabled = false;
-    button.textContent = "生成 UE4.26 Custom 节点复制包";
-  }
-}
+// (Shader convert functions moved to standalone tool)
 
 async function loadCmpJobs() {
   const jobs = await fetchJson("/api/renderdoc-cmp/jobs");
@@ -1102,14 +978,16 @@ async function handlePerfRun(event) {
   event.preventDefault();
 
   const capturePath = document.getElementById("perf-capture-path").value.trim();
+  const renderdocDir = document.getElementById("perf-renderdoc-dir").value.trim();
   const button = document.getElementById("perf-run-btn");
   button.disabled = true;
   button.textContent = "分析中...";
   setSummaryBusy("perf-summary", [
     "状态: 运行中",
     `Capture: ${capturePath || document.getElementById('perf-capture-file').files[0]?.name || "-"}`,
+    renderdocDir ? `RenderDoc: ${renderdocDir}` : "",
     "说明: 正在执行单帧性能分析，请稍候...",
-  ]);
+  ].filter(Boolean));
   setLogBusy("perf-run-log", "正在读取 draw/counter 并分析性能，请稍候...");
 
   try {
@@ -1117,6 +995,7 @@ async function handlePerfRun(event) {
     if (capturePath) {
       const formData = new FormData();
       formData.append("capture_path", capturePath);
+      formData.append("renderdoc_dir", renderdocDir);
       response = await fetch("/api/renderdoc-perf/analyze/by-path", {
         method: "POST",
         body: formData,
@@ -1128,6 +1007,7 @@ async function handlePerfRun(event) {
       }
       const formData = new FormData();
       formData.append("capture_file", captureFile);
+      formData.append("renderdoc_dir", renderdocDir);
       response = await fetch("/api/renderdoc-perf/analyze", {
         method: "POST",
         body: formData,
@@ -1443,90 +1323,18 @@ document.getElementById("asset-pass-scan-form").addEventListener("submit", handl
 document.getElementById("asset-export-form").addEventListener("submit", handleAssetExportCreate);
 document.getElementById("asset-csv-inspect-form").addEventListener("submit", handleAssetCsvInspect);
 document.getElementById("asset-csv-convert-btn").addEventListener("click", handleAssetCsvConvert);
-document.getElementById("shader-convert-form").addEventListener("submit", handleShaderConvert);
 document.getElementById("setup-form").addEventListener("submit", handleSetupSave);
 document.getElementById("refresh-health-btn").addEventListener("click", loadHealth);
 document.getElementById("open-setup-btn").addEventListener("click", showSetupModal);
 document.getElementById("setup-close-btn").addEventListener("click", hideSetupModal);
 document.getElementById("asset-export-mapping-confirm-btn").addEventListener("click", handleAssetExportMappingConfirm);
 document.getElementById("asset-export-mapping-cancel-btn").addEventListener("click", hideAssetExportMappingModal);
-document.getElementById("shader-copy-output-btn").addEventListener("click", async () => {
-  try {
-    await copyTextFromElement("shader-output-spec");
-  } catch (error) {
-    alert(error.message || "复制失败");
-  }
-});
-document.getElementById("shader-copy-inputs-btn").addEventListener("click", async () => {
-  try {
-    await copyTextFromElement("shader-input-spec");
-  } catch (error) {
-    alert(error.message || "复制失败");
-  }
-});
-document.getElementById("shader-copy-hlsl-btn").addEventListener("click", async () => {
-  try {
-    await copyTextFromElement("shader-hlsl-code");
-  } catch (error) {
-    alert(error.message || "复制失败");
-  }
-});
-document.getElementById("shader-copy-vertex-hlsl-btn").addEventListener("click", async () => {
-  try {
-    await copyTextFromElement("shader-vertex-hlsl-code");
-  } catch (error) {
-    alert(error.message || "复制失败");
-  }
-});
-document.getElementById("shader-copy-vertex-summary-btn").addEventListener("click", async () => {
-  try {
-    await copyTextFromElement("shader-vertex-summary");
-  } catch (error) {
-    alert(error.message || "复制失败");
-  }
-});
-document.getElementById("shader-copy-pure-graph-summary-btn").addEventListener("click", async () => {
-  try {
-    await copyTextFromElement("shader-pure-graph-summary");
-  } catch (error) {
-    alert(error.message || "复制失败");
-  }
-});
-document.getElementById("shader-copy-pure-graph-t3d-btn").addEventListener("click", async () => {
-  try {
-    await copyTextFromElement("shader-pure-graph-t3d");
-  } catch (error) {
-    alert(error.message || "复制失败");
-  }
-});
-document.getElementById("shader-copy-pure-graph-unsupported-btn").addEventListener("click", async () => {
-  try {
-    await copyTextFromElement("shader-pure-graph-unsupported");
-  } catch (error) {
-    alert(error.message || "复制失败");
-  }
-});
-document.getElementById("shader-copy-t3d-btn").addEventListener("click", async () => {
-  try {
-    await copyTextFromElement("shader-t3d-text");
-  } catch (error) {
-    alert(error.message || "复制失败");
-  }
-});
-document.getElementById("shader-copy-package-btn").addEventListener("click", async () => {
-  try {
-    await copyTextFromElement("shader-copy-package");
-  } catch (error) {
-    alert(error.message || "复制失败");
-  }
-});
 document.getElementById("pick-cmp-base-path-btn").addEventListener("click", () => pickDesktopFile("pick_rdc_file", "cmp-base-path"));
 document.getElementById("pick-cmp-new-path-btn").addEventListener("click", () => pickDesktopFile("pick_rdc_file", "cmp-new-path"));
 document.getElementById("pick-perf-capture-path-btn").addEventListener("click", () => pickDesktopFile("pick_rdc_file", "perf-capture-path"));
+document.getElementById("pick-perf-renderdoc-dir-btn").addEventListener("click", () => pickDesktopDirectory("perf-renderdoc-dir"));
+document.getElementById("pick-cmp-renderdoc-dir-btn").addEventListener("click", () => pickDesktopDirectory("cmp-renderdoc-dir"));
 document.getElementById("pick-asset-capture-path-btn").addEventListener("click", () => pickDesktopFile("pick_rdc_file", "asset-capture-source-path"));
-document.getElementById("pick-shader-fragment-path-btn").addEventListener("click", () => pickDesktopFile("pick_any_file", "shader-fragment-path"));
-document.getElementById("pick-shader-vertex-path-btn").addEventListener("click", () => pickDesktopFile("pick_any_file", "shader-vertex-path"));
-document.getElementById("pick-shader-params-path-btn").addEventListener("click", () => pickDesktopFile("pick_any_file", "shader-params-path"));
 document.getElementById("pick-asset-csv-path-btn").addEventListener("click", () => pickDesktopCsvFiles("asset-csv-source-path"));
 document.getElementById("pick-asset-csv-dir-btn").addEventListener("click", () => pickDesktopDirectory("asset-csv-source-path"));
 document.getElementById("perf-sort-field").addEventListener("change", renderPerfTable);
@@ -1595,6 +1403,525 @@ document.addEventListener("click", (event) => {
     hidePerfPreviewPanel(true);
   }
 });
+// --- Visual Probe Simplification ---
+
+async function handleVisualProbeRun(event) {
+  event.preventDefault();
+  const capturePath = document.getElementById("vp-capture-path").value.trim();
+  const eid = document.getElementById("vp-eid").value.trim();
+  const stage = document.getElementById("vp-stage").value;
+  const ssimThreshold = document.getElementById("vp-ssim-threshold").value.trim();
+  const maxProbes = document.getElementById("vp-max-probes").value.trim();
+  const compileOnly = document.getElementById("vp-compile-only").checked;
+  const useLlm = document.getElementById("vp-use-llm").checked;
+  const summaryEl = document.getElementById("vp-result-summary");
+  const btn = document.getElementById("vp-run-btn");
+  const progressArea = document.getElementById("vp-progress-area");
+  const progressBar = document.getElementById("vp-progress-bar");
+  const progressText = document.getElementById("vp-progress-text");
+  const completionLog = document.getElementById("vp-completion-log");
+  const completionLogText = document.getElementById("vp-completion-log-text");
+
+  if (!capturePath || !eid) {
+    summaryEl.textContent = "请先填写 RDC 路径和 EID。";
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "简化中...";
+  summaryEl.textContent = "";
+  summaryEl.className = "empty-state";
+  document.getElementById("vp-result-detail").classList.add("hidden");
+  completionLog.classList.add("hidden");
+
+  progressArea.classList.remove("hidden");
+  progressBar.style.width = "0%";
+  progressBar.classList.add("indeterminate");
+  progressText.textContent = "正在执行视觉探针简化（L0-L4 静态简化 → 候选分析 → 逐候选验证）...";
+
+  const t0 = performance.now();
+  const progressTimer = setInterval(() => {
+    const elapsed = Math.round((performance.now() - t0) / 1000);
+    progressText.textContent = `正在执行视觉探针简化... 已耗时 ${elapsed}s`;
+  }, 1000);
+
+  const body = new FormData();
+  body.append("capture_path", capturePath);
+  body.append("eid", eid);
+  body.append("stage", stage);
+  body.append("ssim_threshold", ssimThreshold || "0.995");
+  body.append("max_probes", maxProbes || "200");
+  body.append("compile_only", compileOnly ? "true" : "false");
+  body.append("use_llm", useLlm ? "true" : "false");
+
+  try {
+    const data = await fetchJson("/api/visual-probe/run", { method: "POST", body });
+    clearInterval(progressTimer);
+    progressBar.classList.remove("indeterminate");
+    progressBar.style.width = "100%";
+    const totalSec = Math.round((performance.now() - t0) / 1000);
+    progressText.textContent = `完成！总耗时 ${totalSec}s`;
+
+    renderVisualProbeResult(data);
+
+    const logLines = [];
+    logLines.push(`原始 ${data.original_lines} 行 → 静态 ${data.static_simplified_lines} 行 → 最终 ${data.final_lines} 行`);
+    logLines.push(`总缩减: ${data.reduction_total_pct}%  |  视觉优化: ${data.reduction_visual_pct}%`);
+    logLines.push(`探针: ${data.accepted_probes}/${data.total_probes} 接受  |  ${data.rejected_probes} 拒绝  |  ${data.compile_failed_probes} 编译失败`);
+    logLines.push(`耗时: ${data.elapsed_total_ms}ms  |  模式: ${data.mode}`);
+    completionLogText.textContent = logLines.join("\n");
+    completionLog.classList.remove("hidden");
+
+    setTimeout(() => { progressArea.classList.add("hidden"); }, 3000);
+
+    const heading = document.getElementById("vp-result-heading");
+    if (heading) {
+      const rect = heading.getBoundingClientRect();
+      const offset = window.innerHeight * 0.10;
+      window.scrollTo({ top: window.scrollY + rect.top - offset, behavior: "smooth" });
+    }
+  } catch (err) {
+    clearInterval(progressTimer);
+    progressBar.classList.remove("indeterminate");
+    progressBar.style.width = "100%";
+    progressBar.style.background = "#da3633";
+    progressText.textContent = "执行失败";
+    summaryEl.textContent = `简化失败: ${err.message}`;
+    summaryEl.style.color = "#f44336";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "执行视觉探针简化";
+  }
+}
+
+function renderVisualProbeResult(data) {
+  const summaryEl = document.getElementById("vp-result-summary");
+  const detailEl = document.getElementById("vp-result-detail");
+
+  summaryEl.textContent = `简化完成: ${data.original_lines} → ${data.static_simplified_lines} → ${data.final_lines} 行 (总缩减 ${data.reduction_total_pct}%)`;
+  summaryEl.style.color = "#3fb950";
+  summaryEl.style.fontWeight = "700";
+
+  detailEl.classList.remove("hidden");
+  document.getElementById("vp-lines-original").textContent = data.original_lines;
+  document.getElementById("vp-lines-static").textContent = data.static_simplified_lines;
+  document.getElementById("vp-lines-final").textContent = data.final_lines;
+  document.getElementById("vp-reduction-pct").textContent = data.reduction_total_pct + "%";
+  document.getElementById("vp-total-probes").textContent = data.total_probes;
+  document.getElementById("vp-accepted-probes").textContent = data.accepted_probes;
+  document.getElementById("vp-rejected-probes").textContent = data.rejected_probes;
+  document.getElementById("vp-compile-failed").textContent = data.compile_failed_probes;
+  document.getElementById("vp-final-source").value = data.final_source || "";
+
+  const stepsEl = document.getElementById("vp-probe-steps");
+  const steps = data.probe_steps || [];
+  if (steps.length === 0) {
+    stepsEl.innerHTML = '<div class="empty-state">无探针步骤记录</div>';
+  } else {
+    stepsEl.innerHTML = steps.map((s) => {
+      const cls = s.accepted ? "accepted" : (!s.compile_ok ? "compile-fail" : "rejected");
+      const statusCls = s.accepted ? "pass" : (!s.compile_ok ? "warn" : "fail");
+      const statusText = s.accepted ? "ACCEPT" : (!s.compile_ok ? "COMPILE" : "REJECT");
+      const ssimText = s.ssim ? ` SSIM=${s.ssim.toFixed(4)}` : "";
+      const errText = s.error ? ` ${s.error}` : "";
+      return `<div class="vp-probe-item ${cls}">
+        <span class="vp-probe-kind">${s.kind}</span>
+        <span class="vp-probe-status ${statusCls}">${statusText}</span>
+        <span class="vp-probe-desc">${s.description || s.label}${ssimText}${errText}</span>
+      </div>`;
+    }).join("");
+  }
+}
+
+document.getElementById("vp-form").addEventListener("submit", handleVisualProbeRun);
+document.getElementById("pick-vp-capture-btn").addEventListener("click", () =>
+  pickDesktopFile("pick_rdc_file", "vp-capture-path")
+);
+document.getElementById("vp-copy-final-btn").addEventListener("click", async () => {
+  const el = document.getElementById("vp-final-source");
+  try {
+    await navigator.clipboard.writeText(el.value);
+    const btn = document.getElementById("vp-copy-final-btn");
+    btn.textContent = "已复制";
+    setTimeout(() => { btn.textContent = "复制"; }, 1500);
+  } catch (e) {
+    alert("复制失败: " + e.message);
+  }
+});
+
+// (Shader Verify / Simplify / HLSL Verify / OneClick moved to standalone tool)
+if (false) {
+async function handleShaderVerifyFetchSource(event) {
+  if (event) event.preventDefault();
+  const capturePath = document.getElementById("sv-capture-path").value.trim();
+  const eid = document.getElementById("sv-eid").value.trim();
+  const stage = document.getElementById("sv-stage").value;
+  const statusEl = document.getElementById("sv-source-status");
+  const sourceEl = document.getElementById("sv-original-source");
+  const modifiedEl = document.getElementById("sv-modified-glsl");
+
+  if (!capturePath || !eid) {
+    statusEl.textContent = "请先填写 capture 路径和 EID。";
+    return;
+  }
+  statusEl.textContent = "正在读取 shader 源码...";
+  const body = new FormData();
+  body.append("capture_path", capturePath);
+  body.append("eid", eid);
+  body.append("stage", stage);
+  try {
+    const data = await fetchJson("/api/shader-verify/get-shader-source", { method: "POST", body });
+    const src = data.source || "";
+    sourceEl.value = src;
+    if (!modifiedEl.value.trim()) {
+      modifiedEl.value = src;
+    }
+    statusEl.textContent = src
+      ? `已读取 (${src.length} 字符, target=${data.target || "?"}, mode=${data.export_mode || "?"})`
+      : "该 EID / Stage 没有可用的 shader 源码。";
+  } catch (err) {
+    statusEl.textContent = `读取失败: ${err.message}`;
+  }
+}
+
+async function handleShaderVerifyRun(event) {
+  event.preventDefault();
+  const capturePath = document.getElementById("sv-capture-path").value.trim();
+  const eid = document.getElementById("sv-eid").value.trim();
+  const stage = document.getElementById("sv-stage").value;
+  const modifiedGlsl = document.getElementById("sv-modified-glsl").value;
+  const summaryEl = document.getElementById("sv-result-summary");
+  const btn = document.getElementById("sv-run-btn");
+
+  if (!capturePath || !eid || !modifiedGlsl.trim()) {
+    summaryEl.textContent = "请先填写 capture 路径、EID 和修改后的 GLSL。";
+    summaryEl.className = "empty-state";
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "验证中...";
+  summaryEl.textContent = "正在执行 Shader 替换验证...";
+  summaryEl.className = "empty-state";
+
+  const body = new FormData();
+  body.append("capture_path", capturePath);
+  body.append("eid", eid);
+  body.append("stage", stage);
+  body.append("modified_glsl", modifiedGlsl);
+
+  try {
+    const data = await fetchJson("/api/shader-verify/compare", { method: "POST", body });
+    renderShaderVerifyResult(data);
+  } catch (err) {
+    summaryEl.textContent = `验证失败: ${err.message}`;
+    summaryEl.className = "empty-state";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "执行 Shader 替换验证";
+  }
+}
+
+function renderShaderVerifyResult(data) {
+  const summaryEl = document.getElementById("sv-result-summary");
+  const metricsEl = document.getElementById("sv-metrics");
+  const imagesRow = document.getElementById("sv-images-row");
+  const compileInfo = document.getElementById("sv-compile-info");
+
+  if (data.error) {
+    summaryEl.textContent = `错误: ${data.error}`;
+    summaryEl.className = "empty-state";
+    metricsEl.classList.add("hidden");
+    imagesRow.style.display = "none";
+    compileInfo.textContent = data.compile_errors || "—";
+    return;
+  }
+
+  const passed = data.passed;
+  summaryEl.textContent = passed ? "PASSED — 视觉等效" : "FAILED — 视觉不一致";
+  summaryEl.className = passed ? "empty-state" : "empty-state";
+  summaryEl.style.color = passed ? "#4caf50" : "#f44336";
+  summaryEl.style.fontWeight = "700";
+  summaryEl.style.fontSize = "20px";
+
+  metricsEl.classList.remove("hidden");
+  const ssimEl = document.getElementById("sv-ssim");
+  const psnrEl = document.getElementById("sv-psnr");
+  const rmseEl = document.getElementById("sv-rmse");
+
+  ssimEl.textContent = data.ssim != null ? data.ssim.toFixed(4) : "—";
+  ssimEl.className = "metric-value " + (data.ssim >= 0.98 ? "pass" : "fail");
+  psnrEl.textContent = data.psnr === Infinity ? "∞" : (data.psnr != null ? data.psnr.toFixed(2) + " dB" : "—");
+  psnrEl.className = "metric-value";
+  rmseEl.textContent = data.rmse != null ? data.rmse.toFixed(4) : "—";
+  rmseEl.className = "metric-value";
+
+  if (data.baseline_path || data.candidate_path || data.diff_image_path) {
+    imagesRow.style.display = "";
+    if (data.baseline_path) document.getElementById("sv-baseline-img").src = data.baseline_path;
+    if (data.candidate_path) document.getElementById("sv-candidate-img").src = data.candidate_path;
+    if (data.diff_image_path) document.getElementById("sv-diff-img").src = data.diff_image_path;
+  } else {
+    imagesRow.style.display = "none";
+  }
+
+  compileInfo.textContent = data.compile_ok
+    ? (data.compile_errors || "编译成功，无警告。")
+    : (data.compile_errors || "编译失败。");
+}
+
+document.getElementById("sv-fetch-source-btn").addEventListener("click", handleShaderVerifyFetchSource);
+document.getElementById("shader-verify-form").addEventListener("submit", handleShaderVerifyRun);
+document.getElementById("pick-sv-capture-path-btn").addEventListener("click", () =>
+  pickDesktopFile("pick_rdc_file", "sv-capture-path")
+);
+
+// --- GLSL Simplify ---
+
+async function handleShaderSimplifyRun(event) {
+  event.preventDefault();
+  const capturePath = document.getElementById("ss-capture-path").value.trim();
+  const eid = document.getElementById("ss-eid").value.trim();
+  const stage = document.getElementById("ss-stage").value;
+  const summaryEl = document.getElementById("ss-result-summary");
+  const btn = document.getElementById("ss-run-btn");
+
+  if (!capturePath || !eid) {
+    summaryEl.textContent = "请先填写 capture 路径和 EID。";
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "简化中...";
+  summaryEl.textContent = "正在执行 GLSL 自动简化（可能需要较长时间）...";
+  summaryEl.className = "empty-state";
+
+  const body = new FormData();
+  body.append("capture_path", capturePath);
+  body.append("eid", eid);
+  body.append("stage", stage);
+
+  try {
+    const data = await fetchJson("/api/shader-simplify/run", { method: "POST", body });
+    renderShaderSimplifyResult(data);
+  } catch (err) {
+    summaryEl.textContent = `简化失败: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "执行 GLSL 自动简化";
+  }
+}
+
+function renderShaderSimplifyResult(data) {
+  const summaryEl = document.getElementById("ss-result-summary");
+  const detailEl = document.getElementById("ss-result-detail");
+
+  summaryEl.textContent = `简化完成: ${data.original_line_count}→${data.simplified_line_count} 行 (缩减 ${data.reduction_pct}%), 最终 SSIM=${data.final_ssim.toFixed(4)}`;
+  summaryEl.style.color = data.final_ssim >= 0.98 ? "#4caf50" : "#ff9800";
+  summaryEl.style.fontWeight = "700";
+
+  detailEl.classList.remove("hidden");
+  document.getElementById("ss-lines-before").textContent = data.original_line_count;
+  document.getElementById("ss-lines-after").textContent = data.simplified_line_count;
+  document.getElementById("ss-reduction").textContent = data.reduction_pct + "%";
+  document.getElementById("ss-reduction").className = "metric-value " + (data.reduction_pct > 20 ? "pass" : "");
+  document.getElementById("ss-simplified-source").value = data.simplified_source || "";
+
+  const steps = data.steps || [];
+  const logLines = steps.map((s) =>
+    `Step ${s.step} [${s.levels}] ${s.action}: ${s.lines_before}→${s.lines_after} lines, SSIM=${s.ssim.toFixed(4)}, compile=${s.compile_ok}`
+  );
+  document.getElementById("ss-transform-log").textContent = logLines.join("\n") || "无变换记录";
+}
+
+document.getElementById("shader-simplify-form").addEventListener("submit", handleShaderSimplifyRun);
+document.getElementById("pick-ss-capture-path-btn").addEventListener("click", () =>
+  pickDesktopFile("pick_rdc_file", "ss-capture-path")
+);
+document.getElementById("ss-copy-simplified-btn").addEventListener("click", async () => {
+  try { await copyTextFromElement("ss-simplified-source"); } catch (e) { alert(e.message); }
+});
+
+// --- HLSL Verify ---
+
+async function handleHlslVerifyRun(event) {
+  event.preventDefault();
+  const glsl = document.getElementById("hv-simplified-glsl").value;
+  const capturePath = document.getElementById("hv-capture-path").value.trim();
+  const eid = document.getElementById("hv-eid").value.trim();
+  const stage = document.getElementById("hv-stage").value;
+  const summaryEl = document.getElementById("hv-result-summary");
+  const btn = document.getElementById("hv-run-btn");
+
+  if (!glsl.trim()) {
+    summaryEl.textContent = "请输入简化后的 GLSL。";
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "验证中...";
+  summaryEl.textContent = "正在执行 HLSL 转换验证...";
+  summaryEl.className = "empty-state";
+
+  const body = new FormData();
+  body.append("simplified_glsl", glsl);
+  if (capturePath) body.append("capture_path", capturePath);
+  if (eid) body.append("eid", eid);
+  body.append("stage", stage);
+
+  try {
+    const data = await fetchJson("/api/hlsl-verify/run", { method: "POST", body });
+    renderHlslVerifyResult(data);
+  } catch (err) {
+    summaryEl.textContent = `HLSL 验证失败: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "执行 HLSL 转换验证";
+  }
+}
+
+function renderHlslVerifyResult(data) {
+  const summaryEl = document.getElementById("hv-result-summary");
+  const detailEl = document.getElementById("hv-result-detail");
+
+  if (data.success) {
+    summaryEl.textContent = `转换成功 (method: ${data.method_used}, ${data.total_iterations} 次迭代)`;
+    summaryEl.style.color = "#4caf50";
+  } else {
+    summaryEl.textContent = `转换失败: ${data.error || "所有方法均未通过"}`;
+    summaryEl.style.color = "#f44336";
+  }
+  summaryEl.style.fontWeight = "700";
+
+  detailEl.classList.remove("hidden");
+  document.getElementById("hv-standalone-hlsl").value = data.final_hlsl || "";
+  document.getElementById("hv-ue-hlsl").value = data.final_ue_custom_hlsl || "";
+
+  const iterations = data.iterations || [];
+  const logLines = iterations.map((i) =>
+    `[${i.iteration}] ${i.method}: compile=${i.compile_ok}, spirv=${i.spirv_bridge_ok}, action=${i.action}`
+  );
+  document.getElementById("hv-iteration-log").textContent = logLines.join("\n") || "无日志";
+}
+
+document.getElementById("hlsl-verify-form").addEventListener("submit", handleHlslVerifyRun);
+document.getElementById("pick-hv-capture-path-btn").addEventListener("click", () =>
+  pickDesktopFile("pick_rdc_file", "hv-capture-path")
+);
+document.getElementById("hv-copy-hlsl-btn").addEventListener("click", async () => {
+  try { await copyTextFromElement("hv-standalone-hlsl"); } catch (e) { alert(e.message); }
+});
+document.getElementById("hv-copy-ue-btn").addEventListener("click", async () => {
+  try { await copyTextFromElement("hv-ue-hlsl"); } catch (e) { alert(e.message); }
+});
+
+// --- One-Click Convert ---
+
+async function handleOneclickConvertRun(event) {
+  event.preventDefault();
+  const glsl = document.getElementById("oc-glsl-source").value;
+  const fragmentPath = document.getElementById("oc-fragment-path").value.trim();
+  const vertexPath = document.getElementById("oc-vertex-path").value.trim();
+  const paramsPath = document.getElementById("oc-params-path").value.trim();
+  const capturePath = document.getElementById("oc-capture-path").value.trim();
+  const eid = document.getElementById("oc-eid").value.trim();
+  const stage = document.getElementById("oc-stage").value;
+  const summaryEl = document.getElementById("oc-result-summary");
+  const btn = document.getElementById("oc-run-btn");
+
+  if (!glsl.trim() && !fragmentPath && !capturePath) {
+    summaryEl.textContent = "请输入 GLSL 源码、指定文件路径或 RDC + EID。";
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "转换中...";
+  summaryEl.textContent = "正在执行一键转换...";
+  summaryEl.className = "empty-state";
+
+  const body = new FormData();
+  body.append("glsl_source", glsl);
+  if (fragmentPath) body.append("fragment_path", fragmentPath);
+  if (vertexPath) body.append("vertex_path", vertexPath);
+  if (paramsPath) body.append("shader_params_path", paramsPath);
+  if (capturePath) body.append("capture_path", capturePath);
+  if (eid) body.append("eid", eid);
+  body.append("stage", stage);
+
+  try {
+    const data = await fetchJson("/api/oneclick-convert/run", { method: "POST", body });
+    renderOneclickResult(data);
+  } catch (err) {
+    summaryEl.textContent = `转换失败: ${err.message}`;
+    summaryEl.style.color = "#f44336";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "一键转换";
+  }
+}
+
+function renderOneclickResult(data) {
+  const summaryEl = document.getElementById("oc-result-summary");
+  const detailEl = document.getElementById("oc-result-detail");
+
+  if (data.success) {
+    const reduction = data.original_lines > 0
+      ? Math.round((1 - data.simplified_lines / data.original_lines) * 100)
+      : 0;
+    summaryEl.textContent = `转换成功 — 原始 ${data.original_lines} 行 → 简化 ${data.simplified_lines} 行 (减少 ${reduction}%)`;
+    summaryEl.style.color = "#4caf50";
+  } else {
+    summaryEl.textContent = `转换失败: ${data.error || "未知错误"}`;
+    summaryEl.style.color = "#f44336";
+  }
+  summaryEl.style.fontWeight = "700";
+
+  detailEl.classList.remove("hidden");
+
+  const statsEl = document.getElementById("oc-simplify-stats");
+  const transforms = data.simplify_transforms || [];
+  statsEl.innerHTML = transforms
+    .map((t) => `<span class="stat-badge">${t.level}: ${t.lines_before}→${t.lines_after}</span>`)
+    .join(" ");
+
+  document.getElementById("oc-standalone-hlsl").value = data.standalone_hlsl || "";
+  document.getElementById("oc-ue-hlsl").value = data.ue_custom_hlsl || "";
+
+  const rules = data.rules_applied || [];
+  const logLines = rules.map((r) => `[${r.rule_name}] ${r.description}: ${r.lines_before}→${r.lines_after} lines`);
+  document.getElementById("oc-rules-log").textContent = logLines.join("\n") || "无规则应用记录";
+
+  const warnings = (data.warnings || []).concat(data.unsupported || []);
+  const warnSection = document.getElementById("oc-warnings-section");
+  if (warnings.length) {
+    warnSection.classList.remove("hidden");
+    document.getElementById("oc-warnings").textContent = warnings.join("\n");
+  } else {
+    warnSection.classList.add("hidden");
+  }
+}
+
+document.getElementById("oneclick-convert-form").addEventListener("submit", handleOneclickConvertRun);
+document.getElementById("pick-oc-fragment-btn").addEventListener("click", () =>
+  pickDesktopFile("pick_glsl_file", "oc-fragment-path")
+);
+document.getElementById("pick-oc-vertex-btn").addEventListener("click", () =>
+  pickDesktopFile("pick_glsl_file", "oc-vertex-path")
+);
+document.getElementById("pick-oc-params-btn").addEventListener("click", () =>
+  pickDesktopFile("pick_json_file", "oc-params-path")
+);
+document.getElementById("pick-oc-capture-btn").addEventListener("click", () =>
+  pickDesktopFile("pick_rdc_file", "oc-capture-path")
+);
+document.getElementById("oc-copy-standalone-btn").addEventListener("click", async () => {
+  try { await copyTextFromElement("oc-standalone-hlsl"); } catch (e) { alert(e.message); }
+});
+document.getElementById("oc-copy-ue-btn").addEventListener("click", async () => {
+  try { await copyTextFromElement("oc-ue-hlsl"); } catch (e) { alert(e.message); }
+});
+} // end if(false) dead block
+
 loadHealth();
 loadSetupStatus();
 loadCmpJobs();

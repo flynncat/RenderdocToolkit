@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from app.services.renderdoc_direct_replay import RenderdocDirectReplay
 from app.services.renderdoc_perf_store import RenderdocPerfStore
+from app.services.subprocess_utils import hidden_subprocess_kwargs
 
 
 class RenderdocPerfService:
@@ -35,12 +36,12 @@ class RenderdocPerfService:
     def get_job_detail(self, job_id: str) -> Dict[str, Any]:
         return self.store.get_job_detail(job_id)
 
-    def analyze_capture_isolated(self, job_id: str, capture_path: Path) -> Dict[str, Any]:
+    def analyze_capture_isolated(self, job_id: str, capture_path: Path, renderdoc_dir: str = "") -> Dict[str, Any]:
         ctx = multiprocessing.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe(duplex=False)
         process = ctx.Process(
             target=_perf_worker_entry,
-            args=(str(self.store.session_root), job_id, str(capture_path), child_conn),
+            args=(str(self.store.session_root), job_id, str(capture_path), child_conn, renderdoc_dir),
             daemon=False,
         )
         process.start()
@@ -58,18 +59,24 @@ class RenderdocPerfService:
             raise RuntimeError(str(result.get("error") or "性能分析失败"))
         return self.store.get_job_detail(job_id)
 
-    def analyze_capture(self, job_id: str, capture_path: Path) -> Dict[str, Any]:
+    def analyze_capture(self, job_id: str, capture_path: Path, renderdoc_dir: str = "") -> Dict[str, Any]:
+        from app.services.renderdoc_runtime_resolver import resolve_renderdoc_runtime
+        rd_ctx = resolve_renderdoc_runtime(renderdoc_dir)
+
         job_dir = self.store.job_path(job_id)
         preview_dir = job_dir / "artifacts" / "previews"
         preview_dir.mkdir(parents=True, exist_ok=True)
-        run_log_lines = [f"[capture] {capture_path}"]
+        run_log_lines = [
+            f"[capture] {capture_path}",
+            f"[renderdoc] dir={rd_ctx.renderdoc_dir} python={rd_ctx.renderdoc_python_path} source={rd_ctx.source}",
+        ]
 
         draws_payload = self._load_draws_payload(capture_path)
         counters_payload = self._load_counters_payload(capture_path)
         draw_rows = self._extract_draw_rows(draws_payload)
         counter_map = self._extract_counter_map(counters_payload)
 
-        with RenderdocDirectReplay(capture_path) as replay:
+        with RenderdocDirectReplay(capture_path, renderdoc_python_path=rd_ctx.renderdoc_python_path) as replay:
             capture_info = replay.get_capture_metadata()
             texture_desc_map = replay.get_texture_description_map()
             gpu_duration_map = replay.fetch_counter_map(["GPU Duration"])
@@ -131,6 +138,10 @@ class RenderdocPerfService:
                 "status": "completed",
                 "inputs": {
                     "capture_file": str(capture_path),
+                    "renderdoc_dir_requested": renderdoc_dir,
+                    "renderdoc_dir_resolved": rd_ctx.renderdoc_dir,
+                    "renderdoc_python_path": rd_ctx.renderdoc_python_path,
+                    "renderdoc_source": rd_ctx.source,
                 },
                 "summary": {
                     "row_count": len(rows),
@@ -151,12 +162,27 @@ class RenderdocPerfService:
         output_path = preview_dir / f"wireframe_{eid}.png"
 
         if not output_path.exists():
-            with RenderdocDirectReplay(capture_path) as replay:
-                saved = replay.save_draw_wireframe_preview(
-                    eid=eid,
-                    output_path=output_path,
-                )
-            if saved is None or not saved.exists():
+            inputs = (detail.get("metadata") or {}).get("inputs", {})
+            renderdoc_dir = self._stringify(inputs.get("renderdoc_dir_requested"))
+            ctx = multiprocessing.get_context("spawn")
+            parent_conn, child_conn = ctx.Pipe(duplex=False)
+            process = ctx.Process(
+                target=_preview_worker_entry,
+                args=(str(capture_path), eid, str(output_path), renderdoc_dir, child_conn),
+                daemon=False,
+            )
+            process.start()
+            child_conn.close()
+            process.join()
+            result: Dict[str, Any] | None = None
+            if parent_conn.poll():
+                result = parent_conn.recv()
+            parent_conn.close()
+            if process.exitcode not in (0, None):
+                raise RuntimeError(f"预览子进程异常退出，exit_code={process.exitcode}")
+            if result and not result.get("ok"):
+                raise RuntimeError(str(result.get("error") or f"无法生成 EID {eid} 的线框预览"))
+            if not output_path.exists():
                 raise RuntimeError(f"无法生成 EID {eid} 的线框预览")
 
         rel = output_path.relative_to(self.store.job_path(job_id)).as_posix()
@@ -677,19 +703,36 @@ class RenderdocPerfService:
             encoding="utf-8",
             errors="replace",
             shell=False,
+            **hidden_subprocess_kwargs(),
         )
         output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
         return proc.returncode, output.strip()
 
 
-def _perf_worker_entry(session_root: str, job_id: str, capture_path: str, conn: Connection) -> None:
+def _perf_worker_entry(session_root: str, job_id: str, capture_path: str, conn: Connection, renderdoc_dir: str = "") -> None:
     store = RenderdocPerfStore(Path(session_root))
     service = RenderdocPerfService(store)
     try:
-        service.analyze_capture(job_id, Path(capture_path))
+        service.analyze_capture(job_id, Path(capture_path), renderdoc_dir=renderdoc_dir)
         conn.send({"ok": True})
     except Exception as exc:
         store.update_metadata(job_id, {"status": "failed"})
+        conn.send({"ok": False, "error": str(exc)})
+    finally:
+        conn.close()
+
+
+def _preview_worker_entry(capture_path: str, eid: str, output_path: str, renderdoc_dir: str, conn: Connection) -> None:
+    try:
+        from app.services.renderdoc_runtime_resolver import resolve_renderdoc_runtime
+        rd_ctx = resolve_renderdoc_runtime(renderdoc_dir)
+        with RenderdocDirectReplay(capture_path, renderdoc_python_path=rd_ctx.renderdoc_python_path) as replay:
+            saved = replay.save_draw_wireframe_preview(eid=eid, output_path=output_path)
+        if saved is None or not Path(saved).exists():
+            conn.send({"ok": False, "error": f"无法生成 EID {eid} 的线框预览"})
+        else:
+            conn.send({"ok": True})
+    except Exception as exc:
         conn.send({"ok": False, "error": str(exc)})
     finally:
         conn.close()

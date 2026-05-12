@@ -139,6 +139,30 @@ class CsvModelConverter:
             raise ValueError("CSV is empty")
         return rows[0]
 
+    def merge_override_mapping(
+        self,
+        headers: Sequence[str],
+        suggested_mapping: ColumnMapping,
+        override_mapping: Optional[Dict[str, str]] = None,
+    ) -> Tuple[ColumnMapping, List[str]]:
+        header_set = set(headers)
+        merged = suggested_mapping.to_dict()
+        notes: List[str] = []
+        for field_name, raw_value in (override_mapping or {}).items():
+            selected = str(raw_value or "").strip()
+            if not selected:
+                continue
+            if selected in header_set:
+                merged[field_name] = selected
+            else:
+                notes.append(f"批量映射字段 `{field_name}` 选择的列 `{selected}` 在当前 CSV 中不存在，已回退自动识别。")
+        return ColumnMapping(**merged), notes
+
+    def resolve_mapping(self, csv_path: str | Path, override_mapping: Optional[Dict[str, str]] = None) -> Tuple[ColumnMapping, List[str]]:
+        headers = self.read_headers(csv_path)
+        suggested_mapping = self.suggest_mapping(csv_path)
+        return self.merge_override_mapping(headers, suggested_mapping, override_mapping)
+
     def suggest_mapping(self, csv_path: str | Path) -> ColumnMapping:
         rows = self._read_rows(csv_path)
         if not rows:

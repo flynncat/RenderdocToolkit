@@ -103,6 +103,12 @@ label {
   font-size: 14px;
 }
 
+.field-hint {
+  margin-top: 6px;
+  color: #9ba5b4;
+  font-size: 12px;
+}
+
 input,
 textarea,
 button {
@@ -528,6 +534,185 @@ pre {
   height: 12px;
   border-radius: 999px;
   flex: 0 0 auto;
+}
+
+.sv-preview-img {
+  max-width: 100%;
+  border: 1px solid #333;
+  border-radius: 6px;
+  background: #111;
+}
+
+.metric-value {
+  font-size: 28px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.metric-value.pass {
+  color: #4caf50;
+}
+
+.metric-value.fail {
+  color: #f44336;
+}
+
+.layout-shader-simplify {
+  grid-template-columns: 1fr 1.8fr 0.8fr;
+}
+
+.vp-progress-bar-container {
+  width: 100%;
+  height: 6px;
+  background: #21262d;
+  border-radius: 3px;
+  margin-top: 12px;
+  overflow: hidden;
+}
+
+.vp-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #2f81f7, #58a6ff);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+.vp-progress-bar.indeterminate {
+  width: 30% !important;
+  animation: vp-indeterminate 1.5s infinite ease-in-out;
+}
+
+@keyframes vp-indeterminate {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
+
+.vp-progress-text {
+  font-size: 0.82em;
+  color: #8b949e;
+  margin-top: 6px;
+}
+
+.vp-metrics-row {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.vp-metric-card {
+  flex: 1;
+  min-width: 90px;
+  background: #0d1117;
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  padding: 12px;
+  text-align: center;
+}
+
+.vp-metric-card.small {
+  min-width: 70px;
+  padding: 8px;
+}
+
+.vp-metric-card.accepted {
+  border-color: #238636;
+}
+
+.vp-metric-card.rejected {
+  border-color: #da3633;
+}
+
+.vp-metric-value {
+  font-size: 1.5em;
+  font-weight: 700;
+  color: #c9d1d9;
+}
+
+.vp-metric-value.highlight {
+  color: #58a6ff;
+}
+
+.vp-metric-label {
+  font-size: 0.78em;
+  color: #8b949e;
+  margin-top: 2px;
+}
+
+.vp-probe-list {
+  max-height: 400px;
+  overflow-y: auto;
+  margin-bottom: 16px;
+}
+
+.vp-probe-item {
+  background: #0d1117;
+  border: 1px solid #21262d;
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin: 3px 0;
+  font-size: 0.82em;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.vp-probe-item.accepted {
+  border-left: 3px solid #3fb950;
+}
+
+.vp-probe-item.rejected {
+  border-left: 3px solid #f85149;
+}
+
+.vp-probe-item.compile-fail {
+  border-left: 3px solid #d29922;
+}
+
+.vp-probe-kind {
+  display: inline-block;
+  background: #21262d;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: monospace;
+  font-size: 0.9em;
+  white-space: nowrap;
+}
+
+.vp-probe-status {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 0.8em;
+  font-weight: 700;
+}
+
+.vp-probe-status.pass { background: #238636; color: #fff; }
+.vp-probe-status.fail { background: #da3633; color: #fff; }
+.vp-probe-status.warn { background: #9e6a03; color: #fff; }
+
+.vp-probe-desc {
+  flex: 1;
+  color: #8b949e;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.textarea-with-copy {
+  position: relative;
+}
+
+.textarea-with-copy textarea {
+  width: 100%;
+}
+
+.copy-btn {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  padding: 4px 10px;
+  font-size: 0.8em;
 }
 
 @media (max-width: 1300px) {

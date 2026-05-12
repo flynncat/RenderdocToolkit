@@ -7,6 +7,7 @@ from typing import Dict, Optional
 
 from app.config import ANALYZER_SCRIPT
 from app.services.script_runner import run_python_script_inproc
+from app.services.subprocess_utils import hidden_subprocess_kwargs
 
 
 class AnalyzerService:
@@ -51,6 +52,7 @@ class AnalyzerService:
                 encoding="utf-8",
                 errors="replace",
                 shell=False,
+                **hidden_subprocess_kwargs(),
             )
             returncode = proc.returncode
             combined_output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")

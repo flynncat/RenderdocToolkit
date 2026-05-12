@@ -34,6 +34,16 @@ third_round_*.json
 out_*/
 second_round_out/
 
+# IDE settings
+.vscode/
+
+# Test/verification outputs
+test_reports/
+verify_sessions/
+
+# Temporary model files
+.tmp_vsin_*.fbx
+
 # Tool runtime noise
 **/__pycache__/
 external_tools/renderdoccmp/output/

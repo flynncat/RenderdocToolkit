@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from app.config import CMP_SESSION_ROOT, RENDERDOC_CMP_ROOT, RENDERDOC_CMP_SCRIPT
 from app.services.script_runner import run_python_script_inproc
+from app.services.subprocess_utils import hidden_subprocess_kwargs
 
 
 def _now_iso() -> str:
@@ -68,6 +69,10 @@ class RenderdocCmpService:
         malioc_path: str = "",
         verbose: bool = False,
     ) -> Dict[str, Any]:
+        from app.services.renderdoc_runtime_resolver import resolve_renderdoc_runtime
+        rd_ctx = resolve_renderdoc_runtime(renderdoc_dir)
+        effective_renderdoc_dir = rd_ctx.renderdoc_dir if rd_ctx.renderdoc_dir else renderdoc_dir.strip()
+
         if not self.cmp_script.exists():
             raise FileNotFoundError(f"renderdoc_cmp script not found: {self.cmp_script}")
 
@@ -77,8 +82,8 @@ class RenderdocCmpService:
         script_args = [str(base_file), str(new_file)]
         if strict_mode:
             script_args.append("--strict")
-        if renderdoc_dir.strip():
-            script_args.extend(["--renderdoc", renderdoc_dir.strip()])
+        if effective_renderdoc_dir:
+            script_args.extend(["--renderdoc", effective_renderdoc_dir])
         if malioc_path.strip():
             script_args.extend(["--malioc", malioc_path.strip()])
         if verbose:
@@ -96,6 +101,7 @@ class RenderdocCmpService:
                 errors="replace",
                 cwd=str(work_dir),
                 shell=False,
+                **hidden_subprocess_kwargs(),
             )
             returncode = proc.returncode
             combined_output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
@@ -127,6 +133,10 @@ class RenderdocCmpService:
                     "new_file": self._path_ref(job_dir, new_file),
                     "strict_mode": strict_mode,
                     "renderdoc_dir": renderdoc_dir.strip(),
+                    "renderdoc_dir_requested": renderdoc_dir.strip(),
+                    "renderdoc_dir_resolved": rd_ctx.renderdoc_dir,
+                    "renderdoc_cmd_path": rd_ctx.renderdoc_cmd_path,
+                    "renderdoc_source": rd_ctx.source,
                     "malioc_path": malioc_path.strip(),
                 },
                 "artifacts": {

@@ -6,6 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from app.services.subprocess_utils import hidden_subprocess_kwargs
+
 
 def _normalize_json_text(text: str) -> Any:
     text = text.strip()
@@ -157,6 +159,7 @@ class EidDeepDiveService:
             encoding="utf-8",
             errors="replace",
             shell=False,
+            **hidden_subprocess_kwargs(),
         )
         output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
         return proc.returncode, output.strip()

@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from app.services.asset_export_store import AssetExportStore
 from app.services.csv_model_converter import CsvModelConverter
 from app.services.renderdoc_direct_replay import RenderdocDirectReplay
+from app.services.subprocess_utils import hidden_subprocess_kwargs
 
 try:
     from PIL import Image
@@ -59,7 +60,54 @@ class AssetExportService:
         export_obj: bool,
         texture_format: str,
         mapping_override: Optional[Dict[str, str]] = None,
+        isolated: bool = False,
     ) -> Dict[str, Any]:
+        if isolated:
+            ctx = multiprocessing.get_context("spawn")
+            parent_conn, child_conn = ctx.Pipe(duplex=False)
+            process = ctx.Process(
+                target=_asset_export_worker,
+                args=(
+                    child_conn,
+                    job_id,
+                    str(capture_path),
+                    str(output_root),
+                    export_scope,
+                    pass_id,
+                    pass_name,
+                    pass_start_id,
+                    pass_start,
+                    pass_end_id,
+                    pass_end,
+                    export_fbx,
+                    export_obj,
+                    texture_format,
+                    dict(mapping_override or {}),
+                ),
+                daemon=False,
+            )
+            process.start()
+            child_conn.close()
+            try:
+                try:
+                    message = parent_conn.recv()
+                except EOFError:
+                    message = {
+                        "ok": False,
+                        "error": f"资产导出子进程异常退出，exit_code={process.exitcode}",
+                    }
+            finally:
+                parent_conn.close()
+                process.join(timeout=10)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
+            if not isinstance(message, dict):
+                raise RuntimeError("资产导出子进程返回了无效结果")
+            if not message.get("ok"):
+                raise RuntimeError(str(message.get("error") or "资产导出失败"))
+            return self.store.get_job_detail(job_id)
+
         job_dir = self.store.job_path(job_id)
         output_root.mkdir(parents=True, exist_ok=True)
         manifest: Dict[str, Any] = {
@@ -525,6 +573,7 @@ class AssetExportService:
             encoding="utf-8",
             errors="replace",
             shell=False,
+            **hidden_subprocess_kwargs(),
         )
         output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
         return proc.returncode, output.strip()
@@ -739,18 +788,7 @@ class AssetExportService:
         override_mapping: Dict[str, str],
     ) -> Tuple[Any, List[str]]:
         headers = self.converter.read_headers(mesh_csv_path)
-        header_set = set(headers)
-        merged = suggested_mapping.to_dict()
-        notes: List[str] = []
-        for field_name, raw_value in (override_mapping or {}).items():
-            selected = str(raw_value or "").strip()
-            if not selected:
-                continue
-            if selected in header_set:
-                merged[field_name] = selected
-            else:
-                notes.append(f"批量映射字段 `{field_name}` 选择的列 `{selected}` 在当前 CSV 中不存在，已回退自动识别。")
-        return type(suggested_mapping)(**merged), notes
+        return self.converter.merge_override_mapping(headers, suggested_mapping, override_mapping)
 
     def _resolve_pass_endpoint_eid(
         self,
@@ -1145,6 +1183,49 @@ def _asset_mapping_preview_worker(
             pass_end=pass_end,
         )
         conn.send({"ok": True, "result": result})
+    except Exception as exc:
+        conn.send({"ok": False, "error": f"{exc}\n{traceback.format_exc()}"})
+    finally:
+        conn.close()
+
+
+def _asset_export_worker(
+    conn: Any,
+    job_id: str,
+    capture_path: str,
+    output_root: str,
+    export_scope: str,
+    pass_id: str,
+    pass_name: str,
+    pass_start_id: str,
+    pass_start: str,
+    pass_end_id: str,
+    pass_end: str,
+    export_fbx: bool,
+    export_obj: bool,
+    texture_format: str,
+    mapping_override: Dict[str, str],
+) -> None:
+    try:
+        service = AssetExportService(AssetExportStore(), CsvModelConverter())
+        service.run_export(
+            job_id=job_id,
+            capture_path=Path(capture_path),
+            output_root=Path(output_root),
+            export_scope=export_scope,
+            pass_id=pass_id,
+            pass_name=pass_name,
+            pass_start_id=pass_start_id,
+            pass_start=pass_start,
+            pass_end_id=pass_end_id,
+            pass_end=pass_end,
+            export_fbx=export_fbx,
+            export_obj=export_obj,
+            texture_format=texture_format,
+            mapping_override=mapping_override,
+            isolated=False,
+        )
+        conn.send({"ok": True})
     except Exception as exc:
         conn.send({"ok": False, "error": f"{exc}\n{traceback.format_exc()}"})
     finally:

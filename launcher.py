@@ -70,13 +70,27 @@ def main() -> None:
     os.environ.setdefault("RENDERDOC_WEBUI_HOME", str(home))
     chosen_port = _pick_port(_preferred_port())
     os.environ["RENDERDOC_WEBUI_PORT"] = str(chosen_port)
+    headless_mode = os.getenv("RENDERDOC_PORTABLE_HEADLESS", "").strip().lower() in {"1", "true", "yes", "on"}
     logger.info("Launcher starting with home=%s port=%s", home, chosen_port)
 
     try:
-        import webview
         from app.main import app
-        from app.desktop_bridge import DesktopBridge
         import uvicorn
+
+        if headless_mode:
+            logger.info("Starting uvicorn in headless packaged smoke mode")
+            uvicorn.run(
+                app,
+                host="127.0.0.1",
+                port=chosen_port,
+                log_level="info",
+                log_config=None,
+                access_log=False,
+            )
+            return
+
+        import webview
+        from app.desktop_bridge import DesktopBridge
 
         config = uvicorn.Config(
             app=app,

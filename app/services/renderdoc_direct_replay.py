@@ -26,8 +26,9 @@ class RenderdocDirectReplay:
         "cs": "Compute",
     }
 
-    def __init__(self, capture_path: str | Path) -> None:
+    def __init__(self, capture_path: str | Path, *, renderdoc_python_path: str = "") -> None:
         self.capture_path = Path(capture_path)
+        self._renderdoc_python_path = (renderdoc_python_path or "").strip()
         self.rd = None
         self.cap = None
         self.controller = None
@@ -269,6 +270,163 @@ class RenderdocDirectReplay:
             return None
         finally:
             replay_output.Shutdown()
+
+    def capture_original_draw(
+        self,
+        *,
+        eid: str | int,
+        output_path: str | Path,
+    ) -> Optional[Path]:
+        """Save the render-target output for *eid* without any shader modifications."""
+        return self.save_draw_preview(eid=eid, output_path=output_path, prefer_depth=False)
+
+    def replace_shader_and_capture(
+        self,
+        *,
+        eid: str | int,
+        stage: str,
+        modified_source: str,
+        output_path: str | Path,
+    ) -> Dict[str, Any]:
+        """Build *modified_source* as a custom shader, hot-swap it via
+        ``ReplaceResource``, re-render *eid*, and save the resulting
+        render-target to *output_path*.
+
+        Returns a dict with keys:
+            ``path``           – str | None, saved screenshot path
+            ``success``        – bool
+            ``compile_ok``     – bool, whether BuildCustomShader succeeded
+            ``compile_errors`` – str, compiler messages (empty on success)
+        """
+        if self.controller is None or self.rd is None:
+            raise RuntimeError("RenderDoc replay is not opened")
+
+        rd = self.rd
+        event_id = int(str(eid).strip())
+        stage_key = stage.lower().strip()
+        stage_enum = getattr(
+            rd.ShaderStage,
+            self._STAGE_MAP.get(stage_key, "Pixel"),
+        )
+
+        self._set_frame_event(event_id)
+        pipe = self.controller.GetPipelineState()
+        pipeline_obj = pipe.GetGraphicsPipelineObject()
+        reflection = pipe.GetShaderReflection(stage_enum)
+        if reflection is None:
+            return {
+                "path": None,
+                "success": False,
+                "compile_ok": False,
+                "compile_errors": f"No shader reflection for stage {stage_key} at EID {event_id}",
+            }
+
+        original_shader_id = reflection.resourceId
+        entry_point = self._stringify(pipe.GetShaderEntryPoint(stage_enum))
+
+        compile_flags = rd.ShaderCompileFlags()
+        source_encoding = rd.ShaderEncoding.GLSL
+        try:
+            custom_id, errors = self.controller.BuildTargetShader(
+                entry_point, source_encoding, modified_source.encode("utf-8"), compile_flags, stage_enum,
+            )
+        except Exception as exc:
+            return {
+                "path": None,
+                "success": False,
+                "compile_ok": False,
+                "compile_errors": f"BuildCustomShader raised: {exc}",
+            }
+
+        errors_str = str(errors or "")
+        if str(custom_id) == "ResourceId::0":
+            return {
+                "path": None,
+                "success": False,
+                "compile_ok": False,
+                "compile_errors": errors_str or "BuildCustomShader returned null id",
+            }
+
+        try:
+            self.controller.ReplaceResource(original_shader_id, custom_id)
+            self._current_eid = None
+            self._set_frame_event(event_id)
+
+            pipe = self.controller.GetPipelineState()
+            resource_id = None
+            for target in list(pipe.GetOutputTargets()):
+                if str(target.resource) != "ResourceId::0":
+                    resource_id = target.resource
+                    break
+            if resource_id is None:
+                depth_target = pipe.GetDepthTarget()
+                if str(depth_target.resource) != "ResourceId::0":
+                    resource_id = depth_target.resource
+            if resource_id is None:
+                return {
+                    "path": None,
+                    "success": False,
+                    "compile_ok": True,
+                    "compile_errors": errors_str,
+                }
+
+            output = Path(output_path)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            save = rd.TextureSave()
+            save.resourceId = resource_id
+            save.destType = rd.FileType.PNG
+            save.alpha = rd.AlphaMapping.BlendToCheckerboard
+            save.mip = 0
+            save.slice.sliceIndex = 0
+            save.sample.sampleIndex = 0
+
+            result = self.controller.SaveTexture(save, str(output))
+            saved = result == rd.ResultCode.Succeeded and output.exists()
+            return {
+                "path": str(output) if saved else None,
+                "success": saved,
+                "compile_ok": True,
+                "compile_errors": errors_str,
+            }
+        finally:
+            self.controller.RemoveReplacement(original_shader_id)
+            self.controller.FreeCustomShader(custom_id)
+            self._current_eid = None
+
+    def get_shader_source_for_eid(
+        self,
+        *,
+        eid: str | int,
+        stage: str = "ps",
+    ) -> Dict[str, Any]:
+        """Return the shader source/disassembly and metadata for *eid*."""
+        if self.controller is None or self.rd is None:
+            raise RuntimeError("RenderDoc replay is not opened")
+
+        event_id = int(str(eid).strip())
+        stage_key = stage.lower().strip()
+        stage_enum = getattr(
+            self.rd.ShaderStage,
+            self._STAGE_MAP.get(stage_key, "Pixel"),
+        )
+
+        self._set_frame_event(event_id)
+        pipe = self.controller.GetPipelineState()
+        pipeline_obj = pipe.GetGraphicsPipelineObject()
+        data = self._collect_shader_stage_data(
+            pipe=pipe, pipeline_object=pipeline_obj, stage_enum=stage_enum,
+        )
+        if data is None:
+            return {"source": "", "entry_point": "", "resource_id": "", "target": ""}
+
+        source = data.get("source_text") or data.get("disassembly") or ""
+        return {
+            "source": source,
+            "entry_point": data.get("entry_point", ""),
+            "resource_id": data.get("resource_id", ""),
+            "target": data.get("selected_target", ""),
+            "export_mode": data.get("export_mode", ""),
+        }
 
     def get_capture_metadata(self) -> Dict[str, Any]:
         if self.cap is None:
@@ -871,9 +1029,8 @@ class RenderdocDirectReplay:
             )
         return result
 
-    @staticmethod
-    def _import_renderdoc():
-        python_path = (app_config.RENDERDOC_PYTHON_PATH or "").strip()
+    def _import_renderdoc(self):
+        python_path = self._renderdoc_python_path or (app_config.RENDERDOC_PYTHON_PATH or "").strip()
         if not python_path:
             raise RuntimeError("未配置 RenderDoc Python 路径")
         if python_path not in sys.path:

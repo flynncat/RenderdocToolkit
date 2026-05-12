@@ -411,8 +411,6 @@ def build_matrix_semantic_fixture() -> tuple[Path, Path, Path]:
 
 def run_api_regression(base_url: str, before_rdc: Path, after_rdc: Path, csv_path: Path) -> dict[str, Any]:
     results: dict[str, Any] = {}
-    results["shader_convert"] = run_shader_convert_api_smoke(base_url)
-
     cmp_result = post_form(
         f"{base_url}/api/renderdoc-cmp/compare/by-path",
         {
@@ -432,12 +430,14 @@ def run_api_regression(base_url: str, before_rdc: Path, after_rdc: Path, csv_pat
 
     perf_first = post_form(
         f"{base_url}/api/renderdoc-perf/analyze/by-path",
-        {"capture_path": str(before_rdc)},
+        {"capture_path": str(before_rdc), "renderdoc_dir": ""},
         timeout=900,
     )
     rows_first = (perf_first.get("analysis") or {}).get("rows") or []
     ensure(perf_first.get("metadata", {}).get("status") == "completed", "第一次性能分析未完成")
     ensure(bool(rows_first), "第一次性能分析没有 rows")
+    perf_inputs = perf_first.get("metadata", {}).get("inputs", {})
+    ensure("renderdoc_source" in perf_inputs, "性能分析 metadata 缺少 renderdoc_source 字段")
     top_first = rows_first[0]
     preview_result = post_form(
         f"{base_url}/api/renderdoc-perf/jobs/{perf_first['metadata']['job_id']}/draw-preview",
@@ -666,22 +666,18 @@ def run_basic_api_smoke(base_url: str) -> dict[str, Any]:
     health = wait_for_health(base_url)
     ensure(bool(health.get("rdc", {}).get("ok")), "RenderDoc CLI 健康检查失败")
     ensure(bool(health.get("renderdoc_cmp", {}).get("ok")), "内置 renderdoc_cmp 健康检查失败")
-    shader_summary = run_shader_convert_api_smoke(base_url)
     return {
         "mode": "basic",
         "health": {
             "rdc": bool(health.get("rdc", {}).get("ok")),
             "cmp": bool(health.get("renderdoc_cmp", {}).get("ok")),
         },
-        "shader_convert": shader_summary,
     }
 
 
 def run_csv_only_api_regression(base_url: str, csv_path: Path) -> dict[str, Any]:
     health = wait_for_health(base_url)
     ensure(bool(health.get("renderdoc_cmp", {}).get("ok")), "内置 renderdoc_cmp 健康检查失败")
-    shader_summary = run_shader_convert_api_smoke(base_url)
-
     inspect_result = post_form(
         f"{base_url}/api/asset-export/csv-inspect/by-path",
         {"csv_path": str(csv_path)},
@@ -704,7 +700,6 @@ def run_csv_only_api_regression(base_url: str, csv_path: Path) -> dict[str, Any]
     ensure(any(item.get("mapping_notes") for item in manual_conversions), "CSV 批量转换未出现按文件回退说明")
     return {
         "mode": "csv_only",
-        "shader_convert": shader_summary,
         "changed_fields": changed_fields,
         "convert_job_id": convert_result.get("metadata", {}).get("job_id"),
         "converted_files": len(manual_conversions),
@@ -810,9 +805,11 @@ async def run_ui_regression(base_url: str, before_rdc: Path, after_rdc: Path, cs
 
         await page.click('.tab-btn[data-tab="perf"]')
         await page.locator("#perf-form").wait_for(state="visible", timeout=10000)
+        ensure(await page.locator("#perf-renderdoc-dir").count() > 0, "性能 Tab 缺少 RenderDoc 目录输入")
 
         await page.click('.tab-btn[data-tab="cmp"]')
         await page.locator("#cmp-form").wait_for(state="visible", timeout=10000)
+        ensure(await page.locator("#cmp-renderdoc-dir").count() > 0, "性能 Diff Tab 缺少 RenderDoc 目录输入")
 
         await page.click('.tab-btn[data-tab="asset-export"]')
         await page.fill("#asset-capture-source-path", str(before_rdc))
@@ -848,7 +845,6 @@ async def run_ui_regression(base_url: str, before_rdc: Path, after_rdc: Path, cs
             timeout=300000,
         )
         print("ui_step: open_output_button_ready")
-        await run_shader_convert_ui_smoke(page)
 
         await browser.close()
 
@@ -889,7 +885,6 @@ async def run_basic_ui_smoke(base_url: str) -> None:
             await page.click(f'.tab-btn[data-tab="{tab_name}"]')
             workspace = page.locator(f"#workspace-{tab_name}")
             await workspace.wait_for(state="visible", timeout=5000)
-        await run_shader_convert_ui_smoke(page)
 
         await browser.close()
 
@@ -943,8 +938,6 @@ async def run_csv_only_ui_smoke(base_url: str, csv_path: Path) -> None:
             "() => document.querySelector('#asset-export-files')?.textContent?.includes('手工 CSV 转换')",
             timeout=300000,
         )
-        await run_shader_convert_ui_smoke(page)
-
         await browser.close()
 
     ensure(not dialogs, f"UI 交互出现弹窗错误: {dialogs[:1]}")
