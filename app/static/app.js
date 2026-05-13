@@ -248,6 +248,7 @@ function renderCmpJobs(jobs) {
 
 function renderPerfSummary(detail) {
   const metadata = detail.metadata || {};
+  const inputs = metadata.inputs || {};
   const analysis = detail.analysis || {};
   const overview = analysis.overview || {};
   const captureInfo = analysis.capture_info || {};
