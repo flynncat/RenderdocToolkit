@@ -224,6 +224,11 @@ class TextureInfo:
     is_srgb: bool = False
     data_buffer_id: str = ""  # Which ZIP entry has the data
     data_row_pitch: int = 0
+    # True once data_buffer_id was set from an "Initial Contents" snapshot
+    # (the canonical full-resource source for assets uploaded before the
+    # captured frame).  Used to lock out subsequent partial-tile SubImage
+    # uploads from overwriting the good buffer.
+    data_from_initial_contents: bool = False
     md5: str = ""
     extracted_path: str = ""
     thumbnail_base64: str = ""  # For HTML embedding
@@ -879,18 +884,93 @@ class RDCAnalyzer:
                 # Only use mip level 0 buffer that MATCHES the declared dimensions
                 if buffer_id and mip_level == 0:
                     tex = textures[upload_texture_id]  # Use the texture from THIS upload, not current_texture!
-                    
-                    # If dimensions are already set by glTexStorage2D, verify they match
                     if tex.width > 0 and tex.height > 0:
-                        # Only accept buffer if dimensions match exactly
+                        # A SubImage that covers the declared full dimensions
+                        # is the most reliable source — it overrides even an
+                        # Initial Contents snapshot (which may be a tiny
+                        # placeholder that UE later streams over).
                         if mip_width == tex.width and mip_height == tex.height:
                             tex.data_buffer_id = buffer_id
-                    else:
-                        # No dimensions set yet, use this buffer and set dimensions
+                            tex.data_from_initial_contents = False
+                    elif not tex.data_from_initial_contents:
+                        # No dimensions set yet AND no Initial Contents — use
+                        # this partial buffer and adopt its dimensions.
                         tex.data_buffer_id = buffer_id
                         if mip_width > 0 and mip_height > 0:
                             tex.width = mip_width
                             tex.height = mip_height
+
+            # Internal::Initial Contents - RenderDoc's snapshot of resource
+            # state at capture start.  For UE-style apps that load most assets
+            # *before* the captured frame, the pixel data lives here (in a
+            # buffer named "SubresourceContents") and there is no explicit
+            # glCompressed* upload chunk.  Without handling this, every
+            # asset-loaded-on-startup texture ends up with no thumbnail and
+            # the HTML report shows "No Preview" for all of them.
+            elif chunk_name == 'Internal::Initial Contents':
+                init_id = None
+                init_type = ""
+                init_internalformat = ""
+                init_width = 0
+                init_height = 0
+                init_buffer = None
+                for elem in chunk:
+                    elem_name = elem.get('name', '')
+                    if elem_name == 'id':
+                        init_id = elem.text
+                    elif elem_name == 'Type':
+                        # Prefer string (e.g. "Texture") but fall back to raw int.
+                        init_type = elem.get('string', '') or (elem.text or '')
+                    elif elem_name == 'internalformat':
+                        init_internalformat = elem.get('string', '') or (elem.text or '')
+                    elif elem_name == 'width':
+                        try:
+                            init_width = int(elem.text)
+                        except (TypeError, ValueError):
+                            pass
+                    elif elem_name == 'height':
+                        try:
+                            init_height = int(elem.text)
+                        except (TypeError, ValueError):
+                            pass
+                    elif elem_name == 'SubresourceContents' and elem.tag == 'buffer':
+                        init_buffer = elem.text
+
+                if not init_id or init_id == "0":
+                    continue
+                # Only textures (Type=="Texture" or numeric 2) have pixels.
+                if 'Texture' not in init_type and init_type != '2':
+                    continue
+                if not init_buffer:
+                    continue
+
+                tex = textures.get(init_id)
+                if tex is None:
+                    tex = TextureInfo(resource_id=init_id)
+                    textures[init_id] = tex
+
+                # Fill in any missing descriptor info from this snapshot.
+                if init_width and not tex.width:
+                    tex.width = init_width
+                if init_height and not tex.height:
+                    tex.height = init_height
+                if init_internalformat and not tex.format:
+                    tex.format = init_internalformat
+                if init_internalformat in ASTCDecoder.ASTC_FORMATS:
+                    block_x, block_y, is_srgb = ASTCDecoder.ASTC_FORMATS[init_internalformat]
+                    tex.is_astc = True
+                    tex.block_width = block_x
+                    tex.block_height = block_y
+                    tex.is_srgb = is_srgb
+
+                # Initial Contents is a full upload by construction — it
+                # always represents the entire resource.  Use it unless we
+                # already have a stronger source (we don't track that here,
+                # but partial SubImage uploads will be skipped below since
+                # we mark this buffer as authoritative).
+                tex.data_buffer_id = init_buffer
+                # Mark so subsequent partial SubImage chunks don't clobber it.
+                tex.data_from_initial_contents = True
         
         # Compute MD5s and create thumbnails
         for tex_id, tex_info in textures.items():
