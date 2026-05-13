@@ -164,37 +164,60 @@ class ASTCDecoder:
     @staticmethod
     def decode_astc_to_png(astc_data: bytes, width: int, height: int,
                            block_x: int, block_y: int, is_srgb: bool,
-                           output_path: str) -> bool:
-        """Decode ASTC data to PNG using astcenc"""
+                           output_path: str) -> Tuple[bool, bool]:
+        """Decode ASTC data to PNG using astcenc.
+
+        Returns ``(success, is_placeholder)``.  ``is_placeholder`` is True
+        when the buffer was too small to cover the declared mip 0 dimensions
+        and we fell back to decoding only the blocks we have (the typical UE
+        mobile streaming pattern: a single 16-byte block represents the
+        lowest mip).  The caller can use this to annotate the thumbnail in
+        the report rather than hiding it as "No Preview".
+        """
         astcenc = ASTCDecoder._find_astcenc()
         if not astcenc:
-            return False
-        
+            return False, False
+
         try:
-            # Calculate mip 0 size
-            # ASTC compressed data is organized in blocks of 16 bytes each
+            # ASTC compressed data is organized in 16-byte blocks.
             num_blocks_x = (width + block_x - 1) // block_x
             num_blocks_y = (height + block_y - 1) // block_y
             mip0_size = num_blocks_x * num_blocks_y * 16
-            
-            # Extract only mip level 0 if data contains mipmaps
+
+            # If data exceeds mip 0 size, trim — astcenc only consumes mip 0.
             if len(astc_data) > mip0_size:
                 astc_data = astc_data[:mip0_size]
-            
-            # Verify we have enough data
+
+            is_placeholder = False
+            decode_width = width
+            decode_height = height
+
             if len(astc_data) < mip0_size:
-                return False  # Incomplete data
-            
-            # Create temporary ASTC file with proper header
+                # Streaming/placeholder case (e.g. UE mobile lowest-mip block).
+                # We have at least one full block.  Pick the largest WxH that
+                # the data can fully cover so astcenc accepts it.
+                available_blocks = len(astc_data) // 16
+                if available_blocks < 1:
+                    return False, False
+                is_placeholder = True
+                # Use a square-ish layout; if we have N blocks, choose
+                # bx = floor(sqrt(N)), by = N // bx.  Common case N=1 -> 1x1.
+                bx = max(1, int(available_blocks ** 0.5))
+                by = max(1, available_blocks // bx)
+                # Trim trailing partial row to keep astcenc happy.
+                astc_data = astc_data[: bx * by * 16]
+                decode_width = bx * block_x
+                decode_height = by * block_y
+
             with tempfile.NamedTemporaryFile(suffix='.astc', delete=False) as f:
-                header = ASTCDecoder.create_astc_header(width, height, block_x, block_y)
+                header = ASTCDecoder.create_astc_header(decode_width, decode_height,
+                                                        block_x, block_y)
                 f.write(header)
                 f.write(astc_data)
                 astc_file = f.name
-            
-            # Decode: -ds for sRGB, -dl for linear
+
             decode_flag = '-ds' if is_srgb else '-dl'
-            
+
             result = subprocess.run([
                 str(astcenc),
                 decode_flag,
@@ -202,13 +225,17 @@ class ASTCDecoder:
                 output_path
             ], capture_output=True, text=True, timeout=10, encoding='utf-8', errors='replace',
                 **_hidden_subprocess_kwargs())
-            
-            os.unlink(astc_file)
-            
-            return result.returncode == 0 and os.path.exists(output_path)
-            
+
+            try:
+                os.unlink(astc_file)
+            except OSError:
+                pass
+
+            success = result.returncode == 0 and os.path.exists(output_path)
+            return success, (success and is_placeholder)
+
         except Exception:
-            return False
+            return False, False
 
 @dataclass
 class TextureInfo:
@@ -232,7 +259,13 @@ class TextureInfo:
     md5: str = ""
     extracted_path: str = ""
     thumbnail_base64: str = ""  # For HTML embedding
-    
+    # True when the captured buffer is only an UE-style streaming placeholder
+    # (e.g. a single ASTC block for the smallest mip).  The thumbnail still
+    # gets decoded, but the HTML report should annotate it so the user
+    # understands the picture is not the full asset.
+    is_placeholder: bool = False
+    placeholder_reason: str = ""
+
 @dataclass
 class ShaderComplexity:
     """Shader complexity metrics from Mali compiler"""
@@ -751,8 +784,8 @@ class RDCAnalyzer:
             if tex_info.is_astc:
                 # Decode ASTC texture
                 png_path = self.extract_dir / f"thumb_{tex_info.resource_id}.png"
-                
-                success = ASTCDecoder.decode_astc_to_png(
+
+                success, is_placeholder = ASTCDecoder.decode_astc_to_png(
                     data,
                     tex_info.width,
                     tex_info.height,
@@ -761,17 +794,38 @@ class RDCAnalyzer:
                     tex_info.is_srgb,
                     str(png_path)
                 )
-                
+
                 if success:
                     try:
-                        img = Image.open(png_path)
-                        result = self._image_to_thumbnail_base64(img)
-                        # Clean up
-                        png_path.unlink()
-                        return result
+                        img = Image.open(png_path).copy()
+                        # UE streaming placeholder: a tiny image carrying just
+                        # the lowest-mip block.  Up-scale so the user can see
+                        # the representative color rather than getting a 4x4
+                        # speck.  Flag the texture so the report can annotate.
+                        if is_placeholder:
+                            tex_info.is_placeholder = True
+                            tex_info.placeholder_reason = (
+                                f"streaming-mip: only {len(data)} bytes available "
+                                f"for {tex_info.width}x{tex_info.height} {tex_info.format}"
+                            )
+                            target = 96
+                            if img.width and img.height:
+                                scale = max(1, target // max(img.width, img.height))
+                                img = img.resize(
+                                    (img.width * scale, img.height * scale),
+                                    Image.NEAREST,
+                                )
+                        try:
+                            png_path.unlink()
+                        except OSError:
+                            pass
+                        return self._image_to_thumbnail_base64(img)
                     except Exception:
                         if png_path.exists():
-                            png_path.unlink()
+                            try:
+                                png_path.unlink()
+                            except OSError:
+                                pass
             else:
                 if self.is_d3d11:
                     preview = self._create_d3d11_thumbnail(tex_info, data)
@@ -2132,12 +2186,44 @@ class HTMLReportGenerator:
         }
         .texture-item {
             text-align: center;
+            position: relative;
         }
         .texture-item img {
             border: 2px solid #ddd;
             border-radius: 5px;
             max-width: 128px;
             max-height: 128px;
+            image-rendering: pixelated;
+        }
+        .texture-item.placeholder img {
+            border: 2px dashed #d97706;
+            background: repeating-linear-gradient(
+                45deg, #fef3c7, #fef3c7 6px, #fde68a 6px, #fde68a 12px);
+        }
+        .texture-item .placeholder-badge {
+            position: absolute;
+            top: 4px;
+            left: 4px;
+            background: #d97706;
+            color: white;
+            font-size: 10px;
+            padding: 1px 5px;
+            border-radius: 3px;
+            font-weight: bold;
+            cursor: help;
+        }
+        .texture-item.no-data .no-preview {
+            width: 128px;
+            height: 128px;
+            background: #ddd;
+            border: 2px solid #999;
+            border-radius: 5px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #666;
+            font-size: 12px;
+            cursor: help;
         }
         .texture-item span {
             display: block;
@@ -2357,6 +2443,57 @@ class HTMLReportGenerator:
                 
         return matches
     
+    def _render_bound_textures(self, textures):
+        """Render the texture grid for a draw call, with placeholder badges.
+
+        UE-style mobile captures often only ship a single ASTC block (16 bytes)
+        in the capture as a streaming placeholder.  We still render a swatch
+        for those, but tag the cell so the user can see the difference between
+        "data missing from capture" and "fully loaded asset".
+        """
+        self.add_html(
+            f'<p><strong>Textures ({len(textures)}):</strong></p>'
+            '<div class="texture-grid">'
+        )
+        for tex in textures:
+            fmt_label = (tex.format or "")[:30]
+            dims = f"{tex.width}x{tex.height}"
+            if tex.thumbnail_base64:
+                cls = "texture-item"
+                badge = ""
+                if getattr(tex, "is_placeholder", False):
+                    cls += " placeholder"
+                    tooltip = (
+                        f"UE streaming placeholder: capture only stored a "
+                        f"single block for the lowest mip ({tex.placeholder_reason}). "
+                        f"The real pixel data is streamed in at runtime and is "
+                        f"not part of this .rdc file."
+                    )
+                    badge = f'<span class="placeholder-badge" title="{tooltip}">占位符</span>'
+                self.add_html(f"""
+<div class="{cls}">
+    {badge}
+    <img src="{tex.thumbnail_base64}" alt="Texture {tex.resource_id}">
+    <span>{dims}<br>{fmt_label}</span>
+</div>
+""")
+            else:
+                # Genuinely no decodable data (depth target, EGL external, etc.)
+                fmt_upper = (tex.format or "").upper()
+                if "DEPTH" in fmt_upper or "STENCIL" in fmt_upper:
+                    note = "深度/模板缓冲，无可视化像素数据"
+                elif "EXTERNAL" in fmt_upper or "OES" in fmt_upper:
+                    note = "EGLImage 外部纹理，像素由 Android 共享内存提供，不在抓帧中"
+                else:
+                    note = "抓帧中无该资源的像素数据"
+                self.add_html(f"""
+<div class="texture-item no-data">
+    <div class="no-preview" title="{note}">No Preview</div>
+    <span>{dims}<br>{fmt_label}</span>
+</div>
+""")
+        self.add_html('</div>')
+
     def render_drawcall_details(self, base_dc, new_dc):
         """Helper method to render draw call details with textures and 3D geometry"""
         # Base draw call
@@ -2367,49 +2504,17 @@ class HTMLReportGenerator:
 """)
             
             if base_dc.bound_textures:
-                self.add_html(f'<p><strong>Textures ({len(base_dc.bound_textures)}):</strong></p><div class="texture-grid">')
-                for tex in base_dc.bound_textures:
-                    if tex.thumbnail_base64:
-                        self.add_html(f"""
-<div class="texture-item">
-    <img src="{tex.thumbnail_base64}" alt="Texture {tex.resource_id}">
-    <span>{tex.width}x{tex.height}<br>{tex.format[:25]}</span>
-</div>
-""")
-                    else:
-                        self.add_html(f"""
-<div class="texture-item">
-    <div style="width:128px;height:128px;background:#ddd;border:2px solid #999;border-radius:5px;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;">No Preview</div>
-    <span>{tex.width}x{tex.height}<br>{tex.format[:25]}</span>
-</div>
-""")
-                self.add_html('</div>')
-        
+                self._render_bound_textures(base_dc.bound_textures)
+
         # New draw call
         if new_dc:
             self.add_html(f"""
 <p><strong>New:</strong> {new_dc.name} <code>EID {new_dc.eid}</code> <code>Chunk {new_dc.chunk_index}</code></p>
 <p>Primitives: {new_dc.primitive_count:,} | Vertices: {new_dc.vertex_count:,} | Instance: {new_dc.instance_count}</p>
 """)
-            
+
             if new_dc.bound_textures:
-                self.add_html(f'<p><strong>Textures ({len(new_dc.bound_textures)}):</strong></p><div class="texture-grid">')
-                for tex in new_dc.bound_textures:
-                    if tex.thumbnail_base64:
-                        self.add_html(f"""
-<div class="texture-item">
-    <img src="{tex.thumbnail_base64}" alt="Texture {tex.resource_id}">
-    <span>{tex.width}x{tex.height}<br>{tex.format[:25]}</span>
-</div>
-""")
-                    else:
-                        self.add_html(f"""
-<div class="texture-item">
-    <div style="width:128px;height:128px;background:#ddd;border:2px solid #999;border-radius:5px;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;">No Preview</div>
-    <span>{tex.width}x{tex.height}<br>{tex.format[:25]}</span>
-</div>
-""")
-                self.add_html('</div>')
+                self._render_bound_textures(new_dc.bound_textures)
         
     def render_shader_stats(self, base_dc, new_dc):
         """Helper method to render shader performance comparison"""
