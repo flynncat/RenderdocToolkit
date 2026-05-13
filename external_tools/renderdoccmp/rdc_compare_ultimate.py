@@ -38,6 +38,28 @@ except ImportError:
     PIL_AVAILABLE = False
 
 
+def _hidden_subprocess_kwargs() -> dict:
+    """Return subprocess kwargs that suppress console window popups on Windows.
+
+    Without these flags every renderdoccmd / malioc / astcenc invocation
+    flashes a cmd window which steals focus from the user.  We combine
+    ``CREATE_NO_WINDOW`` (prevents inheriting / creating a console) with an
+    explicit ``SW_HIDE`` ``STARTUPINFO`` for defence in depth.
+
+    Note: ``DETACHED_PROCESS`` is incompatible with ``CREATE_NO_WINDOW`` and
+    must NOT be combined.
+    """
+    kwargs: dict = {}
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    if hasattr(subprocess, "STARTUPINFO") and hasattr(subprocess, "STARTF_USESHOWWINDOW"):
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0  # SW_HIDE
+        kwargs["startupinfo"] = si
+    return kwargs
+
+
 class ASTCDecoder:
     """Handles ASTC texture decoding"""
     
@@ -178,7 +200,8 @@ class ASTCDecoder:
                 decode_flag,
                 astc_file,
                 output_path
-            ], capture_output=True, text=True, timeout=10, encoding='utf-8', errors='replace')
+            ], capture_output=True, text=True, timeout=10, encoding='utf-8', errors='replace',
+                **_hidden_subprocess_kwargs())
             
             os.unlink(astc_file)
             
@@ -332,7 +355,8 @@ class RDCConverter:
                 "convert",
                 "-f", str(rdc_path),
                 "-o", str(output_dir / f"{base_name}.zip.xml")
-            ], capture_output=True, text=True, timeout=300, check=True, env=env, encoding='utf-8', errors='replace')
+            ], capture_output=True, text=True, timeout=300, check=True, env=env, encoding='utf-8',
+                errors='replace', **_hidden_subprocess_kwargs())
             
             print(f"  [OK] Conversion complete")
             return (str(xml_path), str(zip_path))
@@ -1658,7 +1682,8 @@ class RDCAnalyzer:
                 timeout=10,
                 env=env,
                 encoding='utf-8',
-                errors='replace'
+                errors='replace',
+                **_hidden_subprocess_kwargs(),
             )
             
             output = result.stdout + result.stderr

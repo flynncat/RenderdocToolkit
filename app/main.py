@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -497,6 +499,49 @@ async def get_perf_artifact(job_id: str, path: str) -> FileResponse:
     return FileResponse(path=str(candidate), filename=candidate.name)
 
 
+@app.get("/api/renderdoc-perf/jobs/{job_id}/draw-texture-thumbnail")
+async def get_perf_draw_texture_thumbnail(
+    job_id: str, res_id: str, width: int, height: int, fmt: str = ""
+) -> FileResponse:
+    """Lazily decode the dominant bound texture for an XML-fallback draw.
+
+    Used as the per-draw preview surrogate when GPU wireframe replay is
+    unavailable (custom/older RenderDoc builds without Python API).
+    Thumbnails are cached on disk so repeat requests are instant.
+    """
+    try:
+        job_dir = perf_service.store.job_path(job_id).resolve()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="性能分析任务不存在")
+
+    if not res_id or width <= 0 or height <= 0:
+        raise HTTPException(status_code=400, detail="无效的纹理参数")
+
+    cache_dir = job_dir / "artifacts" / "draw_thumbs"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    safe_fmt = re.sub(r"[^A-Za-z0-9_]", "_", fmt or "raw")
+    cache_path = cache_dir / f"tex_{res_id}_{width}x{height}_{safe_fmt}.png"
+
+    if not cache_path.exists():
+        from app.services import renderdoc_xml_thumbnailer
+        zip_path = job_dir / "workdir" / "capture.zip"
+        if not zip_path.exists():
+            raise HTTPException(status_code=404, detail="capture.zip 不存在（未启用 zip.xml 回退路径）")
+        astcenc = renderdoc_xml_thumbnailer.find_astcenc()
+        ok = renderdoc_xml_thumbnailer.generate_thumbnail(
+            zip_path=zip_path,
+            resource_id=res_id,
+            width=width,
+            height=height,
+            fmt=fmt,
+            output_png=cache_path,
+            astcenc_path=astcenc,
+        )
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"无法解码纹理 res={res_id} fmt={fmt}")
+    return FileResponse(path=str(cache_path), filename=cache_path.name, media_type="image/png")
+
+
 @app.get("/api/asset-export/jobs")
 async def list_asset_export_jobs() -> list[dict]:
     return asset_export_store.list_jobs()
@@ -539,15 +584,20 @@ async def run_renderdoc_cmp_by_path(
         },
     )
 
+    # cmp_service.run_compare blocks for several minutes while the cmp child
+    # process decodes textures / analyses shaders.  Run it in a worker thread
+    # so the FastAPI event loop keeps serving health checks, job listings,
+    # and other UI requests.
     try:
-        cmp_service.run_compare(
-            job_id=job_id,
-            base_file=base_file,
-            new_file=new_file,
-            strict_mode=str(strict_mode).lower() in {"true", "1", "yes", "on"},
-            renderdoc_dir=renderdoc_dir,
-            malioc_path=malioc_path,
-            verbose=str(verbose).lower() in {"true", "1", "yes", "on"},
+        await run_in_threadpool(
+            cmp_service.run_compare,
+            job_id,
+            base_file,
+            new_file,
+            str(strict_mode).lower() in {"true", "1", "yes", "on"},
+            renderdoc_dir,
+            malioc_path,
+            str(verbose).lower() in {"true", "1", "yes", "on"},
         )
     except Exception as exc:
         cmp_service.update_metadata(job_id, {"status": "failed"})
@@ -575,7 +625,12 @@ async def run_renderdoc_perf_by_path(
         },
     )
     try:
-        return perf_service.analyze_capture_isolated(job_id, capture_file, renderdoc_dir=renderdoc_dir)
+        return await run_in_threadpool(
+            perf_service.analyze_capture_isolated,
+            job_id,
+            capture_file,
+            renderdoc_dir,
+        )
     except Exception as exc:
         perf_service.store.update_metadata(job_id, {"status": "failed"})
         raise HTTPException(status_code=500, detail=f"性能分析失败: {exc}") from exc
@@ -1195,14 +1250,17 @@ async def run_renderdoc_cmp(
     )
 
     try:
-        result = cmp_service.run_compare(
-            job_id=job_id,
-            base_file=base_path,
-            new_file=new_path,
-            strict_mode=str(strict_mode).lower() in {"true", "1", "yes", "on"},
-            renderdoc_dir=renderdoc_dir,
-            malioc_path=malioc_path,
-            verbose=str(verbose).lower() in {"true", "1", "yes", "on"},
+        # Same as /compare/by-path: run in worker thread so the FastAPI event
+        # loop keeps serving other requests during the multi-minute cmp.
+        await run_in_threadpool(
+            cmp_service.run_compare,
+            job_id,
+            base_path,
+            new_path,
+            str(strict_mode).lower() in {"true", "1", "yes", "on"},
+            renderdoc_dir,
+            malioc_path,
+            str(verbose).lower() in {"true", "1", "yes", "on"},
         )
     except Exception as exc:
         cmp_service.update_metadata(job_id, {"status": "failed"})
@@ -1232,7 +1290,12 @@ async def run_renderdoc_perf(
         },
     )
     try:
-        return perf_service.analyze_capture_isolated(job_id, saved_capture, renderdoc_dir=renderdoc_dir)
+        return await run_in_threadpool(
+            perf_service.analyze_capture_isolated,
+            job_id,
+            saved_capture,
+            renderdoc_dir,
+        )
     except Exception as exc:
         perf_service.store.update_metadata(job_id, {"status": "failed"})
         raise HTTPException(status_code=500, detail=f"性能分析失败: {exc}") from exc

@@ -338,14 +338,21 @@ function renderPerfSortFields(fields) {
 }
 
 function renderPerfDrawPreviewMarkup(row) {
-  if (row.draw_preview_url) {
-    const title = `EID ${row.eid || "-"} | ${row.pass_name || "-"}`;
-    const meta = `Score ${Number(row.stable_sort_score || 0).toFixed(3)} | Cover ${Number(row.screen_coverage_percent || 0).toFixed(3)}% | Tri ${row.triangles || 0}`;
-    return `<button type="button" class="perf-preview-trigger" data-preview-src="${escapeHtml(row.draw_preview_url)}" data-preview-title="${escapeHtml(title)}" data-preview-meta="${escapeHtml(meta)}"><img src="${row.draw_preview_url}" alt="draw-${row.eid}" class="perf-preview-thumb"></button>`;
-  }
   const previewKind = (row.draw_preview_kind || "").toLowerCase();
+  if (row.draw_preview_url) {
+    const isTexFallback = previewKind === "texture";
+    const baseTitle = `EID ${row.eid || "-"} | ${row.pass_name || "-"}`;
+    const title = isTexFallback ? `${baseTitle}（贴图预览 · 回退模式）` : baseTitle;
+    const meta = `Score ${Number(row.stable_sort_score || 0).toFixed(3)} | Cover ${Number(row.screen_coverage_percent || 0).toFixed(3)}% | Tri ${row.triangles || 0}`;
+    const altText = isTexFallback ? `draw-${row.eid}-texture-fallback` : `draw-${row.eid}`;
+    const hoverNote = isTexFallback
+      ? "自定义 RenderDoc 无 Python 回放 API；以绑定贴图作为视觉提示替代线框预览。"
+      : "";
+    const cls = isTexFallback ? "perf-preview-thumb perf-preview-thumb--fallback" : "perf-preview-thumb";
+    return `<button type="button" class="perf-preview-trigger" data-preview-src="${escapeHtml(row.draw_preview_url)}" data-preview-title="${escapeHtml(title)}" data-preview-meta="${escapeHtml(meta)}" title="${escapeHtml(hoverNote)}"><img src="${row.draw_preview_url}" alt="${altText}" class="${cls}" loading="lazy"></button>`;
+  }
   if (previewKind === "unavailable") {
-    return '<span class="perf-preview-empty" title="自定义 RenderDoc 不支持 Python 回放 API，单 Draw 线框预览不可用">回退</span>';
+    return '<span class="perf-preview-empty" title="自定义 RenderDoc 不支持 Python 回放 API，且该 Draw 未绑定可解码贴图。">回退</span>';
   }
   return '<span class="perf-preview-empty">无</span>';
 }

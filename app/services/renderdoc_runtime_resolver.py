@@ -122,6 +122,23 @@ def convert_capture_to_xml(
     )
 
 
+def convert_capture_to_zip_xml(
+    capture_path: str | Path,
+    renderdoc_cmd_path: str,
+    output_dir: str | Path,
+) -> Optional[Path]:
+    """Convert to ``zip.xml`` format which produces TWO files in *output_dir*:
+    ``capture.zip.xml`` (structured chunk data) and ``capture.zip`` (binary
+    resource buffers).  Returns the path to the ``.zip.xml`` file on success.
+
+    The companion ``.zip`` is at ``output_dir / "capture.zip"`` and is used
+    later by texture-thumbnail generation.
+    """
+    return _run_renderdoccmd_convert(
+        capture_path, renderdoc_cmd_path, output_dir, "zip.xml", "zip.xml",
+    )
+
+
 def convert_capture_to_chrome_json(
     capture_path: str | Path,
     renderdoc_cmd_path: str,

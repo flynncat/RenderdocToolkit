@@ -14,6 +14,35 @@ from app.services.renderdoc_perf_store import RenderdocPerfStore
 from app.services.subprocess_utils import hidden_subprocess_kwargs
 
 
+def _select_preview_texture(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Pick the largest bound texture from a draw row to use as its preview.
+
+    Prefers textures that have a known ``data_buffer_id`` (compressed formats
+    upload the actual bytes to a buffer separate from the texture descriptor)
+    and the largest estimated size among them.
+    """
+    items = row.get("texture_summary_items") or []
+    if not items:
+        return None
+    # Two-pass: prefer items with a data_buffer_id (decodable); fall back to
+    # any item with a res_id if none have a buffer.
+    candidates = [it for it in items if it.get("data_buffer_id")]
+    if not candidates:
+        candidates = items
+    best = None
+    best_bytes = -1
+    for it in candidates:
+        if not it.get("width") or not it.get("height"):
+            continue
+        if not (it.get("data_buffer_id") or it.get("res_id")):
+            continue
+        b = int(it.get("estimated_bytes", 0))
+        if b > best_bytes:
+            best = it
+            best_bytes = b
+    return best
+
+
 class RenderdocPerfService:
     COUNTER_NAMES = [
         "GPU Duration",
@@ -232,6 +261,7 @@ class RenderdocPerfService:
         """
         from app.services.renderdoc_runtime_resolver import (
             convert_capture_to_xml,
+            convert_capture_to_zip_xml,
             convert_capture_to_chrome_json,
             extract_capture_thumbnail,
         )
@@ -243,7 +273,18 @@ class RenderdocPerfService:
         preview_dir = job_dir / "artifacts" / "previews"
         preview_dir.mkdir(parents=True, exist_ok=True)
 
-        xml_path = convert_capture_to_xml(capture_path, rd_ctx.renderdoc_cmd_path, work_dir)
+        # Prefer zip.xml (XML + companion .zip with raw resource buffers) so
+        # we can lazily generate per-draw texture thumbnails later.  Fall back
+        # to pure xml if the conversion fails (e.g. very old renderdoccmd).
+        zip_xml_path = convert_capture_to_zip_xml(
+            capture_path, rd_ctx.renderdoc_cmd_path, work_dir,
+        )
+        if zip_xml_path is not None:
+            xml_path = zip_xml_path
+            zip_companion = work_dir / "capture.zip"
+        else:
+            xml_path = convert_capture_to_xml(capture_path, rd_ctx.renderdoc_cmd_path, work_dir)
+            zip_companion = None
         if xml_path is None:
             raise RuntimeError(
                 f"无法用自定义 renderdoccmd 转换 capture 为 XML。"
@@ -271,6 +312,36 @@ class RenderdocPerfService:
                 )
             except ValueError:
                 analysis["capture_thumbnail_url"] = ""
+
+        # Annotate each draw row with a lazy texture-thumbnail URL so the
+        # frontend can populate the "preview" cell.  Per-draw GPU wireframe
+        # is impossible in fallback mode (no replay API) — we substitute the
+        # draw's dominant bound texture as a visual hint.
+        if zip_companion and zip_companion.exists():
+            features = analysis.setdefault("analysis_features", {})
+            features["draw_texture_thumbnail_supported"] = True
+            for row in analysis.get("rows", []):
+                top_tex = _select_preview_texture(row)
+                if top_tex is None:
+                    continue
+                # Prefer data_buffer_id (actual pixel storage in capture.zip)
+                # over the texture's own resource id (which is the descriptor).
+                lookup_id = top_tex.get("data_buffer_id") or top_tex.get("res_id", "")
+                if not lookup_id:
+                    continue
+                # Use upload's actual dimensions (data_width/height) when
+                # available — they tell the decoder how to interpret the
+                # compressed block grid.  For partial uploads this avoids
+                # mis-sized ASTC headers.
+                decode_w = top_tex.get("data_width") or top_tex.get("width", 0)
+                decode_h = top_tex.get("data_height") or top_tex.get("height", 0)
+                row["draw_preview_url"] = (
+                    f"/api/renderdoc-perf/jobs/{job_id}/draw-texture-thumbnail"
+                    f"?res_id={lookup_id}"
+                    f"&width={decode_w}&height={decode_h}"
+                    f"&fmt={top_tex.get('format_full', top_tex.get('format', ''))}"
+                )
+                row["draw_preview_kind"] = "texture"
 
         self.store.write_json_artifact(job_id, "artifacts/perf_analysis.json", analysis)
 

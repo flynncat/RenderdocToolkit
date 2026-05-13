@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import shutil
 import subprocess
 import sys
 from datetime import datetime
+from multiprocessing.connection import Connection
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from app.config import CMP_SESSION_ROOT, RENDERDOC_CMP_ROOT, RENDERDOC_CMP_SCRIPT
-from app.services.script_runner import run_python_script_inproc
+from app.services.script_runner import run_python_script_inproc, run_python_script_inproc_to_file
 from app.services.subprocess_utils import hidden_subprocess_kwargs
+
+
+# Hard cap on cmp script wall-clock time.  The two-capture cmp pipeline does
+# heavy texture decoding + per-shader malioc analysis and can legitimately run
+# for 10-20 minutes on large UE captures.  We give it 45 minutes max so a
+# truly stuck child gets killed instead of blocking the UI forever.
+_CMP_SUBPROCESS_TIMEOUT_SECONDS = 45 * 60
 
 
 def _now_iso() -> str:
@@ -89,8 +98,13 @@ class RenderdocCmpService:
         if verbose:
             script_args.append("--verbose")
 
+        # In frozen builds (portable .exe) we MUST run the cmp script in a
+        # separate process — it does heavy texture decoding and Mali compiler
+        # invocations that can OOM on large UE captures.  Running it in-proc
+        # would kill the entire web server (and thus the desktop window).
         if getattr(sys, "frozen", False):
-            returncode, combined_output = run_python_script_inproc(self.cmp_script, script_args, cwd=work_dir)
+            returncode = self._run_compare_subprocess(script_args, work_dir, run_log)
+            combined_output = run_log.read_text(encoding="utf-8", errors="replace") if run_log.exists() else ""
         else:
             cmd = [sys.executable, str(self.cmp_script), *script_args]
             proc = subprocess.run(
@@ -105,9 +119,10 @@ class RenderdocCmpService:
             )
             returncode = proc.returncode
             combined_output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
-        run_log.write_text(combined_output, encoding="utf-8", errors="replace")
+            run_log.write_text(combined_output, encoding="utf-8", errors="replace")
         if returncode != 0:
-            raise RuntimeError(combined_output.strip() or "renderdoc_cmp 执行失败")
+            tail = combined_output.strip()[-4000:] if combined_output else ""
+            raise RuntimeError(tail or f"renderdoc_cmp 执行失败 (exit_code={returncode})")
 
         self._assert_supported_output(combined_output)
 
@@ -213,3 +228,116 @@ class RenderdocCmpService:
             else:
                 base[key] = value
         return base
+
+    def _run_compare_subprocess(
+        self,
+        script_args: List[str],
+        work_dir: Path,
+        run_log: Path,
+    ) -> int:
+        """Run the cmp script inside an isolated child process.
+
+        Streams its stdout/stderr live to *run_log*.  If the child crashes
+        (OOM, segfault from a native extension, etc.) the parent service
+        survives and reports a useful error instead of dying silently.
+        """
+        ctx = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        process = ctx.Process(
+            target=_cmp_worker_entry,
+            args=(
+                str(self.cmp_script),
+                list(script_args),
+                str(work_dir),
+                str(run_log),
+                child_conn,
+            ),
+            daemon=False,
+        )
+        process.start()
+        child_conn.close()
+        process.join(timeout=_CMP_SUBPROCESS_TIMEOUT_SECONDS)
+
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=10)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
+            self._append_to_log(
+                run_log,
+                f"\n[cmp_service] subprocess timed out after "
+                f"{_CMP_SUBPROCESS_TIMEOUT_SECONDS}s and was terminated.\n",
+            )
+            raise RuntimeError(
+                f"cmp 子进程执行超时（>{_CMP_SUBPROCESS_TIMEOUT_SECONDS // 60} 分钟），已强制终止。"
+            )
+
+        result: Dict[str, Any] = {}
+        if parent_conn.poll():
+            try:
+                result = parent_conn.recv()
+            except EOFError:
+                result = {}
+        parent_conn.close()
+
+        if process.exitcode not in (0, None):
+            self._append_to_log(
+                run_log,
+                f"\n[cmp_service] subprocess exited with code "
+                f"{process.exitcode} (likely OOM, segfault, or killed).\n",
+            )
+            raise RuntimeError(
+                f"cmp 子进程异常退出 (exit_code={process.exitcode})，"
+                f"可能由于内存不足或本地工具崩溃。"
+                f"详见日志：{run_log}"
+            )
+
+        return int(result.get("rc", 1))
+
+    @staticmethod
+    def _append_to_log(log_path: Path, text: str) -> None:
+        try:
+            with log_path.open("a", encoding="utf-8", errors="replace") as f:
+                f.write(text)
+        except OSError:
+            pass
+
+
+def _cmp_worker_entry(
+    script_path: str,
+    argv: List[str],
+    work_dir: str,
+    output_file: str,
+    conn: Connection,
+) -> None:
+    """Subprocess worker: run the cmp script with output streamed to a file.
+
+    Lives in module scope so it is picklable for ``multiprocessing.spawn``.
+    """
+    out_path = Path(output_file)
+    try:
+        rc = run_python_script_inproc_to_file(
+            Path(script_path),
+            argv,
+            out_path,
+            cwd=Path(work_dir),
+        )
+        conn.send({"ok": True, "rc": rc})
+    except Exception as exc:
+        import traceback
+        try:
+            with out_path.open("a", encoding="utf-8", errors="replace") as f:
+                f.write(f"\n[cmp_worker] uncaught {type(exc).__name__}: {exc}\n")
+                traceback.print_exc(file=f)
+        except OSError:
+            pass
+        try:
+            conn.send({"ok": False, "rc": -1, "error": str(exc)})
+        except OSError:
+            pass
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass

@@ -185,6 +185,19 @@ class _TexInfo:
     fmt: str = ""
     target: str = ""
     estimated_bytes: int = 0
+    # ID of the buffer carrying the actual pixel data (set by
+    # glCompressedTexImage2D / glCompressedTexSubImage2D at mip level 0).
+    # For compressed textures, this buffer ID is what should be looked up in
+    # capture.zip to fetch the encoded bytes — NOT res_id.
+    data_buffer_id: str = ""
+    # Actual dimensions of the data in data_buffer_id.  Often equals
+    # (width, height) for full uploads but can be smaller for partial tile
+    # uploads — used when decoding ASTC blocks of the right grid size.
+    data_width: int = 0
+    data_height: int = 0
+    # True once we've stored a *full* upload (Image2D, not SubImage2D).
+    # When True we won't overwrite with a partial sub-image.
+    data_is_full: bool = False
 
 
 @dataclass
@@ -264,11 +277,25 @@ _SHADER_CHUNKS = {
     "glCreateProgram", "glAttachShader", "glLinkProgram",
 }
 
+_TEX_UPLOAD = {
+    "glCompressedTexImage2D",
+    "glCompressedTexSubImage2D",
+    "glTexSubImage2D",
+}
+
+# Internal RenderDoc chunk recording the captured initial state of a resource
+# (texture, buffer, etc.) at the start of capture.  For textures uploaded
+# BEFORE the captured frame began (typical for game asset loading), this is
+# where the pixel data lives — there is no explicit upload chunk.
+_INITIAL_CONTENTS_CHUNK = "Internal::Initial Contents"
+
 _STATE_CHUNKS = (
     _TEX_STORAGE
+    | _TEX_UPLOAD
     | _SHADER_CHUNKS
     | {"glBindTexture", "glActiveTexture", "glGenTextures",
-       "glUseProgram", "glViewport", "glLabelObjectEXT"}
+       "glUseProgram", "glViewport", "glLabelObjectEXT",
+       _INITIAL_CONTENTS_CHUNK}
 )
 
 _ALL_INTERESTING = _DRAW_NAMES | _MARKER_PUSH | _MARKER_POP | _STATE_CHUNKS
@@ -294,7 +321,7 @@ _SCENE_PASS_MAP = {
     "prepass": "PrePass",
 }
 
-_PARAM_TAGS = {"uint", "int", "enum", "string", "float", "bool", "ResourceId"}
+_PARAM_TAGS = {"uint", "int", "enum", "string", "float", "bool", "ResourceId", "buffer"}
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +428,14 @@ def _process_chunk(
     # --- Texture catalog ---
     if name in _TEX_STORAGE:
         _handle_tex_storage(ctx, params)
+        return
+
+    if name in _TEX_UPLOAD:
+        _handle_tex_upload(ctx, params)
+        return
+
+    if name == _INITIAL_CONTENTS_CHUNK:
+        _handle_initial_contents(ctx, params)
         return
 
     if name == "glLabelObjectEXT":
@@ -520,6 +555,109 @@ def _aggregate_program_instructions(
     return vs_total, ps_total
 
 
+def _handle_initial_contents(ctx: _ParseContext, params: Dict[str, str]) -> None:
+    """Capture texture pixel data carried by ``Internal::Initial Contents``.
+
+    UE-style applications load most of their texture assets *before* the
+    captured frame, so the pixel data ends up in RenderDoc's initial-contents
+    chunks rather than explicit ``glCompressed*`` upload calls.  Each such
+    chunk for a texture references a ``SubresourceContents`` buffer that
+    lives in ``capture.zip`` under that buffer's zero-padded ID.
+    """
+    type_str = params.get("Type", "")
+    # "2" or "Texture" depending on whether enum text or string is captured.
+    if "Texture" not in type_str and type_str != "2":
+        return
+    res_id = params.get("id", "")
+    if not res_id or res_id == "0":
+        return
+    buffer_id = params.get("SubresourceContents", "")
+    if not buffer_id:
+        return
+
+    info = ctx.texture_catalog.get(res_id)
+    if info is None:
+        info = _TexInfo(res_id=res_id)
+        ctx.texture_catalog[res_id] = info
+
+    # Populate descriptor fields if missing (Initial Contents often arrives
+    # before the corresponding glTexStorage2D in chunk order).
+    try:
+        width = int(params.get("width", "0"))
+        height = int(params.get("height", "0"))
+    except ValueError:
+        width, height = 0, 0
+    if width and not info.width:
+        info.width = width
+    if height and not info.height:
+        info.height = height
+    if not info.fmt:
+        # internalformat carries the enum string like
+        # "GL_COMPRESSED_SRGB8_ALPHA8_ASTC_6x6"; prefer that over raw int.
+        fmt = params.get("internalformat", "")
+        if fmt and not fmt.isdigit():
+            info.fmt = fmt
+
+    # Don't overwrite a known full upload from glCompressedTexImage2D.
+    if info.data_is_full:
+        return
+    info.data_buffer_id = buffer_id
+    info.data_width = info.width
+    info.data_height = info.height
+    info.data_is_full = True
+
+
+def _handle_tex_upload(ctx: _ParseContext, params: Dict[str, str]) -> None:
+    """Record the data buffer ID for a compressed/raw texture upload.
+
+    Compressed formats store their actual pixel bytes in a separate buffer
+    that ``renderdoccmd convert -c zip.xml`` writes into ``capture.zip``.
+    We remember that buffer ID along with the dimensions of *that* upload
+    (which may be a partial tile) so the thumbnail extractor can fetch and
+    decode the bytes — the texture's own resource ID points to the
+    descriptor, not the data.
+
+    Strategy: prefer the first full ``glCompressedTexImage2D`` upload (or
+    matching full-size ``glCompressedTexSubImage2D`` at (0,0)).  Fall back
+    to the first partial sub-image at (0,0) if no full upload exists.
+    """
+    res_id = params.get("texture", "")
+    if not res_id or res_id == "0":
+        return
+    info = ctx.texture_catalog.get(res_id)
+    if info is None:
+        info = _TexInfo(res_id=res_id)
+        ctx.texture_catalog[res_id] = info
+
+    try:
+        level = int(params.get("level", "0"))
+        xoff = int(params.get("xoffset", "0"))
+        yoff = int(params.get("yoffset", "0"))
+        up_w = int(params.get("width", "0"))
+        up_h = int(params.get("height", "0"))
+    except ValueError:
+        level, xoff, yoff, up_w, up_h = 0, 0, 0, 0, 0
+    if level != 0 or xoff != 0 or yoff != 0:
+        return
+
+    buffer_id = params.get("pixels", "")
+    if not buffer_id:
+        return
+
+    # If we already have a full upload, don't overwrite with a partial one.
+    if info.data_is_full:
+        return
+
+    is_full = (
+        up_w == info.width and up_h == info.height and info.width > 0
+    )
+    info.data_buffer_id = buffer_id
+    info.data_width = up_w or info.width
+    info.data_height = up_h or info.height
+    if is_full:
+        info.data_is_full = True
+
+
 def _handle_tex_storage(ctx: _ParseContext, params: Dict[str, str]) -> None:
     res_id = params.get("texture", "")
     if not res_id:
@@ -632,8 +770,13 @@ def _snapshot_textures(ctx: _ParseContext) -> Tuple[List[Dict[str, Any]], int, i
             "width": info.width,
             "height": info.height,
             "format": _format_short(info.fmt),
+            "format_full": info.fmt,
             "levels": info.levels,
             "estimated_bytes": info.estimated_bytes,
+            "data_buffer_id": info.data_buffer_id,
+            "data_width": info.data_width or info.width,
+            "data_height": info.data_height or info.height,
+            "data_is_full": info.data_is_full,
         })
         total_bytes += info.estimated_bytes
     return items, len(items), total_bytes
