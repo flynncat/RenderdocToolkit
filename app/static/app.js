@@ -252,25 +252,51 @@ function renderPerfSummary(detail) {
   const analysis = detail.analysis || {};
   const overview = analysis.overview || {};
   const captureInfo = analysis.capture_info || {};
+  const features = analysis.analysis_features || {};
   currentPerfAnalysis = analysis;
   const rdSource = (inputs.renderdoc_source || "").trim();
   const rdResolved = (inputs.renderdoc_dir_resolved || "").trim();
   const rdLine = rdResolved
     ? `<div><strong>RenderDoc:</strong> ${escapeHtml(rdResolved)}${rdSource ? ` (${escapeHtml(rdSource)})` : ""}</div>`
     : "";
+
+  const analysisMode = (inputs.analysis_mode || "").trim();
+  const isXmlFallback = analysisMode === "xml_fallback";
+  const modeBadge = isXmlFallback
+    ? `<div class="perf-mode-badge perf-mode-fallback">⚠️ XML 回退分析模式 (自定义 RenderDoc)</div>`
+    : "";
+
+  let thumbBlock = "";
+  if (analysis.capture_thumbnail_url) {
+    const note = isXmlFallback
+      ? "回退模式下仅可显示抓帧的整体缩略图，无法生成单 Draw 的线框预览（缺少 Python 回放 API）"
+      : "";
+    thumbBlock = `
+      <div class="perf-capture-thumb-block">
+        <div class="perf-capture-thumb-title">Capture 缩略图</div>
+        <button type="button" class="perf-preview-trigger" data-preview-src="${escapeHtml(analysis.capture_thumbnail_url)}" data-preview-title="Capture 缩略图" data-preview-meta="${escapeHtml(inputs.capture_file || "")}">
+          <img src="${analysis.capture_thumbnail_url}" alt="capture thumbnail" class="perf-capture-thumb">
+        </button>
+        ${note ? `<div class="perf-capture-thumb-note">${escapeHtml(note)}</div>` : ""}
+      </div>
+    `;
+  }
+
   document.getElementById("perf-summary").innerHTML = `
+    ${modeBadge}
     <div><strong>Job:</strong> ${metadata.job_id || "-"}</div>
     <div><strong>状态:</strong> ${metadata.status || "-"}</div>
     <div><strong>Capture:</strong> ${inputs.capture_file || "-"}</div>
     ${rdLine}
     <div><strong>驱动:</strong> ${captureInfo.driver_name || "-"}</div>
-    <div><strong>总 GPU:</strong> ${Number(overview.total_gpu_duration_ms || 0).toFixed(3)} ms</div>
+    <div><strong>总 ${features.api_duration_from_chrome_json ? "API" : "GPU"} 耗时:</strong> ${Number(overview.total_gpu_duration_ms || 0).toFixed(3)} ms${features.api_duration_from_chrome_json ? " <em>(CPU API 近似)</em>" : ""}</div>
     <div><strong>Draw 数:</strong> ${overview.draw_count || 0}</div>
     <div><strong>总三角面:</strong> ${overview.total_triangles || 0}</div>
     <div><strong>总顶点:</strong> ${overview.total_vertices_read || 0}</div>
-    <div><strong>总指令:</strong> ${overview.total_instruction_count || 0}</div>
+    <div><strong>总指令${features.instruction_count_estimated ? "(估算)" : ""}:</strong> ${overview.total_instruction_count || 0}</div>
     <div><strong>稳定总分:</strong> ${Number(overview.total_stable_sort_score || 0).toFixed(3)}</div>
     <div><strong>总贴图:</strong> ${Number(overview.total_texture_mb || 0).toFixed(3)} MB</div>
+    ${thumbBlock}
   `;
   document.getElementById("perf-run-log").textContent = detail.run_log || "暂无日志";
   renderPerfSortFields(analysis.sort_fields || []);
@@ -316,6 +342,10 @@ function renderPerfDrawPreviewMarkup(row) {
     const title = `EID ${row.eid || "-"} | ${row.pass_name || "-"}`;
     const meta = `Score ${Number(row.stable_sort_score || 0).toFixed(3)} | Cover ${Number(row.screen_coverage_percent || 0).toFixed(3)}% | Tri ${row.triangles || 0}`;
     return `<button type="button" class="perf-preview-trigger" data-preview-src="${escapeHtml(row.draw_preview_url)}" data-preview-title="${escapeHtml(title)}" data-preview-meta="${escapeHtml(meta)}"><img src="${row.draw_preview_url}" alt="draw-${row.eid}" class="perf-preview-thumb"></button>`;
+  }
+  const previewKind = (row.draw_preview_kind || "").toLowerCase();
+  if (previewKind === "unavailable") {
+    return '<span class="perf-preview-empty" title="自定义 RenderDoc 不支持 Python 回放 API，单 Draw 线框预览不可用">回退</span>';
   }
   return '<span class="perf-preview-empty">无</span>';
 }

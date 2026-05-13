@@ -223,17 +223,25 @@ class RenderdocPerfService:
         capture_path: Path,
         rd_ctx: Any,
     ) -> Dict[str, Any]:
-        """Fallback path: convert the capture to XML with the task-specific
-        ``renderdoccmd`` and extract analysis from the structured XML data.
+        """Fallback path: convert the capture to XML (and optionally Chrome
+        JSON for timing) with the task-specific ``renderdoccmd`` and extract
+        analysis from the structured data.
+
         Used when the capture format is not readable by the standard renderdoc
         Python module (e.g. older/custom RenderDoc builds).
         """
-        from app.services.renderdoc_runtime_resolver import convert_capture_to_xml
+        from app.services.renderdoc_runtime_resolver import (
+            convert_capture_to_xml,
+            convert_capture_to_chrome_json,
+            extract_capture_thumbnail,
+        )
         from app.services.renderdoc_xml_analyzer import analyze_capture_xml
 
         job_dir = self.store.job_path(job_id)
         work_dir = job_dir / "workdir"
         work_dir.mkdir(parents=True, exist_ok=True)
+        preview_dir = job_dir / "artifacts" / "previews"
+        preview_dir.mkdir(parents=True, exist_ok=True)
 
         xml_path = convert_capture_to_xml(capture_path, rd_ctx.renderdoc_cmd_path, work_dir)
         if xml_path is None:
@@ -242,18 +250,46 @@ class RenderdocPerfService:
                 f"renderdoccmd={rd_ctx.renderdoc_cmd_path}"
             )
 
-        analysis = analyze_capture_xml(xml_path)
+        # Best-effort: extract chrome.json for CPU-side timings and thumbnail
+        # for capture preview.  Either failing is non-fatal.
+        chrome_path = convert_capture_to_chrome_json(
+            capture_path, rd_ctx.renderdoc_cmd_path, work_dir,
+        )
+        thumbnail_path = extract_capture_thumbnail(
+            capture_path, rd_ctx.renderdoc_cmd_path, preview_dir,
+        )
+
+        analysis = analyze_capture_xml(xml_path, chrome_json_path=chrome_path)
         analysis["capture_path"] = str(capture_path)
         analysis["capture_name"] = capture_path.name
 
+        if thumbnail_path and thumbnail_path.exists():
+            try:
+                rel = thumbnail_path.relative_to(job_dir)
+                analysis["capture_thumbnail_url"] = (
+                    f"/api/renderdoc-perf/jobs/{job_id}/artifact?path={rel.as_posix()}"
+                )
+            except ValueError:
+                analysis["capture_thumbnail_url"] = ""
+
         self.store.write_json_artifact(job_id, "artifacts/perf_analysis.json", analysis)
+
+        features = analysis.get("analysis_features", {})
         run_log = (
             f"[capture] {capture_path}\n"
             f"[renderdoc] dir={rd_ctx.renderdoc_dir} cmd={rd_ctx.renderdoc_cmd_path} source={rd_ctx.source}\n"
             f"[mode] xml_fallback\n"
             f"[xml] {xml_path}\n"
+            f"[chrome_json] {chrome_path or 'unavailable'}\n"
+            f"[thumbnail] {thumbnail_path or 'unavailable'}\n"
+            f"[features] api_duration_chrome={features.get('api_duration_from_chrome_json', False)}, "
+            f"instructions_estimated={features.get('instruction_count_estimated', False)}, "
+            f"coverage_estimated={features.get('coverage_estimated_from_viewport', False)}\n"
             f"[draws] {analysis['overview']['draw_count']}\n"
             f"[triangles] {analysis['overview']['total_triangles']}\n"
+            f"[total_api_ms] {analysis['overview']['total_gpu_duration_ms']}\n"
+            f"[total_instructions_est] {analysis['overview']['total_instruction_count']}\n"
+            f"[total_texture_mb] {analysis['overview']['total_texture_mb']}\n"
         )
         self.store.write_text_artifact(job_id, "artifacts/perf_run_log.txt", run_log)
 
@@ -274,10 +310,13 @@ class RenderdocPerfService:
                 },
                 "summary": {
                     "row_count": len(rows),
-                    "total_gpu_duration_ms": 0.0,
+                    "total_gpu_duration_ms": overview.get("total_gpu_duration_ms", 0.0),
                     "hottest_pass": pass_chart[0]["name"] if pass_chart else "",
                     "total_triangles": overview.get("total_triangles", 0),
+                    "total_instruction_count": overview.get("total_instruction_count", 0),
+                    "total_texture_mb": overview.get("total_texture_mb", 0.0),
                     "analysis_mode": "xml_fallback",
+                    "analysis_features": features,
                 },
             },
         )

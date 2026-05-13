@@ -117,28 +117,113 @@ def convert_capture_to_xml(
     """Use a (possibly foreign) ``renderdoccmd convert`` to dump the capture
     as XML.  Returns the path to the XML file on success, ``None`` otherwise.
     """
+    return _run_renderdoccmd_convert(
+        capture_path, renderdoc_cmd_path, output_dir, "xml", "xml",
+    )
+
+
+def convert_capture_to_chrome_json(
+    capture_path: str | Path,
+    renderdoc_cmd_path: str,
+    output_dir: str | Path,
+) -> Optional[Path]:
+    """Convert a capture to Chrome tracing JSON which contains CPU-side API
+    call timestamps.  These approximate per-draw timing when GPU replay is
+    unavailable.
+    """
+    return _run_renderdoccmd_convert(
+        capture_path, renderdoc_cmd_path, output_dir, "chrome.json", "json",
+    )
+
+
+def extract_capture_thumbnail(
+    capture_path: str | Path,
+    renderdoc_cmd_path: str,
+    output_dir: str | Path,
+    max_size: int = 1280,
+) -> Optional[Path]:
+    """Extract the capture's embedded thumbnail using ``renderdoccmd thumb``.
+    Returns the path to the PNG file on success, ``None`` otherwise.
+
+    Uses a fixed ASCII-only output filename to avoid encoding issues with
+    non-ASCII characters in the capture filename on some platforms.
+    """
     capture_path = Path(capture_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    xml_path = output_dir / f"{capture_path.stem}.xml"
+    out_path = output_dir / "capture_thumbnail.png"
+    cmd = [
+        renderdoc_cmd_path,
+        "thumb",
+        "-o", str(out_path),
+        "-f", "png",
+        "-s", str(max_size),
+        str(capture_path),
+    ]
+    try:
+        # Use bytes (no text decoding) to avoid GBK decode errors when
+        # renderdoccmd echoes Chinese capture paths on Windows.
+        proc = subprocess.run(
+            cmd, capture_output=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 100:
+            log.info(
+                "Extracted thumbnail: %s (%d bytes)",
+                out_path, out_path.stat().st_size,
+            )
+            return out_path
+        stderr_text = proc.stderr.decode("utf-8", errors="replace")[:500] if proc.stderr else ""
+        log.warning(
+            "renderdoccmd thumb failed (rc=%d, exists=%s, size=%d): %s",
+            proc.returncode,
+            out_path.exists(),
+            out_path.stat().st_size if out_path.exists() else 0,
+            stderr_text,
+        )
+    except Exception as exc:
+        log.warning("renderdoccmd thumb error: %s", exc)
+    return None
+
+
+def _run_renderdoccmd_convert(
+    capture_path: str | Path,
+    renderdoc_cmd_path: str,
+    output_dir: str | Path,
+    convert_format: str,
+    extension: str,
+) -> Optional[Path]:
+    capture_path = Path(capture_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Use ASCII-only output filename to avoid GBK encoding issues on Windows
+    # when the capture has Chinese characters in its name.
+    out_path = output_dir / f"capture.{extension}"
     cmd = [
         renderdoc_cmd_path,
         "convert",
         "-f", str(capture_path),
-        "-o", str(xml_path),
-        "-c", "xml",
+        "-o", str(out_path),
+        "-c", convert_format,
     ]
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=120,
+            cmd, capture_output=True, timeout=180,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        if proc.returncode == 0 and xml_path.exists() and xml_path.stat().st_size > 100:
-            log.info("Converted capture to XML: %s (%d bytes)", xml_path, xml_path.stat().st_size)
-            return xml_path
-        log.warning("renderdoccmd convert failed (rc=%d): %s", proc.returncode, proc.stderr[:500])
+        if proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 100:
+            log.info(
+                "Converted capture to %s: %s (%d bytes)",
+                convert_format, out_path, out_path.stat().st_size,
+            )
+            return out_path
+        stderr_text = proc.stderr.decode("utf-8", errors="replace")[:500] if proc.stderr else ""
+        log.warning(
+            "renderdoccmd convert -> %s failed (rc=%d): %s",
+            convert_format, proc.returncode, stderr_text,
+        )
     except Exception as exc:
-        log.warning("renderdoccmd convert error: %s", exc)
+        log.warning("renderdoccmd convert -> %s error: %s", convert_format, exc)
     return None
 
 

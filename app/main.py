@@ -479,6 +479,24 @@ async def generate_perf_draw_preview(job_id: str, eid: str = Form(...)) -> dict:
         raise HTTPException(status_code=500, detail=f"生成线框预览失败: {exc}") from exc
 
 
+@app.get("/api/renderdoc-perf/jobs/{job_id}/artifact")
+async def get_perf_artifact(job_id: str, path: str) -> FileResponse:
+    """Serve files under the perf job directory (e.g. capture thumbnail)."""
+    try:
+        job_dir = perf_service.store.job_path(job_id).resolve()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="性能分析任务不存在")
+
+    target = Path(path)
+    candidate = target if target.is_absolute() else (job_dir / target)
+    candidate = candidate.resolve()
+    if not candidate.is_relative_to(job_dir):
+        raise HTTPException(status_code=403, detail="不允许访问该文件")
+    if not candidate.exists() or not candidate.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return FileResponse(path=str(candidate), filename=candidate.name)
+
+
 @app.get("/api/asset-export/jobs")
 async def list_asset_export_jobs() -> list[dict]:
     return asset_export_store.list_jobs()
