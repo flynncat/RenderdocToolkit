@@ -102,7 +102,17 @@ if (Test-Path $PortableDir) {
     }
 }
 
-python -m PyInstaller --noconfirm $SpecPath
+# PyInstaller writes its progress INFO records to stderr; PowerShell with
+# $ErrorActionPreference="Stop" treats those as errors and aborts the build.
+# Temporarily relax the policy and rely on $LASTEXITCODE instead.
+$prevErrorPolicy = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+& python -m PyInstaller --noconfirm $SpecPath *>&1 | ForEach-Object { Write-Host $_ }
+$pyiExit = $LASTEXITCODE
+$ErrorActionPreference = $prevErrorPolicy
+if ($pyiExit -ne 0) {
+    throw "PyInstaller failed with exit code $pyiExit"
+}
 
 $BuiltDir = Join-Path $DistRoot "RenderdocDiffTools"
 if (-not (Test-Path $BuiltDir)) {

@@ -88,6 +88,19 @@ class RenderdocCmpService:
         job_dir = self._job_dir(job_id)
         work_dir = job_dir / "workdir"
         run_log = job_dir / "report" / "cmp_run_log.txt"
+
+        # Pre-pass: drive qrenderdoc replay on each capture so we have real
+        # PNG pixels for the texture grid in the final HTML report.  This
+        # is best-effort — if it fails we silently fall back to the legacy
+        # zip-based decoding path (which only catches Initial Contents +
+        # ASTC placeholder swatches).
+        replay_dirs = self._run_qrenderdoc_pre_pass(
+            job_id=job_id,
+            base_file=base_file,
+            new_file=new_file,
+            renderdoc_dir=effective_renderdoc_dir,
+        )
+
         script_args = [str(base_file), str(new_file)]
         if strict_mode:
             script_args.append("--strict")
@@ -97,6 +110,10 @@ class RenderdocCmpService:
             script_args.extend(["--malioc", malioc_path.strip()])
         if verbose:
             script_args.append("--verbose")
+        if replay_dirs.get("base"):
+            script_args.extend(["--replay-png-base", str(replay_dirs["base"])])
+        if replay_dirs.get("new"):
+            script_args.extend(["--replay-png-new", str(replay_dirs["new"])])
 
         # In frozen builds (portable .exe) we MUST run the cmp script in a
         # separate process — it does heavy texture decoding and Mali compiler
@@ -166,6 +183,72 @@ class RenderdocCmpService:
             "report_url": f"/cmp-session-files/{job_id}/report/cmp_output/comparison_report.html",
             "run_log": combined_output,
         }
+
+    def _run_qrenderdoc_pre_pass(
+        self,
+        *,
+        job_id: str,
+        base_file: Path,
+        new_file: Path,
+        renderdoc_dir: str,
+    ) -> Dict[str, Optional[Path]]:
+        """Best-effort pre-pass: dump real texture PNGs via qrenderdoc.
+
+        Returns a dict ``{"base": Path or None, "new": Path or None}`` that
+        ``run_compare`` then forwards to the cmp script.  Any failure is
+        logged but does not raise — cmp keeps working with its legacy
+        zip-based texture path in that case.
+        """
+        from app.services.replay_backend import select_replay_backend
+
+        result: Dict[str, Optional[Path]] = {"base": None, "new": None}
+        if not renderdoc_dir:
+            return result
+
+        backend = select_replay_backend(renderdoc_dir, timeout_seconds=900)
+        if backend is None:
+            return result
+
+        job_dir = self._job_dir(job_id)
+        log_path = job_dir / "report" / "cmp_qr_replay_log.txt"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def _dump(side: str, capture: Path) -> Optional[Path]:
+            out_dir = job_dir / "workdir" / f"qr_replay_{side}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            # Pre-pass dumps every texture (no specific event filter).  We
+            # bound the extra-dump budget at 1024 to cap I/O while still
+            # covering most assets in a typical UE frame.  Per-draw RT
+            # dumps are not needed for cmp.
+            rep = backend.run(
+                capture_path=capture,
+                output_dir=out_dir,
+                mode="cmp",
+                max_draws=0,
+                event_ids=None,
+                max_extra_textures=1024,
+            )
+            line = (
+                f"[qr_replay] side={side} ok={rep.ok} dur={rep.duration_seconds:.1f}s "
+                f"err={rep.error or 'n/a'}\n"
+            )
+            try:
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write(line)
+            except OSError:
+                pass
+            return out_dir if rep.ok else None
+
+        try:
+            result["base"] = _dump("base", base_file)
+            result["new"] = _dump("new", new_file)
+        except Exception as exc:
+            try:
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write(f"[qr_replay] pre-pass crashed: {exc}\n")
+            except OSError:
+                pass
+        return result
 
     @staticmethod
     def _assert_supported_output(run_log: str) -> None:

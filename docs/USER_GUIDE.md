@@ -64,6 +64,17 @@
 - 线框预览
 - 运行日志中的附加提示
 
+### 预览图来源标识
+
+当指定了自定义 RenderDoc 目录时，工具会自动尝试用 `qrenderdoc.exe --python` 后端做真实 GPU 回放，并按以下颜色边框区分每行 Draw 的预览来源：
+
+- 绿色实线边框：`真实 RT (qrenderdoc 回放)` — 该 Draw 写颜色 RT，展示真实回放出的 RT PNG
+- 绿色虚线边框：`真实绑定纹理 (qrenderdoc 回放)` — 该 Draw 不写颜色 RT（如 shadow map / depth-only pass），改展示其首张绑定纹理的真实回放像素
+- 蓝色实线边框：`线框 (Python 直连回放)` — 公版/兼容版本 RenderDoc 走 Python 直连 API 生成的线框预览
+- 橙色实线边框：`贴图预览 (XML 回退)` — 无可用回放后端时，从 `capture.zip` 解码的绑定纹理作为视觉提示
+
+性能页顶部还会显示当前回放后端徽章，例如 `XML 分析 + qrenderdoc 真实回放 (N draw 已升级)`。
+
 ## 4. 性能 Diff
 
 适用于对比两份 `.rdc` 的性能表现差异。
@@ -92,6 +103,10 @@
 - HTML 报告内嵌窗口
 - `cmp 历史`
 - `运行日志`
+
+### 纹理预览升级
+
+填写自定义 RenderDoc 目录后，cmp 会在两份抓帧上各跑一次 `qrenderdoc.exe --python` 抽真实纹理 PNG，再喂给比对脚本。这能让 UE 移动端常见的 streaming 占位符（capture 里只有 16 字节的最低 mip 数据）也获得真实像素预览；占位符徽章会自动消失。`cmp_qr_replay_log.txt` 记录这一步是否成功，`cmp_run_log.txt` 末尾会输出 `Replay PNG overrides applied: N/Total` 统计实际覆盖数量。
 
 ![性能 Diff 页面](images/cmp-report.png)
 

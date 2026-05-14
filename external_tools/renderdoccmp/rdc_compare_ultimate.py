@@ -410,7 +410,7 @@ class RDCConverter:
 class RDCAnalyzer:
     """Analyzes RenderDoc capture XML and ZIP files"""
     
-    def __init__(self, xml_path: str, zip_path: str, output_dir: str, name: str, verbose: bool = False, malioc_path: str = None):
+    def __init__(self, xml_path: str, zip_path: str, output_dir: str, name: str, verbose: bool = False, malioc_path: str = None, replay_png_dir: str = None):
         self.xml_path = xml_path
         self.zip_path = zip_path
         self.output_dir = Path(output_dir)
@@ -419,6 +419,12 @@ class RDCAnalyzer:
         self.malioc_override = Path(malioc_path) if malioc_path else None
         self.extract_dir = self.output_dir / f"{name}_extracted"
         self.extract_dir.mkdir(exist_ok=True, parents=True)
+        # Directory of real PNGs produced by a qrenderdoc replay pass.  When
+        # present we look up ``tex_<resource_id>.png`` for every TextureInfo
+        # and use the actual GPU-rendered pixels as the thumbnail, which
+        # bypasses the ASTC/streaming-placeholder limitations of XML-only
+        # analysis.  ``None`` keeps the legacy behaviour unchanged.
+        self.replay_png_dir = Path(replay_png_dir) if replay_png_dir else None
         
         print(f"  Loading XML: {Path(xml_path).name}")
         # Read and sanitize XML: remove bytes invalid in XML (non-UTF8 or control chars)
@@ -2092,8 +2098,53 @@ class RDCAnalyzer:
         
         data.total_primitives = sum(dc.primitive_count for dc in data.drawcalls)
         data.total_vertices = sum(dc.vertex_count for dc in data.drawcalls)
-        
+
+        # Optionally override texture thumbnails with real-pixel PNGs from
+        # qrenderdoc replay.  This wipes the "占位符" badge for any texture
+        # that the replay was actually able to read back.
+        if self.replay_png_dir and self.replay_png_dir.is_dir():
+            self._apply_replay_pngs(data.textures)
+
         return data
+
+    def _apply_replay_pngs(self, textures: Dict[str, "TextureInfo"]) -> None:
+        """Override ``thumbnail_base64`` with real-GPU PNGs when available.
+
+        The qrenderdoc backend (Plan B1) drops one ``tex_<resource_id>.png``
+        per texture into ``self.replay_png_dir``.  We look those up by the
+        TextureInfo's resource_id (parsing out the trailing integer where
+        present, e.g. ``ResourceId::272`` -> ``272``).  On a hit, the
+        texture's thumbnail is replaced with the real pixels (encoded as a
+        ``data:`` URL) and the placeholder flag is cleared.
+        """
+        if not PIL_AVAILABLE:
+            return
+        import base64 as _b64
+        overrides = 0
+        for tex in textures.values():
+            rid = (tex.resource_id or "").strip()
+            if not rid:
+                continue
+            # Accept either "272" or "ResourceId::272" / "ResourceId::1000..." forms.
+            digits = rid.rsplit(":", 1)[-1]
+            try:
+                rid_int = int(digits)
+            except ValueError:
+                continue
+            png_path = self.replay_png_dir / f"tex_{rid_int}.png"
+            if not png_path.is_file() or png_path.stat().st_size <= 0:
+                continue
+            try:
+                payload = png_path.read_bytes()
+                tex.thumbnail_base64 = "data:image/png;base64," + _b64.b64encode(payload).decode("ascii")
+                # Real pixels — definitely not a placeholder anymore.
+                tex.is_placeholder = False
+                tex.placeholder_reason = ""
+                overrides += 1
+            except OSError:
+                continue
+        if overrides:
+            print(f"    Replay PNG overrides applied: {overrides}/{len(textures)}")
 
 
 class HTMLReportGenerator:
@@ -2902,11 +2953,17 @@ def main():
     # Find renderdoc path
     renderdoc_path = None
     malioc_path = None
+    replay_png_base = None
+    replay_png_new = None
     for idx, arg in enumerate(sys.argv):
         if arg == '--renderdoc' and idx + 1 < len(sys.argv):
             renderdoc_path = sys.argv[idx + 1]
         if arg == '--malioc' and idx + 1 < len(sys.argv):
             malioc_path = sys.argv[idx + 1]
+        if arg == '--replay-png-base' and idx + 1 < len(sys.argv):
+            replay_png_base = sys.argv[idx + 1]
+        if arg == '--replay-png-new' and idx + 1 < len(sys.argv):
+            replay_png_new = sys.argv[idx + 1]
             
     output_dir = "output/rdc_comparison_output"
     Path(output_dir).mkdir(exist_ok=True, parents=True)
@@ -2933,10 +2990,18 @@ def main():
         new_zip = new_input.replace('.zip.xml', '.zip')
         
     # Analyze
-    base_analyzer = RDCAnalyzer(base_xml, base_zip, output_dir, "base", verbose=verbose_mode, malioc_path=malioc_path)
+    base_analyzer = RDCAnalyzer(
+        base_xml, base_zip, output_dir, "base",
+        verbose=verbose_mode, malioc_path=malioc_path,
+        replay_png_dir=replay_png_base,
+    )
     base_data = base_analyzer.analyze()
-    
-    new_analyzer = RDCAnalyzer(new_xml, new_zip, output_dir, "new", verbose=verbose_mode, malioc_path=malioc_path)
+
+    new_analyzer = RDCAnalyzer(
+        new_xml, new_zip, output_dir, "new",
+        verbose=verbose_mode, malioc_path=malioc_path,
+        replay_png_dir=replay_png_new,
+    )
     new_data = new_analyzer.analyze()
     
     # Generate HTML report

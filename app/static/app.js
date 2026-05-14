@@ -262,9 +262,17 @@ function renderPerfSummary(detail) {
 
   const analysisMode = (inputs.analysis_mode || "").trim();
   const isXmlFallback = analysisMode === "xml_fallback";
-  const modeBadge = isXmlFallback
-    ? `<div class="perf-mode-badge perf-mode-fallback">⚠️ XML 回退分析模式 (自定义 RenderDoc)</div>`
-    : "";
+  const replayBackend = (inputs.replay_backend || "").trim();
+  const qrUsed = !!features.qr_replay_used;
+  const qrUpgraded = Number(features.qr_replay_draws_upgraded || 0);
+  let modeBadge = "";
+  if (isXmlFallback) {
+    if (qrUsed) {
+      modeBadge = `<div class="perf-mode-badge perf-mode-replay-upgraded">XML 分析 + qrenderdoc 真实回放 (${qrUpgraded} draw 已升级为真实 RT)</div>`;
+    } else {
+      modeBadge = `<div class="perf-mode-badge perf-mode-fallback">XML 回退分析模式 (自定义 RenderDoc，未启用 qrenderdoc 后端)</div>`;
+    }
+  }
 
   let thumbBlock = "";
   if (analysis.capture_thumbnail_url) {
@@ -340,15 +348,36 @@ function renderPerfSortFields(fields) {
 function renderPerfDrawPreviewMarkup(row) {
   const previewKind = (row.draw_preview_kind || "").toLowerCase();
   if (row.draw_preview_url) {
+    // Distinguish four sources of the per-draw preview image so users can
+    // see at a glance which technology produced it.  The visual style
+    // (border colour) and tooltip text are different for each.
+    const isRtReplay = previewKind === "rt_replay";
+    const isTexReplay = previewKind === "tex_replay";
     const isTexFallback = previewKind === "texture";
+    const isWireframe = previewKind === "wireframe_overlay";
     const baseTitle = `EID ${row.eid || "-"} | ${row.pass_name || "-"}`;
-    const title = isTexFallback ? `${baseTitle}（贴图预览 · 回退模式）` : baseTitle;
+    let titleSuffix = "";
+    let hoverNote = "";
+    let cls = "perf-preview-thumb";
+    if (isRtReplay) {
+      titleSuffix = "（真实 RT · qrenderdoc 回放）";
+      hoverNote = "通过 qrenderdoc.exe --python 后端真实 GPU 回放得到的渲染目标。";
+      cls = "perf-preview-thumb perf-preview-thumb--rt-replay";
+    } else if (isTexReplay) {
+      titleSuffix = "（真实绑定纹理 · qrenderdoc 回放）";
+      hoverNote = "该 Draw 不写颜色 RT（如 shadow map）；展示其首张绑定纹理的真实回放像素。";
+      cls = "perf-preview-thumb perf-preview-thumb--tex-replay";
+    } else if (isWireframe) {
+      titleSuffix = "（线框 · Python 直连回放）";
+      cls = "perf-preview-thumb perf-preview-thumb--wireframe";
+    } else if (isTexFallback) {
+      titleSuffix = "（贴图预览 · XML 回退）";
+      hoverNote = "无可用回放后端时，从 capture.zip 解码出的绑定贴图作为视觉提示。";
+      cls = "perf-preview-thumb perf-preview-thumb--fallback";
+    }
+    const title = baseTitle + titleSuffix;
     const meta = `Score ${Number(row.stable_sort_score || 0).toFixed(3)} | Cover ${Number(row.screen_coverage_percent || 0).toFixed(3)}% | Tri ${row.triangles || 0}`;
-    const altText = isTexFallback ? `draw-${row.eid}-texture-fallback` : `draw-${row.eid}`;
-    const hoverNote = isTexFallback
-      ? "自定义 RenderDoc 无 Python 回放 API；以绑定贴图作为视觉提示替代线框预览。"
-      : "";
-    const cls = isTexFallback ? "perf-preview-thumb perf-preview-thumb--fallback" : "perf-preview-thumb";
+    const altText = `draw-${row.eid}-${previewKind || "preview"}`;
     return `<button type="button" class="perf-preview-trigger" data-preview-src="${escapeHtml(row.draw_preview_url)}" data-preview-title="${escapeHtml(title)}" data-preview-meta="${escapeHtml(meta)}" title="${escapeHtml(hoverNote)}"><img src="${row.draw_preview_url}" alt="${altText}" class="${cls}" loading="lazy"></button>`;
   }
   if (previewKind === "unavailable") {

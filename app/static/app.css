@@ -428,6 +428,24 @@ pre {
   position: absolute;
 }
 
+/* Real GPU replay via qrenderdoc.exe --python — green border so users can
+   tell at a glance that this is the freshest, highest-fidelity preview. */
+.perf-preview-thumb--rt-replay {
+  border-color: #4ec27a;
+  box-shadow: inset 0 0 0 1px rgba(78, 194, 122, 0.4);
+}
+
+.perf-preview-thumb--tex-replay {
+  border-color: #4ec27a;
+  border-style: dashed;
+  box-shadow: inset 0 0 0 1px rgba(78, 194, 122, 0.32);
+}
+
+.perf-preview-thumb--wireframe {
+  border-color: #6f95e6;
+  box-shadow: inset 0 0 0 1px rgba(111, 149, 230, 0.35);
+}
+
 .perf-preview-empty {
   display: inline-flex;
   align-items: center;
@@ -453,6 +471,12 @@ pre {
   background: #4a3500;
   color: #ffce67;
   border: 1px solid #6a4d00;
+}
+
+.perf-mode-replay-upgraded {
+  background: #1a3d29;
+  color: #76e6a3;
+  border: 1px solid #2d6a45;
 }
 
 .perf-capture-thumb-block {

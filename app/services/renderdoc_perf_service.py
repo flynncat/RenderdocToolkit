@@ -256,8 +256,11 @@ class RenderdocPerfService:
         JSON for timing) with the task-specific ``renderdoccmd`` and extract
         analysis from the structured data.
 
-        Used when the capture format is not readable by the standard renderdoc
-        Python module (e.g. older/custom RenderDoc builds).
+        After XML analysis we *also* try to drive a real GPU replay through
+        the user's ``qrenderdoc.exe`` (the ``QRenderdocScriptBackend``).
+        When that succeeds, we upgrade per-draw previews from
+        "biggest bound texture decoded from XML" to "actual replayed RT
+        PNG", which is what the user really wants.
         """
         from app.services.renderdoc_runtime_resolver import (
             convert_capture_to_xml,
@@ -343,6 +346,16 @@ class RenderdocPerfService:
                 )
                 row["draw_preview_kind"] = "texture"
 
+        # ------------------------------------------------------------------
+        # Upgrade path: GPU replay via QRenderdocScriptBackend
+        # ------------------------------------------------------------------
+        replay_info = self._run_qrenderdoc_replay(
+            job_id=job_id,
+            capture_path=capture_path,
+            rd_ctx=rd_ctx,
+            analysis=analysis,
+        )
+
         self.store.write_json_artifact(job_id, "artifacts/perf_analysis.json", analysis)
 
         features = analysis.get("analysis_features", {})
@@ -353,9 +366,14 @@ class RenderdocPerfService:
             f"[xml] {xml_path}\n"
             f"[chrome_json] {chrome_path or 'unavailable'}\n"
             f"[thumbnail] {thumbnail_path or 'unavailable'}\n"
+            f"[qr_replay] backend={replay_info.get('backend','none')} "
+            f"ok={replay_info.get('ok', False)} "
+            f"draws={replay_info.get('draws_upgraded', 0)} "
+            f"err={replay_info.get('error') or 'n/a'}\n"
             f"[features] api_duration_chrome={features.get('api_duration_from_chrome_json', False)}, "
             f"instructions_estimated={features.get('instruction_count_estimated', False)}, "
-            f"coverage_estimated={features.get('coverage_estimated_from_viewport', False)}\n"
+            f"coverage_estimated={features.get('coverage_estimated_from_viewport', False)}, "
+            f"qr_replay={features.get('qr_replay_used', False)}\n"
             f"[draws] {analysis['overview']['draw_count']}\n"
             f"[triangles] {analysis['overview']['total_triangles']}\n"
             f"[total_api_ms] {analysis['overview']['total_gpu_duration_ms']}\n"
@@ -378,6 +396,7 @@ class RenderdocPerfService:
                     "renderdoc_python_path": rd_ctx.renderdoc_python_path,
                     "renderdoc_source": rd_ctx.source,
                     "analysis_mode": "xml_fallback",
+                    "replay_backend": replay_info.get("backend", "xml_only"),
                 },
                 "summary": {
                     "row_count": len(rows),
@@ -388,12 +407,126 @@ class RenderdocPerfService:
                     "total_texture_mb": overview.get("total_texture_mb", 0.0),
                     "analysis_mode": "xml_fallback",
                     "analysis_features": features,
+                    "qr_replay_draws_upgraded": replay_info.get("draws_upgraded", 0),
                 },
             },
         )
         detail = self.store.get_job_detail(job_id)
         detail["metadata"] = metadata
         return detail
+
+    def _run_qrenderdoc_replay(
+        self,
+        *,
+        job_id: str,
+        capture_path: Path,
+        rd_ctx: Any,
+        analysis: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Attempt to upgrade XML-only previews with real GPU replay PNGs.
+
+        Always returns a status dict — never raises.  When it succeeds, the
+        ``analysis`` dict is mutated in-place to point ``draw_preview_url``
+        at the freshly dumped RT/texture PNGs for the hottest draws.
+        """
+        from app.services.replay_backend import select_replay_backend
+
+        backend = select_replay_backend(rd_ctx.renderdoc_dir, timeout_seconds=900)
+        if backend is None:
+            return {"backend": "none", "ok": False,
+                    "error": "no qrenderdoc.exe in selected renderdoc dir"}
+
+        job_dir = self.store.job_path(job_id)
+        qr_out = job_dir / "artifacts" / "qr_replay"
+        qr_out.mkdir(parents=True, exist_ok=True)
+
+        rows = analysis.get("rows", []) or []
+        # The XML analyzer's "eid" is the chunkIndex of the draw chunk,
+        # which is a different ID space from RenderDoc's API ``eventId``
+        # used by qrenderdoc.  We can't reliably translate one to the
+        # other from the XML side, so let the worker pick its own top-N
+        # draws by primitive count.  The manifest emits both ``eid`` and
+        # ``chunk_index`` so we can still correlate the results back.
+        max_draws = min(60, max(len(rows), 20))
+
+        result = backend.run(
+            capture_path=capture_path,
+            output_dir=qr_out,
+            mode="perf",
+            max_draws=max_draws,
+            event_ids=None,
+        )
+
+        features = analysis.setdefault("analysis_features", {})
+        features["qr_replay_backend"] = backend.name
+        features["qr_replay_used"] = bool(result.ok)
+        features["qr_replay_duration_s"] = round(result.duration_seconds, 2)
+
+        if not result.ok:
+            return {
+                "backend": backend.name, "ok": False,
+                "error": result.error or "unknown",
+                "stderr_tail": result.stderr_tail[-500:],
+            }
+
+        # The XML-fallback analyzer keys draws by ``chunkIndex`` (position
+        # in the structured chunk stream) while RenderDoc's replay API uses
+        # ``Action.eventId`` (a different ID space).  We accept either form
+        # so the upgrade works regardless of which one matches.
+        row_by_id: Dict[int, Dict[str, Any]] = {}
+        for r in rows:
+            try:
+                row_by_id[int(r.get("eid"))] = r
+            except (TypeError, ValueError):
+                continue
+
+        upgraded = 0
+        for d in (result.manifest or {}).get("draws", []):
+            row = None
+            for key in ("chunk_index", "eid"):
+                try:
+                    val = int(d.get(key, -1))
+                except (TypeError, ValueError):
+                    continue
+                if val < 0:
+                    continue
+                row = row_by_id.get(val)
+                if row is not None:
+                    break
+            if row is None:
+                continue
+            rt_png = d.get("rt_png")
+            tex_pngs = [t.get("png") for t in (d.get("textures") or []) if t.get("png")]
+
+            if rt_png:
+                row["draw_preview_url"] = (
+                    f"/perf-session-files/{job_id}/artifacts/qr_replay/{rt_png}"
+                )
+                row["draw_preview_kind"] = "rt_replay"
+                upgraded += 1
+            elif tex_pngs:
+                # No RT (e.g. shadow-map only draw) but we still have bound
+                # texture PNGs we can show.
+                row["draw_preview_url"] = (
+                    f"/perf-session-files/{job_id}/artifacts/qr_replay/{tex_pngs[0]}"
+                )
+                row["draw_preview_kind"] = "tex_replay"
+                upgraded += 1
+
+            # Always expose the full texture-png list so the UI can pop them
+            # in a side-panel when the user clicks a draw row.
+            if tex_pngs:
+                row["draw_replay_texture_urls"] = [
+                    f"/perf-session-files/{job_id}/artifacts/qr_replay/{p}"
+                    for p in tex_pngs
+                ]
+
+        features["qr_replay_draws_upgraded"] = upgraded
+        return {
+            "backend": backend.name, "ok": True,
+            "draws_upgraded": upgraded,
+            "duration_s": result.duration_seconds,
+        }
 
     def _load_draws_payload(self, capture_path: Path) -> Any:
         return self._run_session_json(capture_path, ["rdc", "draws", "--json"])
