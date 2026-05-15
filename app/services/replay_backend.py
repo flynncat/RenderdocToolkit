@@ -250,6 +250,16 @@ class QRenderdocScriptBackend:
 
         log.info("Launching qrenderdoc replay: %s", " ".join(cmd))
         t0 = time.time()
+        # Critical: ``hidden_subprocess_kwargs`` sets STARTF_USESHOWWINDOW +
+        # SW_HIDE which interferes with qrenderdoc's OpenGL output texture
+        # readback — overlay/wireframe textures come back empty.  We need
+        # CREATE_NO_WINDOW alone (no console for the subprocess) without
+        # the wShowWindow override.  qrenderdoc itself never shows a UI
+        # because our worker calls ``sys.exit(0)`` before the main window
+        # is opened.
+        kwargs = {}
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         try:
             proc = subprocess.run(
                 cmd,
@@ -257,7 +267,7 @@ class QRenderdocScriptBackend:
                 capture_output=True,
                 timeout=self.timeout_seconds,
                 cwd=str(self.qrenderdoc_path.parent),
-                **hidden_subprocess_kwargs(),
+                **kwargs,
             )
         except subprocess.TimeoutExpired as exc:
             return ReplayResult(

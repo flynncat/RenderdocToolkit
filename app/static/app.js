@@ -355,13 +355,20 @@ function renderPerfDrawPreviewMarkup(row) {
     const isTexReplay = previewKind === "tex_replay";
     const isTexFallback = previewKind === "texture";
     const isWireframe = previewKind === "wireframe_overlay";
+    const overlayUrl = row.draw_preview_overlay_url || "";
+    const overlayKind = (row.draw_preview_overlay_kind || "").toLowerCase();
+    const hasOverlay = Boolean(overlayUrl);
     const baseTitle = `EID ${row.eid || "-"} | ${row.pass_name || "-"}`;
     let titleSuffix = "";
     let hoverNote = "";
     let cls = "perf-preview-thumb";
     if (isRtReplay) {
-      titleSuffix = "（真实 RT · qrenderdoc 回放）";
-      hoverNote = "通过 qrenderdoc.exe --python 后端真实 GPU 回放得到的渲染目标。";
+      titleSuffix = hasOverlay
+        ? "（RT + 线框 · qrenderdoc 回放）"
+        : "（真实 RT · qrenderdoc 回放）";
+      hoverNote = hasOverlay
+        ? "通过 qrenderdoc.exe --python 后端真实 GPU 回放，并叠加该 Draw 的几何线框 / 轮廓。"
+        : "通过 qrenderdoc.exe --python 后端真实 GPU 回放得到的渲染目标。";
       cls = "perf-preview-thumb perf-preview-thumb--rt-replay";
     } else if (isTexReplay) {
       titleSuffix = "（真实绑定纹理 · qrenderdoc 回放）";
@@ -378,6 +385,15 @@ function renderPerfDrawPreviewMarkup(row) {
     const title = baseTitle + titleSuffix;
     const meta = `Score ${Number(row.stable_sort_score || 0).toFixed(3)} | Cover ${Number(row.screen_coverage_percent || 0).toFixed(3)}% | Tri ${row.triangles || 0}`;
     const altText = `draw-${row.eid}-${previewKind || "preview"}`;
+    const dataOverlay = hasOverlay ? ` data-preview-overlay-src="${escapeHtml(overlayUrl)}" data-preview-overlay-kind="${escapeHtml(overlayKind || "wireframe")}"` : "";
+    const wfBadge = hasOverlay
+      ? `<span class="perf-preview-thumb-badge" title="${escapeHtml(overlayKind === "drawcall" ? "已叠加 Drawcall 轮廓" : "已叠加 Wireframe 线框")}">WF</span>`
+      : "";
+    if (hasOverlay) {
+      // Stack the RT background and the overlay layer.  CSS gives them the
+      // same box so the overlay aligns pixel-for-pixel.
+      return `<button type="button" class="perf-preview-trigger" data-preview-src="${escapeHtml(row.draw_preview_url)}"${dataOverlay} data-preview-title="${escapeHtml(title)}" data-preview-meta="${escapeHtml(meta)}" title="${escapeHtml(hoverNote)}"><span class="perf-preview-stack"><img src="${row.draw_preview_url}" alt="${altText}" class="${cls}" loading="lazy"><img src="${overlayUrl}" alt="${altText}-wf" class="perf-preview-overlay-img" loading="lazy">${wfBadge}</span></button>`;
+    }
     return `<button type="button" class="perf-preview-trigger" data-preview-src="${escapeHtml(row.draw_preview_url)}" data-preview-title="${escapeHtml(title)}" data-preview-meta="${escapeHtml(meta)}" title="${escapeHtml(hoverNote)}"><img src="${row.draw_preview_url}" alt="${altText}" class="${cls}" loading="lazy"></button>`;
   }
   if (previewKind === "unavailable") {
@@ -427,12 +443,13 @@ function positionPerfPreviewPanel(panel, anchorX = 0, anchorY = 0) {
   panel.style.top = `${top}px`;
 }
 
-function showPerfPreviewPanel({ src = "", title = "", meta = "", pinned = false, anchorX = 0, anchorY = 0 }) {
+function showPerfPreviewPanel({ src = "", title = "", meta = "", pinned = false, anchorX = 0, anchorY = 0, overlaySrc = "", overlayKind = "" }) {
   if (!src) {
     return;
   }
   const panel = document.getElementById("perf-preview-panel");
   const image = document.getElementById("perf-preview-panel-image");
+  const overlayImage = document.getElementById("perf-preview-panel-overlay");
   const titleNode = document.getElementById("perf-preview-panel-title");
   const metaNode = document.getElementById("perf-preview-panel-meta");
   perfPreviewPinned = pinned;
@@ -442,10 +459,22 @@ function showPerfPreviewPanel({ src = "", title = "", meta = "", pinned = false,
   }
   image.src = src;
   image.alt = title || "preview";
+  if (overlayImage) {
+    if (overlaySrc) {
+      overlayImage.src = overlaySrc;
+      overlayImage.classList.remove("hidden");
+      overlayImage.dataset.kind = overlayKind || "wireframe";
+    } else {
+      overlayImage.src = "";
+      overlayImage.classList.add("hidden");
+      overlayImage.dataset.kind = "";
+    }
+  }
   titleNode.textContent = title || "预览";
   metaNode.textContent = meta || "";
   panel.classList.remove("hidden");
   panel.classList.toggle("pinned", perfPreviewPinned);
+  panel.classList.toggle("has-overlay", Boolean(overlaySrc));
   positionPerfPreviewPanel(panel, anchorX, anchorY);
   image.onload = () => positionPerfPreviewPanel(panel, anchorX, anchorY);
 }
@@ -456,9 +485,15 @@ function hidePerfPreviewPanel(force = false) {
   }
   const panel = document.getElementById("perf-preview-panel");
   const image = document.getElementById("perf-preview-panel-image");
+  const overlayImage = document.getElementById("perf-preview-panel-overlay");
   panel.classList.add("hidden");
   panel.classList.remove("pinned");
+  panel.classList.remove("has-overlay");
   image.src = "";
+  if (overlayImage) {
+    overlayImage.src = "";
+    overlayImage.classList.add("hidden");
+  }
   perfPreviewPinned = false;
 }
 
@@ -1423,6 +1458,8 @@ document.addEventListener("mouseover", (event) => {
     src: trigger.dataset.previewSrc || "",
     title: trigger.dataset.previewTitle || "",
     meta: trigger.dataset.previewMeta || "",
+    overlaySrc: trigger.dataset.previewOverlaySrc || "",
+    overlayKind: trigger.dataset.previewOverlayKind || "",
     pinned: false,
     anchorX: event.clientX || 0,
     anchorY: event.clientY || 0,
@@ -1460,6 +1497,8 @@ document.addEventListener("click", (event) => {
       src: trigger.dataset.previewSrc || "",
       title: trigger.dataset.previewTitle || "",
       meta: trigger.dataset.previewMeta || "",
+      overlaySrc: trigger.dataset.previewOverlaySrc || "",
+      overlayKind: trigger.dataset.previewOverlayKind || "",
       pinned: true,
       anchorX: event.clientX || 0,
       anchorY: event.clientY || 0,

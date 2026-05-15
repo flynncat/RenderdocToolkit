@@ -45,6 +45,8 @@ Manifest JSON schema (written to <output_dir>/manifest.json)::
         "primitive_count": int,
         "rt_png": "rt_<eid>.png" or null,
         "rt_resource_id": str or null,
+        "overlay_png": "wf_<eid>.png" or null,
+        "overlay_kind": "wireframe" or "drawcall" or null,
         "textures": [
           { "resource_id": str, "width": int, "height": int,
             "format": str, "png": "tex_<rid>.png" or null,
@@ -457,12 +459,30 @@ def run():
     log("leaf actions=" + str(len(leaves)))
 
     target_actions = []
+    skipped_no_rt = 0
     for a in leaves:
         if not _action_is_draw(rd, a):
             continue
         if only_eids and a.eventId not in only_eids:
             continue
+        # Drop draws with no colour RT (e.g. shadow-map or depth-only
+        # passes).  Including them costs us valid wireframe-overlay slots
+        # later: each no-RT iteration still calls SetFrameEvent and
+        # GetDescriptorAccess on the controller, which empirically
+        # corrupts the ReplayOutput's overlay rendering for the next
+        # real-RT draw on v1.36 / GL.  Filtering early matches what the
+        # probe does and is what makes wireframe overlays actually
+        # contain pixels.
+        if only_eids:
+            # Caller explicitly asked for these EIDs; trust them.
+            target_actions.append(a)
+            continue
+        if _extract_rt_from_action(a) is None:
+            skipped_no_rt += 1
+            continue
         target_actions.append(a)
+    if skipped_no_rt:
+        log("filtered out " + str(skipped_no_rt) + " leaf draws with no colour RT")
 
     if not only_eids and max_draws > 0:
         # When the caller didn't pre-select EIDs, prefer the heaviest draws by
@@ -485,6 +505,23 @@ def run():
 
     log("draws to dump=" + str(len(target_actions)))
 
+    # Inline overlay output: created EAGERLY AFTER GetRootActions / target
+    # selection but BEFORE the per-draw loop.  Empirically, on v1.36 / GL,
+    # if the ReplayOutput is created before GetRootActions(), the
+    # subsequent overlay rendering produces blank textures.  The probe
+    # confirmed this same code structure works when CreateOutput follows
+    # the action-enumeration phase.
+    _overlay_out_obj = None
+    try:
+        _overlay_win = rd.CreateHeadlessWindowingData(64, 64)
+        _overlay_out_obj = controller.CreateOutput(
+            _overlay_win, rd.ReplayOutputType.Texture)
+        log("inline overlay: eager CreateOutput ok="
+            + str(_overlay_out_obj is not None))
+    except Exception as exc:
+        log("inline overlay: CreateOutput failed: " + str(exc))
+        _overlay_out_obj = False
+
     # ---- per-draw replay & dump ----
     sf = controller.GetStructuredFile()
     draws_manifest = []
@@ -494,15 +531,89 @@ def run():
             controller.SetFrameEvent(a.eventId, True)
 
             rt_rid_obj = _extract_rt_from_action(a)
-            rt_png = None
             rt_rid_str = None
             if rt_rid_obj is not None:
-                rt_png = dumper.save_texture(
-                    rt_rid_obj, prefix="rt_eid{0}".format(a.eventId))
                 try:
                     rt_rid_str = str(int(rt_rid_obj))
                 except Exception:
                     rt_rid_str = str(rt_rid_obj)
+
+            # Wireframe overlay (RenderDoc-style) for the *current* draw call.
+            # NOTE: must run BEFORE any other ``controller.SaveTexture`` call
+            # in this iteration.  Calling SaveTexture on an unrelated
+            # resource silently resets the ReplayOutput's m_OverlayDirty
+            # state on v1.36 / GL — once that happens, ``Display()`` no
+            # longer re-renders the overlay even if we toggle the enum
+            # below, and the resulting PNG comes back as a blank
+            # 100543-byte placeholder.
+            #
+            # Order on every iteration MUST be:
+            #   1. SetFrameEvent
+            #   2. (this block) NoOverlay → Wireframe → Display → SaveTexture(overlay)
+            #   3. RT readback (dumper.save_texture)
+            #   4. bound-texture extraction / readback
+            # Re-ordering 2/3 causes ALL overlays to come back empty.
+            #
+            # CRITICAL v1.36 behaviour: ReplayOutput::SetTextureDisplay only
+            # sets m_OverlayDirty=true when the overlay enum OR resourceId
+            # changes between successive calls.  In a perf-replay loop where
+            # many draws share the same RT (e.g. default FBO 17764) and we
+            # always request DebugOverlay.Wireframe, the dirty flag stays
+            # false from iter 1 onwards → Display() *skips* the overlay
+            # refresh → every PNG after iter 0 ends up empty.
+            #
+            # Workaround: every iter, first push NoOverlay, then push
+            # Wireframe.  The enum transition NoOverlay → Wireframe
+            # unconditionally sets the dirty flag, forcing RenderDoc to
+            # re-render the overlay using the controller's current event.
+            # Verified to produce ~80k non-transparent pixels per draw on
+            # the v1.36 GL backend with a custom renderdoc build.
+            overlay_png, overlay_kind = (None, None)
+            if rt_rid_obj is not None:
+                if _overlay_out_obj and _overlay_out_obj is not False:
+                    try:
+                        # Force-dirty trick (see comment above).
+                        _disp_clear = rd.TextureDisplay()
+                        _disp_clear.resourceId = rt_rid_obj
+                        _disp_clear.overlay = rd.DebugOverlay.NoOverlay
+                        _overlay_out_obj.SetTextureDisplay(_disp_clear)
+
+                        _disp = rd.TextureDisplay()
+                        _disp.resourceId = rt_rid_obj
+                        _disp.overlay = rd.DebugOverlay.Wireframe
+                        _overlay_out_obj.SetTextureDisplay(_disp)
+                        _overlay_out_obj.Display()
+                        _overlay_id = _overlay_out_obj.GetDebugOverlayTexID()
+                        _overlay_int = int(_overlay_id) if _overlay_id else 0
+                        _wf_rel = "wf_wireframe_eid{0}.png".format(a.eventId)
+                        _wf_path = os.path.join(output_dir, _wf_rel)
+                        if _overlay_int != 0:
+                            _wsave = rd.TextureSave()
+                            _wsave.resourceId = _overlay_id
+                            _wsave.destType = rd.FileType.PNG
+                            _wsave.mip = 0
+                            try:
+                                _wsave.slice.sliceIndex = 0
+                            except Exception:
+                                pass
+                            _wf_ok = controller.SaveTexture(_wsave, _wf_path)
+                            _wf_sz = os.path.getsize(_wf_path) \
+                                if os.path.exists(_wf_path) else -1
+                            if _is_success(rd, _wf_ok) and _wf_sz > 0:
+                                overlay_png = _wf_rel
+                                overlay_kind = "wireframe"
+                                if (len(draws_manifest) % 10) == 0:
+                                    log("inline overlay eid=" + str(a.eventId)
+                                        + " size=" + str(_wf_sz)
+                                        + " overlay_int=" + str(_overlay_int))
+                    except Exception as exc:
+                        log("inline overlay failed for eid="
+                            + str(a.eventId) + ": " + str(exc))
+
+            rt_png = None
+            if rt_rid_obj is not None:
+                rt_png = dumper.save_texture(
+                    rt_rid_obj, prefix="rt_eid{0}".format(a.eventId))
 
             tex_binds = _extract_descriptor_textures(rd, controller)
             tex_entries = []
@@ -547,6 +658,8 @@ def run():
                 "instance_count": int(getattr(a, "numInstances", 0) or 0),
                 "rt_resource_id": rt_rid_str,
                 "rt_png": rt_png,
+                "overlay_png": overlay_png,
+                "overlay_kind": overlay_kind,
                 "textures": tex_entries,
             })
         except Exception as exc:
@@ -558,6 +671,18 @@ def run():
                 idx, len(target_actions), round(time.time() - t_replay, 1)))
 
     log("all draws done in " + str(round(time.time() - t_replay, 1)) + "s")
+
+    # Tear down the inline wireframe-overlay output.
+    overlay_total = sum(1 for d in draws_manifest if d.get("overlay_png"))
+    overlay_kind_label = "wireframe" if overlay_total > 0 else None
+    log("wireframe overlays produced=" + str(overlay_total)
+        + "/" + str(len(target_actions))
+        + " kind=" + str(overlay_kind_label))
+    if _overlay_out_obj and _overlay_out_obj is not False:
+        try:
+            _overlay_out_obj.Shutdown()
+        except Exception:
+            pass
 
     # Build the capture-global texture roster: metadata for every texture,
     # but only include the PNG path if we *already* dumped it as part of
@@ -613,6 +738,8 @@ def run():
         "texture_count": len(dumper._tex_lookup),
         "draws": draws_manifest,
         "textures": tex_roster,
+        "overlay_kind": overlay_kind_label,
+        "overlay_count": overlay_total,
     }, output_dir
 
 

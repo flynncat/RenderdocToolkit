@@ -496,35 +496,47 @@ class RenderdocPerfService:
             if row is None:
                 continue
             rt_png = d.get("rt_png")
+            overlay_png = d.get("overlay_png")
+            overlay_kind = d.get("overlay_kind") or ""
             tex_pngs = [t.get("png") for t in (d.get("textures") or []) if t.get("png")]
 
+            base_url = f"/perf-session-files/{job_id}/artifacts/qr_replay"
             if rt_png:
-                row["draw_preview_url"] = (
-                    f"/perf-session-files/{job_id}/artifacts/qr_replay/{rt_png}"
-                )
+                row["draw_preview_url"] = f"{base_url}/{rt_png}"
                 row["draw_preview_kind"] = "rt_replay"
                 upgraded += 1
             elif tex_pngs:
                 # No RT (e.g. shadow-map only draw) but we still have bound
                 # texture PNGs we can show.
-                row["draw_preview_url"] = (
-                    f"/perf-session-files/{job_id}/artifacts/qr_replay/{tex_pngs[0]}"
-                )
+                row["draw_preview_url"] = f"{base_url}/{tex_pngs[0]}"
                 row["draw_preview_kind"] = "tex_replay"
                 upgraded += 1
+
+            # Wireframe overlay (only meaningful when we also have an RT —
+            # the overlay is transparent outside the highlighted geometry so
+            # it only "reads" when composited over something).  Pass the URL
+            # and overlay kind ("wireframe" or "drawcall") through so the
+            # frontend can stack & label it.
+            if overlay_png and rt_png:
+                row["draw_preview_overlay_url"] = f"{base_url}/{overlay_png}"
+                row["draw_preview_overlay_kind"] = overlay_kind or "wireframe"
 
             # Always expose the full texture-png list so the UI can pop them
             # in a side-panel when the user clicks a draw row.
             if tex_pngs:
                 row["draw_replay_texture_urls"] = [
-                    f"/perf-session-files/{job_id}/artifacts/qr_replay/{p}"
-                    for p in tex_pngs
+                    f"{base_url}/{p}" for p in tex_pngs
                 ]
 
         features["qr_replay_draws_upgraded"] = upgraded
+        manifest_dict = result.manifest or {}
+        features["qr_replay_overlay_kind"] = manifest_dict.get("overlay_kind") or ""
+        features["qr_replay_overlay_count"] = int(manifest_dict.get("overlay_count") or 0)
         return {
             "backend": backend.name, "ok": True,
             "draws_upgraded": upgraded,
+            "overlay_count": features["qr_replay_overlay_count"],
+            "overlay_kind": features["qr_replay_overlay_kind"],
             "duration_s": result.duration_seconds,
         }
 

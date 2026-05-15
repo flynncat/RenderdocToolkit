@@ -40,6 +40,8 @@ second_round_out/
 # Test/verification outputs
 test_reports/
 verify_sessions/
+_smoke_wf/
+build_portable.log
 
 # Temporary model files
 .tmp_vsin_*.fbx
