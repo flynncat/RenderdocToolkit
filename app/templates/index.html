@@ -97,9 +97,28 @@
             <option value="asc">从低到高</option>
           </select>
         </div>
+        <div class="perf-toolbar-actions">
+          <button id="perf-copy-tsv-btn" type="button" class="secondary-btn" disabled>复制全表 (TSV)</button>
+          <button id="perf-download-pack-btn" type="button" class="secondary-btn" disabled>下载报告+CSV (.zip)</button>
+        </div>
       </div>
       <div id="perf-table-wrap" class="perf-table-wrap">
         <div class="empty-state">暂无性能结果。</div>
+      </div>
+
+      <div class="perf-report-block">
+        <h3>性能诊断报告</h3>
+        <div class="perf-report-toolbar">
+          <span id="perf-report-status" class="perf-report-status">执行性能分析后将自动生成报告</span>
+          <span class="perf-report-actions">
+            <a id="perf-report-download-md" class="secondary-link hidden" download>下载 .md</a>
+            <a id="perf-report-download-html" class="secondary-link hidden" download>下载 .html</a>
+            <a id="perf-report-download-zip" class="secondary-link hidden" download>下载 .zip</a>
+          </span>
+        </div>
+        <div id="perf-report-panel" class="perf-report-panel">
+          <div class="empty-state">执行性能分析后将自动生成报告</div>
+        </div>
       </div>
     </section>
 

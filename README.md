@@ -12,7 +12,7 @@
 
 | 功能 | 说明 |
 | --- | --- |
-| `性能` | 针对单个 `.rdc` 做 Pass 级性能分析，支持多维排序、热点提示和绘制预览 |
+| `性能` | 针对单个 `.rdc` 做 Pass 级性能分析，支持多维排序、热点提示、绘制预览，以及基于规则引擎的**性能诊断报告**（HTML / Markdown / CSV 导出） |
 | `性能 Diff` | 基于 `renderdoc_cmp` 对两份抓帧做性能差异分析，并在界面内查看 HTML 报告 |
 | `资产批量导出` | 扫描 Pass、批量导出资产、导出当前 draw 的 shader/参数、检查 CSV 列映射，并将 CSV 转换为 `FBX` / `OBJ` |
 
@@ -121,6 +121,22 @@ RenderdocDiffPortable\RenderdocDiffTools.exe
 3. 点击 `执行性能分析`
 4. 使用排序维度和排序方向查看热点
 5. 结合图表、日志和绘制预览定位高开销 Pass
+6. 在结果区下方查看**性能诊断报告**（分析完成后自动生成），并按需下载或复制导出
+
+#### 性能诊断报告与导出
+
+每次性能分析完成后，工具会自动运行确定性规则引擎（无 LLM），生成结构化诊断结论并写入任务目录：
+
+- **界面内嵌报告**：结果面板下方的「性能诊断报告」区域，默认展示 HTML；结论中的 EID 可点击跳转到上方性能表对应行
+- **规则覆盖**：过绘、全屏 ALU/带宽、半透明、Shadow/后处理占比、Shader ALU 离群、超大纹理绑定、微三角浪费、Pass 纹理爆炸等（见 `app/services/perf_rule_engine.py`）
+- **可读副本**：`artifacts/perf_report.md`、`artifacts/perf_report.html`
+- **结构化数据**：`artifacts/findings.json`，以及 `artifacts/exports/` 下的 CSV/TSV（overview、pass、draw、纹理长表等，便于 Excel / pandas 二次分析）
+- **一键打包**：工具栏「下载报告+CSV (.zip)」或分别下载 `.md` / `.html` / `.zip`
+
+相关 API（供脚本或集成调用）：
+
+- `GET /api/renderdoc-perf/jobs/{job_id}/report?format=html|md` — 内嵌报告
+- `GET /api/renderdoc-perf/jobs/{job_id}/export?format=csv|tsv|json|md|html|zip` — 单文件或 zip 导出
 
 ### 2. 性能 Diff
 
@@ -190,12 +206,16 @@ RenderdocDiffPortable\RenderdocDiffTools.exe
 ## 项目结构
 
 ```text
-app/                     FastAPI 应用与前端模板
-docs/                    用户文档与技术方案文档
-config/                  本地配置
-launcher.py              桌面入口
-build_portable.ps1       绿色包打包脚本
-RenderdocDiffTools.spec  PyInstaller 打包配置
+app/                                    FastAPI 应用与前端模板
+app/services/perf_rule_engine.py        性能诊断规则引擎（确定性 Finding）
+app/services/perf_report_builder.py       Markdown / HTML 报告渲染
+app/services/perf_recommendation_templates.py  规则对应的人类可读建议模板
+app/services/renderdoc_perf_exporter.py  CSV / TSV / JSON 扁平化导出
+docs/                                   用户文档、发布说明与技术方案
+config/                                 本地配置
+launcher.py                             桌面入口
+build_portable.ps1                      绿色包打包脚本
+RenderdocDiffTools.spec                 PyInstaller 打包配置
 ```
 
 ## 延伸阅读

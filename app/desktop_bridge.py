@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import urllib.request
 from pathlib import Path
+from typing import Any
 
 
 class DesktopBridge:
@@ -75,6 +77,87 @@ class DesktopBridge:
             return True
         except OSError:
             return False
+
+    def save_artifact_from_url(self, url: str, suggested_name: str) -> dict[str, Any]:
+        """Pop a system Save dialog, fetch ``url`` and write bytes to the
+        chosen path.
+
+        Returns a dict that the JS side inspects:
+        - ``{"path": str, "size": int}`` on success
+        - ``{"cancelled": True}`` if the user cancelled the dialog
+        - ``{"error": str}`` if anything went wrong
+
+        Background: pywebview's WebView2 backend on Windows does not honour
+        ``<a download href="blob:...">.click()`` reliably (the click is
+        silently swallowed because WebView2 doesn't surface download
+        navigations to host apps without explicit handler wiring). So we
+        route downloads through this bridge, which uses a native Save dialog
+        + a plain ``urllib`` fetch against the locally-running FastAPI
+        server.
+        """
+        import webview
+        window = self._window
+        if not window:
+            return {"error": "桌面窗口未就绪"}
+
+        suggested = (suggested_name or "perf_artifact").strip() or "perf_artifact"
+        ext = Path(suggested).suffix.lstrip(".").lower()
+        # File-type filter must reflect the extension hint so the dialog
+        # defaults to a sensible filter.  Adding "All files" keeps the user
+        # in charge if they want to rename to something else.
+        filter_map = {
+            "zip": ("ZIP archive (*.zip)", "All files (*.*)"),
+            "html": ("HTML page (*.html)", "All files (*.*)"),
+            "md": ("Markdown (*.md)", "All files (*.*)"),
+            "csv": ("CSV file (*.csv)", "All files (*.*)"),
+            "tsv": ("TSV file (*.tsv)", "All files (*.*)"),
+            "json": ("JSON file (*.json)", "All files (*.*)"),
+        }
+        file_types = filter_map.get(ext, ("All files (*.*)",))
+
+        try:
+            result = window.create_file_dialog(
+                webview.SAVE_DIALOG,
+                directory=self._last_dir,
+                save_filename=suggested,
+                file_types=file_types,
+            )
+        except Exception as exc:  # pragma: no cover (dialog-side errors are platform-specific)
+            return {"error": f"打开保存对话框失败: {exc}"}
+
+        if not result:
+            return {"cancelled": True}
+        target = result if isinstance(result, str) else result[0]
+        if not target:
+            return {"cancelled": True}
+        self._last_dir = str(Path(target).parent)
+
+        absolute_url = self._normalise_url(url)
+        if not absolute_url:
+            return {"error": "URL 不合法或未指定 RENDERDOC_WEBUI_PORT"}
+
+        try:
+            with urllib.request.urlopen(absolute_url, timeout=120) as response:
+                data = response.read()
+            Path(target).write_bytes(data)
+        except Exception as exc:
+            return {"error": f"下载或写入失败: {exc}"}
+
+        return {"path": str(target), "size": len(data)}
+
+    @staticmethod
+    def _normalise_url(url: str) -> str:
+        value = (url or "").strip()
+        if not value:
+            return ""
+        if value.startswith("http://") or value.startswith("https://"):
+            return value
+        if not value.startswith("/"):
+            value = "/" + value
+        port = os.environ.get("RENDERDOC_WEBUI_PORT", "").strip()
+        if not port:
+            return ""
+        return f"http://127.0.0.1:{port}{value}"
 
     def _pick_file(self, file_types: tuple[str, ...]) -> str:
         import webview

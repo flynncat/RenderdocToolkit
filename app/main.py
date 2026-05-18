@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import platform
 import re
 import subprocess
 import tempfile
+import zipfile
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -540,6 +542,123 @@ async def get_perf_draw_texture_thumbnail(
         if not ok:
             raise HTTPException(status_code=404, detail=f"无法解码纹理 res={res_id} fmt={fmt}")
     return FileResponse(path=str(cache_path), filename=cache_path.name, media_type="image/png")
+
+
+_PERF_EXPORT_FORMATS = {"csv", "tsv", "json", "md", "html", "zip"}
+_PERF_EXPORT_FILENAMES = {
+    "csv": "draws.csv",
+    "tsv": "draws.tsv",
+    "md": "perf_report.md",
+    "html": "perf_report.html",
+    "json": "perf_analysis.json",
+}
+_PERF_EXPORT_MEDIA_TYPES = {
+    "csv": "text/csv; charset=utf-8",
+    "tsv": "text/tab-separated-values; charset=utf-8",
+    "md": "text/markdown; charset=utf-8",
+    "html": "text/html; charset=utf-8",
+    "json": "application/json; charset=utf-8",
+}
+
+
+def _resolve_perf_job_dir(job_id: str) -> Path:
+    try:
+        return perf_service.store.job_path(job_id).resolve()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="性能分析任务不存在")
+
+
+def _perf_artifact_path(job_dir: Path, relative: str) -> Path:
+    candidate = (job_dir / relative).resolve()
+    if not candidate.is_relative_to(job_dir):
+        raise HTTPException(status_code=403, detail="不允许访问该文件")
+    if not candidate.exists() or not candidate.is_file():
+        raise HTTPException(status_code=404, detail=f"文件不存在: {relative}")
+    return candidate
+
+
+def _build_perf_zip_bytes(job_dir: Path, job_id: str) -> bytes:
+    buffer = io.BytesIO()
+    candidate_paths: list[tuple[Path, str]] = []
+    for relative in (
+        "artifacts/perf_report.md",
+        "artifacts/perf_report.html",
+        "artifacts/perf_analysis.json",
+        "artifacts/findings.json",
+        "artifacts/perf_run_log.txt",
+    ):
+        path = (job_dir / relative).resolve()
+        if path.exists() and path.is_relative_to(job_dir):
+            candidate_paths.append((path, relative))
+    exports_dir = (job_dir / "artifacts" / "exports").resolve()
+    if exports_dir.exists() and exports_dir.is_dir() and exports_dir.is_relative_to(job_dir):
+        for path in sorted(exports_dir.iterdir()):
+            if path.is_file():
+                candidate_paths.append((path, f"artifacts/exports/{path.name}"))
+    if not candidate_paths:
+        raise HTTPException(status_code=404, detail="该任务还没有可导出的报告/CSV")
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path, arcname in candidate_paths:
+            zf.write(path, arcname=f"{job_id}/{arcname}")
+    return buffer.getvalue()
+
+
+@app.get("/api/renderdoc-perf/jobs/{job_id}/export")
+async def export_perf_job(job_id: str, format: str = "zip") -> Response:
+    """Download perf job artifacts in the requested format.
+
+    - ``csv`` / ``tsv``: returns the wide ``draws`` table only
+    - ``json``: returns the original ``perf_analysis.json``
+    - ``md`` / ``html``: returns the generated report
+    - ``zip`` (default): bundles report + all CSV/TSV + run log + findings.json
+    """
+    fmt = (format or "zip").lower().strip()
+    if fmt not in _PERF_EXPORT_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的导出格式: {format} (可选 {sorted(_PERF_EXPORT_FORMATS)})",
+        )
+    job_dir = _resolve_perf_job_dir(job_id)
+    if fmt == "zip":
+        data = _build_perf_zip_bytes(job_dir, job_id)
+        return Response(
+            content=data,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{job_id}_perf_export.zip"'},
+        )
+
+    if fmt in {"csv", "tsv"}:
+        relative = f"artifacts/exports/{_PERF_EXPORT_FILENAMES[fmt]}"
+    elif fmt == "json":
+        relative = "artifacts/perf_analysis.json"
+    else:
+        relative = f"artifacts/{_PERF_EXPORT_FILENAMES[fmt]}"
+    target = _perf_artifact_path(job_dir, relative)
+    return FileResponse(
+        path=str(target),
+        filename=f"{job_id}_{target.name}",
+        media_type=_PERF_EXPORT_MEDIA_TYPES.get(fmt, "application/octet-stream"),
+    )
+
+
+@app.get("/api/renderdoc-perf/jobs/{job_id}/report")
+async def get_perf_job_report(job_id: str, format: str = "html") -> Response:
+    """Return the rendered perf report for inline display in the frontend.
+
+    Defaults to ``html`` for the inline preview panel; ``md`` is provided so
+    callers can also fetch the raw Markdown without going through the zip
+    download route.
+    """
+    fmt = (format or "html").lower().strip()
+    if fmt not in {"html", "md"}:
+        raise HTTPException(status_code=400, detail="format 仅支持 html 或 md")
+    job_dir = _resolve_perf_job_dir(job_id)
+    relative = "artifacts/perf_report.html" if fmt == "html" else "artifacts/perf_report.md"
+    target = _perf_artifact_path(job_dir, relative)
+    text = target.read_text(encoding="utf-8", errors="replace")
+    if fmt == "html":
+        return HTMLResponse(content=text)
+    return PlainTextResponse(content=text, media_type="text/markdown; charset=utf-8")
 
 
 @app.get("/api/asset-export/jobs")

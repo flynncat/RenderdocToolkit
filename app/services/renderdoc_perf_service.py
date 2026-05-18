@@ -9,7 +9,10 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from app.services.perf_report_builder import PerfReportBuilder
+from app.services.perf_rule_engine import PerfRuleEngine
 from app.services.renderdoc_direct_replay import RenderdocDirectReplay
+from app.services.renderdoc_perf_exporter import PerfExporter
 from app.services.renderdoc_perf_store import RenderdocPerfStore
 from app.services.subprocess_utils import hidden_subprocess_kwargs
 
@@ -171,6 +174,11 @@ class RenderdocPerfService:
         }
 
         self.store.write_json_artifact(job_id, "artifacts/perf_analysis.json", analysis)
+        report_summary = self._generate_report_artifacts(
+            job_id=job_id,
+            analysis=analysis,
+            run_log_lines=run_log_lines,
+        )
         self.store.write_text_artifact(job_id, "artifacts/perf_run_log.txt", "\n".join(run_log_lines) + "\n")
         metadata = self.store.update_metadata(
             job_id,
@@ -187,12 +195,99 @@ class RenderdocPerfService:
                     "row_count": len(rows),
                     "total_gpu_duration_ms": overview["total_gpu_duration_ms"],
                     "hottest_pass": pass_chart[0]["name"] if pass_chart else "",
+                    **report_summary,
                 },
             },
         )
         detail = self.store.get_job_detail(job_id)
         detail["metadata"] = metadata
         return detail
+
+    def _generate_report_artifacts(
+        self,
+        *,
+        job_id: str,
+        analysis: Dict[str, Any],
+        run_log_lines: List[str],
+    ) -> Dict[str, Any]:
+        """Run rule engine + exporter + report builder and persist artifacts.
+
+        Failures here are non-fatal: the perf row table is the primary
+        deliverable, and we don't want a bug in the rule engine to cancel a
+        completed analysis.  Any failure is logged into the per-job run log
+        and surfaced in metadata.summary as ``report_generation_error``.
+        """
+        try:
+            capture_name = str(analysis.get("capture_name") or "")
+            capture_id = Path(capture_name).stem or capture_name or job_id
+            rows = list(analysis.get("rows") or [])
+            overview = dict(analysis.get("overview") or {})
+            pass_chart = list(analysis.get("pass_chart") or [])
+            capture_info = dict(analysis.get("capture_info") or {})
+
+            engine = PerfRuleEngine()
+            findings = engine.analyze(
+                rows=rows,
+                overview=overview,
+                pass_chart=pass_chart,
+                capture_info=capture_info,
+                capture_name=capture_name,
+            )
+            findings_serialised = [f.to_dict() for f in findings]
+            self.store.write_json_artifact(
+                job_id, "artifacts/findings.json", findings_serialised,
+            )
+
+            builder = PerfReportBuilder()
+            report = builder.build(
+                analysis=analysis,
+                findings=findings,
+                capture_name=capture_name,
+                job_id=job_id,
+                exports_relpath="exports",
+            )
+            self.store.write_text_artifact(
+                job_id, "artifacts/perf_report.md", report.md,
+            )
+            self.store.write_text_artifact(
+                job_id, "artifacts/perf_report.html", report.html,
+            )
+
+            exporter = PerfExporter()
+            out_dir = self.store.job_path(job_id) / "artifacts" / "exports"
+            exporter.write_all(
+                analysis=analysis,
+                out_dir=out_dir,
+                findings=findings_serialised,
+                capture_id=capture_id,
+                report_md_relpath="artifacts/perf_report.md",
+                report_html_relpath="artifacts/perf_report.html",
+            )
+
+            severity_counts = {"high": 0, "med": 0, "low": 0}
+            for finding in findings_serialised:
+                sev = str(finding.get("severity") or "").lower()
+                if sev in severity_counts:
+                    severity_counts[sev] += 1
+            run_log_lines.append(
+                f"[report] findings={len(findings)} "
+                f"high={severity_counts['high']} med={severity_counts['med']} low={severity_counts['low']} "
+                f"md=artifacts/perf_report.md html=artifacts/perf_report.html exports=artifacts/exports/"
+            )
+            return {
+                "finding_count_total": len(findings),
+                "finding_count_by_severity": severity_counts,
+                "report_md_path": "artifacts/perf_report.md",
+                "report_html_path": "artifacts/perf_report.html",
+                "exports_dir": "artifacts/exports",
+            }
+        except Exception as exc:
+            run_log_lines.append(f"[report] FAILED: {exc}")
+            return {
+                "finding_count_total": 0,
+                "finding_count_by_severity": {"high": 0, "med": 0, "low": 0},
+                "report_generation_error": str(exc),
+            }
 
     def generate_draw_preview(self, job_id: str, eid: str) -> Dict[str, str]:
         detail = self.store.get_job_detail(job_id)
@@ -358,6 +453,13 @@ class RenderdocPerfService:
 
         self.store.write_json_artifact(job_id, "artifacts/perf_analysis.json", analysis)
 
+        report_log_lines: list[str] = []
+        report_summary = self._generate_report_artifacts(
+            job_id=job_id,
+            analysis=analysis,
+            run_log_lines=report_log_lines,
+        )
+
         features = analysis.get("analysis_features", {})
         run_log = (
             f"[capture] {capture_path}\n"
@@ -380,6 +482,8 @@ class RenderdocPerfService:
             f"[total_instructions_est] {analysis['overview']['total_instruction_count']}\n"
             f"[total_texture_mb] {analysis['overview']['total_texture_mb']}\n"
         )
+        if report_log_lines:
+            run_log = run_log + "\n".join(report_log_lines) + "\n"
         self.store.write_text_artifact(job_id, "artifacts/perf_run_log.txt", run_log)
 
         overview = analysis.get("overview", {})
@@ -408,6 +512,7 @@ class RenderdocPerfService:
                     "analysis_mode": "xml_fallback",
                     "analysis_features": features,
                     "qr_replay_draws_upgraded": replay_info.get("draws_upgraded", 0),
+                    **report_summary,
                 },
             },
         )

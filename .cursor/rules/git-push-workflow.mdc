@@ -1,0 +1,45 @@
+---
+description: When user says 推送到git, sync remote, commit, update README, and push
+alwaysApply: true
+---
+
+# Git Push Workflow（推送到 git）
+
+当用户说 **「推送到 git」**、**「推送到git」** 或含义相同的表述时，**不要只执行 `git push`**。按以下顺序自动完成，无需再次确认（除非提交信息确实无法从 diff 推断）：
+
+## 1. 检查远程更新
+
+```powershell
+Set-Location <repo-root>
+git fetch origin
+```
+
+- 若 `origin/main` 领先本地：先 `git pull --rebase origin main`（或当前分支对应远程），解决冲突后再继续。
+- 汇报：`git status -sb` 与是否有未拉取的远程提交。
+
+## 2. 处理本地改动
+
+- 若有未提交改动：阅读 `git diff` / `git status`，撰写与仓库风格一致的 commit message（`feat:` / `fix:` / `docs:` 等），`git add` 相关文件后 `git commit`。
+- 若无改动：跳过提交，直接进入推送。
+- **不要**提交 `build/`、`dist/`、`_smoke_wf/`、`__pycache__/`、`.pyc` 等已被 `.gitignore` 忽略的产物。
+
+## 3. 更新 README
+
+每次因**用户可见功能**而提交时，同步更新根目录 `README.md`：
+
+- **功能总览**表：新能力一行摘要。
+- **常见工作流**：对应 Tab 的操作步骤（若适用）。
+- **项目结构**：新增的重要模块路径。
+- 保持中文、与现有 README 语气一致；不重复写冗长实现细节（细节放 `docs/`）。
+
+若本次仅为 typo / 内部重构且不影响用户文档，可只改 commit message，README 可不动。
+
+## 4. 推送
+
+```powershell
+git push origin <current-branch>
+```
+
+## 5. 汇报
+
+用中文简要说明：是否拉取了远程、提交 hash 与 message、README 是否更新、推送是否成功。

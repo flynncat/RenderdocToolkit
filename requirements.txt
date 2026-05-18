@@ -7,3 +7,4 @@ pywebview
 numpy
 Pillow
 scikit-image
+markdown

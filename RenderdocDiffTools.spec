@@ -3,7 +3,7 @@
 from PyInstaller.utils.hooks import collect_submodules
 
 hiddenimports = []
-for package_name in ("fastapi", "starlette", "uvicorn", "httpx", "anyio", "jinja2", "webview"):
+for package_name in ("fastapi", "starlette", "uvicorn", "httpx", "anyio", "jinja2", "webview", "markdown"):
     hiddenimports += collect_submodules(package_name)
 
 datas = [

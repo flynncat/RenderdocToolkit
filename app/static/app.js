@@ -312,6 +312,8 @@ function renderPerfSummary(detail) {
   renderPerfTable();
   renderPerfChart(analysis.pass_chart || []);
   renderPerfHotspotHints(analysis.hotspot_hints || []);
+  updatePerfExportButtonsState();
+  renderPerfReportPanel(metadata.job_id || currentPerfJobId);
 }
 
 function renderPerfWarnings(warnings) {
@@ -525,9 +527,10 @@ function renderPerfTable() {
   });
 
   const body = rows.map((row) => {
+    const eid = row.eid || "";
     return `
-      <tr>
-        <td>${row.eid || "-"}</td>
+      <tr id="perf-row-${escapeHtml(eid)}" data-eid="${escapeHtml(eid)}">
+        <td>${eid || "-"}</td>
         <td>${row.scene_pass || "-"}</td>
         <td title="${row.pass_name || ""}">${row.pass_name || "-"}</td>
         <td>${Number(row.stable_sort_score || 0).toFixed(3)}</td>
@@ -603,6 +606,372 @@ function renderPerfChart(items) {
     <div class="perf-chart-pie" style="background: conic-gradient(${segments.join(", ")});"></div>
     <div class="perf-chart-legend">${legend}</div>
   `;
+}
+
+// ---- Perf export & report panel ----
+
+const PERF_TSV_COLUMNS = [
+  { key: "eid", label: "eid" },
+  { key: "scene_pass", label: "scene_pass" },
+  { key: "pass_name", label: "pass_name" },
+  { key: "breadcrumbs_path", label: "breadcrumbs_path" },
+  { key: "draw_type", label: "draw_type" },
+  { key: "instances", label: "instances" },
+  { key: "triangles", label: "triangles" },
+  { key: "vertices_read", label: "vertices_read" },
+  { key: "input_primitives", label: "input_primitives" },
+  { key: "gpu_duration_ms", label: "gpu_duration_ms" },
+  { key: "vs_invocations", label: "vs_invocations" },
+  { key: "ps_invocations", label: "ps_invocations" },
+  { key: "samples_passed", label: "samples_passed" },
+  { key: "vs_instruction_count", label: "vs_instruction_count" },
+  { key: "ps_instruction_count", label: "ps_instruction_count" },
+  { key: "instruction_total", label: "instruction_total" },
+  { key: "target_width", label: "target_width" },
+  { key: "target_height", label: "target_height" },
+  { key: "target_samples", label: "target_samples" },
+  { key: "screen_coverage_percent", label: "screen_coverage_percent" },
+  { key: "coverage_pixels_estimate", label: "coverage_pixels_estimate" },
+  { key: "instruction_coverage_score", label: "instruction_coverage_score" },
+  { key: "stable_sort_score", label: "stable_sort_score" },
+  { key: "stable_sort_basis", label: "stable_sort_basis" },
+  { key: "texture_count", label: "texture_count" },
+  { key: "texture_total_mb", label: "texture_total_mb" },
+  { key: "texture_bandwidth_risk", label: "texture_bandwidth_risk" },
+  { key: "texture_summary_text", label: "texture_summary_text" },
+  { key: "shader_id_vs", label: "shader_id_vs" },
+  { key: "shader_id_ps", label: "shader_id_ps" },
+];
+
+function perfTsvCellValue(row, key) {
+  if (key === "breadcrumbs_path") {
+    const crumbs = row.breadcrumbs || [];
+    if (Array.isArray(crumbs)) {
+      return crumbs.filter(Boolean).join("/");
+    }
+    return String(crumbs || "");
+  }
+  if (key === "shader_id_vs") {
+    return (row.shader_ids && (row.shader_ids.vs || row.shader_ids.program)) || "";
+  }
+  if (key === "shader_id_ps") {
+    return (row.shader_ids && row.shader_ids.ps) || "";
+  }
+  const value = row[key];
+  if (value == null) return "";
+  if (typeof value === "number") return String(value);
+  if (typeof value === "string") return value.replace(/\t/g, " ").replace(/\r?\n/g, " ");
+  if (Array.isArray(value) || typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function buildPerfTsv() {
+  const rows = (currentPerfAnalysis && currentPerfAnalysis.rows) || [];
+  if (!rows.length) return "";
+  const sortField = document.getElementById("perf-sort-field").value || "stable_sort_score";
+  const sortDirection = document.getElementById("perf-sort-direction").value || "desc";
+  const sorted = [...rows].sort((a, b) => {
+    const av = Number((a && a[sortField]) || 0);
+    const bv = Number((b && b[sortField]) || 0);
+    return sortDirection === "asc" ? av - bv : bv - av;
+  });
+  const header = PERF_TSV_COLUMNS.map((c) => c.label).join("\t");
+  const body = sorted.map((row) =>
+    PERF_TSV_COLUMNS.map((c) => perfTsvCellValue(row, c.key)).join("\t")
+  ).join("\n");
+  return header + "\n" + body + "\n";
+}
+
+async function handleCopyPerfTsv() {
+  const text = buildPerfTsv();
+  if (!text) {
+    alert("当前没有可复制的性能数据。");
+    return;
+  }
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    }
+    const btn = document.getElementById("perf-copy-tsv-btn");
+    if (btn) {
+      const orig = btn.textContent;
+      btn.textContent = "已复制 ✓";
+      setTimeout(() => { btn.textContent = orig; }, 1500);
+    }
+  } catch (error) {
+    alert("复制失败：" + (error && error.message ? error.message : error));
+  }
+}
+
+function flashPerfReportStatus(message, level = "info") {
+  const status = document.getElementById("perf-report-status");
+  if (!status) return;
+  const prev = status.textContent;
+  status.textContent = message;
+  status.dataset.level = level;
+  window.setTimeout(() => {
+    if (status.textContent === message) {
+      status.textContent = prev;
+      delete status.dataset.level;
+    }
+  }, 2400);
+}
+
+async function downloadPerfArtifactViaBridge(url, suggestedName, statusLabel) {
+  // pywebview's WebView2 backend swallows blob/anchor downloads, so the
+  // portable build delegates to a Python-side Save dialog + urllib fetch.
+  flashPerfReportStatus(`${statusLabel} 选择保存位置...`);
+  try {
+    const result = await window.pywebview.api.save_artifact_from_url(url, suggestedName);
+    if (!result) {
+      flashPerfReportStatus(`${statusLabel} 已取消`);
+      return null;
+    }
+    if (result.error) {
+      throw new Error(result.error);
+    }
+    if (result.cancelled) {
+      flashPerfReportStatus(`${statusLabel} 已取消`);
+      return null;
+    }
+    flashPerfReportStatus(`${statusLabel} 已保存到 ${result.path} ✓`);
+    return result.path || null;
+  } catch (error) {
+    const msg = error && error.message ? error.message : String(error);
+    flashPerfReportStatus(`${statusLabel} 桌面保存失败：${msg}`, "error");
+    // Fall through to blob-fallback so the user always gets a path.
+    return undefined;
+  }
+}
+
+async function downloadPerfArtifactViaBlobFallback(url, suggestedName, statusLabel) {
+  flashPerfReportStatus(`${statusLabel} 准备中...`);
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error(text || `HTTP ${response.status}`);
+    }
+    const blob = await response.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = blobUrl;
+    anchor.download = suggestedName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    window.setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+    flashPerfReportStatus(`${statusLabel} 已触发下载 ✓`);
+  } catch (error) {
+    const msg = error && error.message ? error.message : String(error);
+    flashPerfReportStatus(`${statusLabel} 失败：${msg}`, "error");
+    alert(`${statusLabel} 失败：${msg}`);
+  }
+}
+
+async function downloadPerfArtifactViaBlob(url, suggestedName, statusLabel) {
+  // Prefer the native Save dialog when running in pywebview because the
+  // blob-anchor trick is unreliable in WebView2 (no visible feedback).
+  if (hasDesktopBridge() && window.pywebview.api.save_artifact_from_url) {
+    const result = await downloadPerfArtifactViaBridge(url, suggestedName, statusLabel);
+    if (result !== undefined) {
+      return;
+    }
+    // result === undefined means the bridge raised — fall through to blob.
+  }
+  await downloadPerfArtifactViaBlobFallback(url, suggestedName, statusLabel);
+}
+
+async function copyPerfArtifactToClipboard(url, statusLabel) {
+  flashPerfReportStatus(`${statusLabel} 复制中...`);
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error(text || `HTTP ${response.status}`);
+    }
+    let text = await response.text();
+    // The exporter writes utf-8-sig — strip the BOM so Excel-friendly bytes
+    // don't pollute clipboard consumers.
+    if (text.charCodeAt(0) === 0xFEFF) text = text.substring(1);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    }
+    flashPerfReportStatus(`${statusLabel} 已复制到剪贴板 ✓`);
+  } catch (error) {
+    const msg = error && error.message ? error.message : String(error);
+    flashPerfReportStatus(`${statusLabel} 复制失败：${msg}`, "error");
+    alert(`${statusLabel} 复制失败：${msg}`);
+  }
+}
+
+function handleDownloadPerfZip() {
+  if (!currentPerfJobId) {
+    alert("请先选择一个性能分析任务。");
+    return;
+  }
+  const url = `/api/renderdoc-perf/jobs/${currentPerfJobId}/export?format=zip`;
+  downloadPerfArtifactViaBlob(url, `${currentPerfJobId}_perf_export.zip`, "报告+CSV (.zip)");
+}
+
+function updatePerfExportButtonsState() {
+  const hasData = Boolean(currentPerfAnalysis && (currentPerfAnalysis.rows || []).length);
+  const hasJob = Boolean(currentPerfJobId);
+  const copyBtn = document.getElementById("perf-copy-tsv-btn");
+  const downloadBtn = document.getElementById("perf-download-pack-btn");
+  if (copyBtn) copyBtn.disabled = !hasData;
+  if (downloadBtn) downloadBtn.disabled = !hasJob;
+}
+
+function highlightPerfRow(eid) {
+  if (!eid) return;
+  const safeEid = String(eid);
+  const row = document.getElementById(`perf-row-${safeEid}`);
+  if (!row) {
+    return;
+  }
+  const wrap = document.getElementById("perf-table-wrap");
+  if (wrap) {
+    const wrapRect = wrap.getBoundingClientRect();
+    const rowRect = row.getBoundingClientRect();
+    const offset = rowRect.top - wrapRect.top - (wrapRect.height / 2) + (rowRect.height / 2);
+    wrap.scrollBy({ top: offset, behavior: "smooth" });
+  }
+  row.classList.remove("perf-row-highlight");
+  // Force reflow so the animation restarts even on repeated clicks.
+  void row.offsetWidth;
+  row.classList.add("perf-row-highlight");
+  window.setTimeout(() => {
+    row.classList.remove("perf-row-highlight");
+  }, 2200);
+}
+
+// Maps a file extension within the perf exports folder to the export endpoint
+// format token + the label used in download status flashes.
+const PERF_EXPORT_FORMAT_FOR_FILE = {
+  "draws.csv": { format: "csv", label: "draws.csv" },
+  "draws.tsv": { format: "tsv", label: "draws.tsv" },
+  "overview.csv": { format: "zip", label: "overview.csv (in zip)", useArtifact: true },
+  "passes.csv": { format: "zip", label: "passes.csv (in zip)", useArtifact: true },
+  "textures.csv": { format: "zip", label: "textures.csv (in zip)", useArtifact: true },
+  "shaders.csv": { format: "zip", label: "shaders.csv (in zip)", useArtifact: true },
+  "findings.csv": { format: "zip", label: "findings.csv (in zip)", useArtifact: true },
+};
+
+function rewritePerfReportLinks(container, jobId) {
+  const links = container.querySelectorAll("a[href]");
+  links.forEach((link) => {
+    const href = link.getAttribute("href") || "";
+    if (!href) return;
+    if (href.startsWith("#perf-row-")) {
+      link.dataset.perfRowAnchor = href.substring(1);
+      link.setAttribute("href", "javascript:void(0)");
+      return;
+    }
+    if (href.startsWith("#finding-")) {
+      link.dataset.perfFindingAnchor = href.substring(1);
+      link.setAttribute("href", "javascript:void(0)");
+      return;
+    }
+    if (href.startsWith("exports/") || href.startsWith("./exports/")) {
+      const file = href.replace(/^\.\//, "").substring("exports/".length);
+      const meta = PERF_EXPORT_FORMAT_FOR_FILE[file];
+      // The draws.tsv link in section 4 doubles as "copy to clipboard" per
+      // user feedback - dedicated action gets its own intercept marker.
+      if (file === "draws.tsv") {
+        link.dataset.perfCopyTsv = "1";
+        link.dataset.perfArtifactPath = `artifacts/exports/${file}`;
+        link.setAttribute("href", "javascript:void(0)");
+        link.setAttribute("title", "点击直接复制 TSV 内容到剪贴板");
+        return;
+      }
+      if (meta && meta.format === "csv") {
+        link.dataset.perfDownloadFormat = "csv";
+        link.dataset.perfDownloadName = `${jobId}_${file}`;
+        link.dataset.perfDownloadLabel = meta.label;
+        link.setAttribute("href", "javascript:void(0)");
+        return;
+      }
+      // The 4 supplementary CSVs (overview/passes/textures/shaders/findings)
+      // only live inside the zip pack. Rewrite their links to /artifact so
+      // a direct fetch + blob-download works in pywebview.
+      link.dataset.perfArtifactPath = `artifacts/exports/${file}`;
+      link.dataset.perfDownloadName = `${jobId}_${file}`;
+      link.dataset.perfDownloadLabel = file;
+      link.setAttribute("href", "javascript:void(0)");
+      return;
+    }
+  });
+}
+
+async function renderPerfReportPanel(jobId) {
+  const panel = document.getElementById("perf-report-panel");
+  const status = document.getElementById("perf-report-status");
+  const linkMd = document.getElementById("perf-report-download-md");
+  const linkHtml = document.getElementById("perf-report-download-html");
+  const linkZip = document.getElementById("perf-report-download-zip");
+  if (!panel) return;
+  panel.innerHTML = '<div class="empty-state">报告加载中...</div>';
+  if (status) status.textContent = "报告加载中...";
+  [linkMd, linkHtml, linkZip].forEach((el) => { if (el) el.classList.add("hidden"); });
+  if (!jobId) {
+    panel.innerHTML = '<div class="empty-state">执行性能分析后将自动生成报告</div>';
+    if (status) status.textContent = "尚未生成报告";
+    return;
+  }
+  try {
+    const response = await fetch(`/api/renderdoc-perf/jobs/${jobId}/report?format=html`);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || `HTTP ${response.status}`);
+    }
+    const html = await response.text();
+    // Extract <body> so the wrapper styles in the report HTML don't clash
+    // with the host page styles.
+    const bodyMatch = html.match(/<body[^>]*>([\s\S]*)<\/body>/i);
+    const innerHtml = bodyMatch ? bodyMatch[1] : html;
+    panel.innerHTML = innerHtml;
+    // The standalone report embeds a full perf-results table so the
+    // downloaded file is self-contained.  The SPA already shows that data
+    // in #perf-table-wrap above, so we strip the embedded copy to avoid
+    // duplication and keep the inline panel compact.
+    const embedded = panel.querySelector("#perf-results-section");
+    if (embedded) {
+      embedded.remove();
+    }
+    rewritePerfReportLinks(panel, jobId);
+    if (status) status.textContent = "报告已生成";
+    if (linkMd) {
+      linkMd.href = `/api/renderdoc-perf/jobs/${jobId}/export?format=md`;
+      linkMd.classList.remove("hidden");
+    }
+    if (linkHtml) {
+      linkHtml.href = `/api/renderdoc-perf/jobs/${jobId}/export?format=html`;
+      linkHtml.classList.remove("hidden");
+    }
+    if (linkZip) {
+      linkZip.href = `/api/renderdoc-perf/jobs/${jobId}/export?format=zip`;
+      linkZip.classList.remove("hidden");
+    }
+  } catch (error) {
+    const msg = error && error.message ? error.message : String(error);
+    panel.innerHTML = `<div class="empty-state">报告未生成或加载失败：${escapeHtml(msg)}</div>`;
+    if (status) status.textContent = "报告未生成";
+  }
 }
 
 function renderPerfHotspotHints(hints) {
@@ -1441,6 +1810,91 @@ document.getElementById("pick-asset-csv-path-btn").addEventListener("click", () 
 document.getElementById("pick-asset-csv-dir-btn").addEventListener("click", () => pickDesktopDirectory("asset-csv-source-path"));
 document.getElementById("perf-sort-field").addEventListener("change", renderPerfTable);
 document.getElementById("perf-sort-direction").addEventListener("change", renderPerfTable);
+{
+  const copyBtn = document.getElementById("perf-copy-tsv-btn");
+  if (copyBtn) copyBtn.addEventListener("click", handleCopyPerfTsv);
+  const zipBtn = document.getElementById("perf-download-pack-btn");
+  if (zipBtn) zipBtn.addEventListener("click", handleDownloadPerfZip);
+  const panel = document.getElementById("perf-report-panel");
+  if (panel) {
+    panel.addEventListener("click", (event) => {
+      const link = event.target.closest("a");
+      if (!link) return;
+      if (link.dataset.perfRowAnchor) {
+        event.preventDefault();
+        const id = link.dataset.perfRowAnchor;
+        const eid = id.startsWith("perf-row-") ? id.substring("perf-row-".length) : id;
+        highlightPerfRow(eid);
+        return;
+      }
+      if (link.dataset.perfFindingAnchor) {
+        event.preventDefault();
+        const target = document.getElementById(link.dataset.perfFindingAnchor);
+        if (target && target.scrollIntoView) {
+          target.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+        return;
+      }
+      if (link.dataset.perfCopyTsv) {
+        event.preventDefault();
+        if (!currentPerfJobId) {
+          alert("请先选择一个性能分析任务。");
+          return;
+        }
+        const url = `/api/renderdoc-perf/jobs/${currentPerfJobId}/export?format=tsv`;
+        copyPerfArtifactToClipboard(url, "draws.tsv");
+        return;
+      }
+      if (link.dataset.perfDownloadFormat) {
+        event.preventDefault();
+        if (!currentPerfJobId) {
+          alert("请先选择一个性能分析任务。");
+          return;
+        }
+        const fmt = link.dataset.perfDownloadFormat;
+        const name = link.dataset.perfDownloadName || `perf_export.${fmt}`;
+        const label = link.dataset.perfDownloadLabel || name;
+        const url = `/api/renderdoc-perf/jobs/${currentPerfJobId}/export?format=${encodeURIComponent(fmt)}`;
+        downloadPerfArtifactViaBlob(url, name, label);
+        return;
+      }
+      if (link.dataset.perfArtifactPath) {
+        event.preventDefault();
+        if (!currentPerfJobId) {
+          alert("请先选择一个性能分析任务。");
+          return;
+        }
+        const path = link.dataset.perfArtifactPath;
+        const name = link.dataset.perfDownloadName || path.split("/").pop();
+        const label = link.dataset.perfDownloadLabel || name;
+        const url = `/api/renderdoc-perf/jobs/${currentPerfJobId}/artifact?path=${encodeURIComponent(path)}`;
+        downloadPerfArtifactViaBlob(url, name, label);
+        return;
+      }
+    });
+  }
+
+  // Hook the 3 toolbar download links (md/html/zip) so they go through the
+  // blob downloader path too — keeps pywebview consistent with browsers.
+  ["perf-report-download-md", "perf-report-download-html", "perf-report-download-zip"].forEach((id) => {
+    const link = document.getElementById(id);
+    if (!link) return;
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      if (!currentPerfJobId) {
+        alert("请先选择一个性能分析任务。");
+        return;
+      }
+      const fmt = id.endsWith("-md") ? "md" : (id.endsWith("-html") ? "html" : "zip");
+      const ext = fmt === "zip" ? "zip" : (fmt === "html" ? "html" : "md");
+      const name = `${currentPerfJobId}_perf_${fmt === "zip" ? "export.zip" : (fmt === "html" ? "report.html" : "report.md")}`;
+      const label = fmt === "zip" ? "报告+CSV (.zip)" : (fmt === "html" ? "perf_report.html" : "perf_report.md");
+      void ext;
+      const url = `/api/renderdoc-perf/jobs/${currentPerfJobId}/export?format=${fmt}`;
+      downloadPerfArtifactViaBlob(url, name, label);
+    });
+  });
+}
 document.getElementById("perf-preview-panel-close").addEventListener("click", () => hidePerfPreviewPanel(true));
 document.getElementById("perf-preview-panel").addEventListener("mouseenter", () => {
   if (perfPreviewHideTimer) {
