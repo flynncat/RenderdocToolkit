@@ -23,6 +23,52 @@
 - 从抓帧中批量导出网格、贴图、shader 与参数，并完成 CSV 到模型格式的转换
 - 在本地持续保存性能与导出任务记录，便于回查
 
+## Roadmap
+
+主线：**支持任意版本 / 魔改 RenderDoc 抓帧的端到端分析与对比**，并补齐性能诊断与导出闭环。
+
+### 近两周已交付（2026-05-07 ~ 2026-05-21）
+
+#### 多版本 RenderDoc 兼容
+
+- [x] **任务级 RenderDoc 目录选择**：性能 / 性能 Diff Tab 各自可覆盖全局配置，路径解析链统一收口至 `renderdoc_runtime_resolver`
+- [x] **XML 回退分析路径**：公版 Python API 不兼容时（如 v1.36 `CODR/RDOC` 魔数），自动走 `renderdoccmd convert -c zip.xml`，重建 GPU 耗时近似、指令数、屏幕覆盖率、绑定纹理与带宽风险
+- [x] **qrenderdoc `--python` 真实回放后端**：借用用户 RenderDoc 内嵌 Python，绕过 ABI 不兼容，拿到真实 GPU 回放的 RT / 绑定纹理 PNG（`replay_backend` + `qr_replay_worker`）
+
+#### 性能 Tab
+
+- [x] **四种绘制预览来源**：`rt_replay` / `tex_replay` / `wireframe_overlay` / `texture`，边框颜色区分数据来源
+- [x] **RT + Wireframe 线框叠加**：qrenderdoc worker 导出线框 PNG，服务端 PIL 合成 + 前端 stack 展示
+- [x] **按需预览与懒加载**：`POST .../draw-preview` 按 EID 生成 RT/线框；XML 回退路径懒加载绑定纹理缩略图
+- [x] **证据型性能诊断报告**：确定性规则引擎（R001–R008 / R010 / R014），自动生成 HTML / Markdown 报告与 CSV / TSV 导出，EID 可跳转性能表
+- [x] **预览翻转开关**：工具栏「上下翻转贴图」，适配 DX/GL 手性差异（仅影响界面显示）
+- [x] **工作流聚焦**：移除 Shader 简化 Tab 及整套实验性简化链路，收敛为核心 perf 能力
+
+#### 性能 Diff Tab
+
+- [x] **子进程隔离 + 隐藏窗口**：cmp 脚本独立进程运行，崩溃不拖垮 Web 服务；`CREATE_NO_WINDOW` 避免 CMD 抢焦点
+- [x] **UE streaming 占位符纹理可视化**：识别 16 字节 ASTC Initial Contents，区分完整资产 / 占位符 / 真无数据三态
+- [x] **GL 纹理提取修复**：支持 `Internal::Initial Contents`，UE 移动端抓帧缩略图从 0 恢复到数百张
+- [x] **cmp 前 qrenderdoc 预跑**：用真实 PNG 覆盖 HTML 报告中的纹理缩略图
+
+#### 资产导出
+
+- [x] **上下翻转贴图**：资产导出与 CSV 转模型支持 `flip_texture_y`，写盘前对 PNG/TGA 做一次 Y 轴翻转
+
+#### 体验与工程
+
+- [x] **桌面对话框修复**：文件/目录选择从 tkinter 切到 pywebview，消除主线程崩溃
+- [x] **双远程 Git 同步**：GitHub（`origin`）+ 工蜂 git.woa（`woa`）并行推送
+- [x] 详细发布说明见 [docs/RELEASE_2026-05-14.md](docs/RELEASE_2026-05-14.md)
+
+### 后续计划
+
+- [ ] 扩展 qrenderdoc worker 对 **Vulkan / D3D** 复杂 descriptor 表的 per-draw 绑定纹理提取（GL 已完整支持）
+- [ ] 补齐 perf 规则引擎预留项（**R009 / R011–R013 / R015**：pipeline-state 扩展 + malioc 相关指标）
+- [ ] cmp-mode **超大场景纹理 roster** 上限提升，以及 streaming 纹理 sub-image 的 tile-reassembly
+- [ ] chrome.json **CPU API 时间**与真实 GPU 计时的更精确近似；可选 Mali GPU counter 集成
+- [ ] 移动端 / 多 API 抓帧的**端到端验收用例**扩充与文档同步
+
 ## 快速开始
 
 ### 运行前准备
