@@ -22,6 +22,26 @@ alwaysApply: true
 git remote add woa https://git.woa.com/flynnxue/RenderdocToolkit.git
 ```
 
+### git.woa 双分支说明
+
+工蜂仓库同时维护 **`main`** 与 **`master`** 两个分支：
+
+- **`main`**：与 GitHub 同步的主开发分支（日常推送目标）
+- **`master`**：工蜂默认首页分支；须与 `main` 保持内容一致，否则访问仓库首页会看到旧代码
+
+每次推送 git.woa 时，**两个分支都要更新**：
+
+```powershell
+git push woa main          # 同步 main
+git push woa main:master   # 同步 master（工蜂首页）
+```
+
+若 `main:master` 因历史分叉被拒绝：
+
+1. 先尝试 fast-forward：`git push woa main:master`
+2. 若仍失败且确认可覆盖旧 master，尝试：`git push woa main:master --force`
+3. 若 master 为**受保护分支**禁止 force push，汇报用户需在工蜂 **设置 → 保护分支** 中临时取消 master 保护，或改默认分支为 `main`，然后重试
+
 ## 1. 检查远程更新
 
 ```powershell
@@ -50,15 +70,16 @@ git fetch woa
 
 若本次仅为 typo / 内部重构且不影响用户文档，可只改 commit message，README 可不动。
 
-## 4. 推送（双远程）
+## 4. 推送（双远程 + git.woa 双分支）
 
 ```powershell
 git push origin <current-branch>
 git push woa <current-branch>
+git push woa <current-branch>:master
 ```
 
-两个远程都必须推送；若其中一个失败，汇报失败原因并尝试修复后重推，不要只推一个就结束。
+三个 push 都必须执行；若其中一个失败，汇报失败原因并尝试修复后重推，不要只推部分就结束。
 
 ## 5. 汇报
 
-用中文简要说明：是否拉取了远程、提交 hash 与 message、README 是否更新、**GitHub 与 git.woa 各自**推送是否成功。
+用中文简要说明：是否拉取了远程、提交 hash 与 message、README 是否更新、**GitHub、git.woa/main、git.woa/master** 各自推送是否成功。
