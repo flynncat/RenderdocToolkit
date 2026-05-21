@@ -311,14 +311,65 @@ _SHADER_TYPE_MAP = {
     "36487": "tess_eval", "GL_TESS_EVALUATION_SHADER": "tess_eval",
 }
 
+# Pass-name keywords mapped to a canonical label.  Order is preserved when
+# iterating: more specific keywords must precede generic ones (e.g.
+# "mobilebasepass" before "basepass").  Kept in sync with
+# `RenderdocPerfService._SCENE_PASS_KEYWORDS` so both code paths classify
+# the same way.
 _SCENE_PASS_MAP = {
+    # Unreal Engine
     "shadowdepths": "ShadowDepths",
     "mobilerenderprepass": "MobileRenderPrePass",
     "mobilebasepass": "MobileBasePass",
-    "translucency": "Translucency",
     "postprocessing": "PostProcessing",
-    "basepass": "BasePass",
+    "translucency": "Translucency",
+    # Generic / Unity / Cocos / in-house
     "prepass": "PrePass",
+    "gbuffer": "GBuffer",
+    "basepass": "BasePass",
+    "depthonly": "DepthOnly",
+    "shadow": "Shadow",
+    "velocity": "Velocity",
+    "decal": "Decal",
+    "lighting": "Lighting",
+    "ssao": "SSAO",
+    "ssr": "SSR",
+    "reflection": "Reflection",
+    "refraction": "Refraction",
+    "transparent": "Translucent",
+    "translucent": "Translucent",
+    "additive": "Translucent",
+    "alphablend": "Translucent",
+    "alpha-blend": "Translucent",
+    "alpha_blend": "Translucent",
+    "sky": "Sky",
+    "skybox": "Sky",
+    "tonemap": "PostProcess",
+    "bloom": "PostProcess",
+    "fxaa": "PostProcess",
+    "taa": "PostProcess",
+    "smaa": "PostProcess",
+    "dof": "PostProcess",
+    "postprocess": "PostProcess",
+    "post-process": "PostProcess",
+    "post_process": "PostProcess",
+    "blit": "Blit",
+    "copy": "Copy",
+    "resolve": "Resolve",
+    "clear": "Clear",
+    "ui": "UI",
+    "hud": "UI",
+    "widget": "UI",
+    "imgui": "UI",
+    "particle": "Particle",
+    "fluid": "Particle",
+    "water": "Water",
+    "foliage": "Foliage",
+    "opaque": "Opaque",
+    "emissive": "Emissive",
+    "outline": "Outline",
+    "edge": "Outline",
+    "stencil": "Stencil",
 }
 
 _PARAM_TAGS = {"uint", "int", "enum", "string", "float", "bool", "ResourceId", "buffer"}
@@ -709,11 +760,28 @@ def _handle_draw(
     # before glUseProgram is called).
     vs_inst, ps_inst = _aggregate_program_instructions(ctx, ctx.state.current_program)
 
+    final_scene_pass = scene_pass or "Other"
+    if final_scene_pass != "Other":
+        decided_by = "marker"
+    else:
+        decided_by = "fallback"
     ctx.draw_rows.append({
         "eid": str(eid),
         "_chunk_index": eid,  # preserved for chrome.json matching by ordinal
         "pass_name": pass_name,
-        "scene_pass": scene_pass or "Other",
+        "scene_pass": final_scene_pass,
+        "scene_pass_decided_by": decided_by,
+        "inferred_pass_kind": "Other",  # XML path can't infer from state yet
+        "marker_scene_pass": scene_pass,
+        "marker_scene_pass_source": "marker" if scene_pass else "",
+        "render_state": {
+            "blend_enable": False,
+            "color_write_mask": 0xF,
+            "depth_test": False,
+            "depth_write": False,
+            "cull_mode": "",
+            "blend_summary": "",
+        },
         "selection_label": f"EID {eid} | {pass_name}",
         "breadcrumbs": breadcrumbs,
         "draw_type": _classify_draw(name),
@@ -818,11 +886,20 @@ def _classify_draw(name: str) -> str:
 
 
 def _detect_scene_pass(breadcrumbs: List[str]) -> str:
+    """Walk the marker stack from outer → inner and return the canonical
+    label of the first crumb that matches a known pass keyword.
+
+    If no crumb matches a known keyword but the engine *did* leave a
+    marker, return the outermost raw name so the row at least shows
+    *something* useful instead of "Other".
+    """
     for crumb in breadcrumbs:
         lower = crumb.lower()
         for key, value in _SCENE_PASS_MAP.items():
             if key in lower:
                 return value
+    if breadcrumbs:
+        return breadcrumbs[0]
     return ""
 
 

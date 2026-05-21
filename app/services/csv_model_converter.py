@@ -258,8 +258,18 @@ class CsvModelConverter:
             tangent=self._find_header(headers, DEFAULT_HINTS["tangent"]) or "",
         )
 
-    def convert(self, csv_path: str | Path, output_path: str | Path, mapping: ColumnMapping, fmt: str) -> ConvertedMesh:
+    def convert(
+        self,
+        csv_path: str | Path,
+        output_path: str | Path,
+        mapping: ColumnMapping,
+        fmt: str,
+        *,
+        flip_texture_y: bool = False,
+    ) -> ConvertedMesh:
         mesh = self.build_mesh(csv_path, mapping)
+        if flip_texture_y:
+            self._flip_uv_v(mesh)
         fmt_normalized = fmt.lower()
         if fmt_normalized == "obj":
             self.write_obj(mesh, output_path)
@@ -268,6 +278,21 @@ class CsvModelConverter:
         else:
             raise ValueError(f"unsupported format: {fmt}")
         return mesh
+
+    @staticmethod
+    def _flip_uv_v(mesh: ConvertedMesh) -> None:
+        """Mutate `mesh` so every vertex's UV V component becomes ``1.0 - V``.
+
+        Used by the "上下翻转贴图" toggle on the manual-conversion path.
+        Only V is touched; U stays untouched - this matches the typical
+        DX↔GL handedness fix where the V axis is mirrored but the U
+        layout stays identical.
+        """
+        for vertex in mesh.vertices:
+            vertex.uv0 = (vertex.uv0[0], 1.0 - vertex.uv0[1])
+            vertex.uv1 = (vertex.uv1[0], 1.0 - vertex.uv1[1])
+            vertex.uv2 = (vertex.uv2[0], 1.0 - vertex.uv2[1])
+            vertex.uv3 = (vertex.uv3[0], 1.0 - vertex.uv3[1])
 
     def build_mesh(self, csv_path: str | Path, mapping: ColumnMapping) -> ConvertedMesh:
         rows = self._read_rows(csv_path)

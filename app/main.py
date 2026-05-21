@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
+import mimetypes
 import os
 import platform
 import re
 import subprocess
 import tempfile
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+try:
+    from PIL import Image as _PIL_Image  # type: ignore
+except Exception:
+    _PIL_Image = None  # type: ignore
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -249,6 +257,61 @@ def _create_manual_csv_conversion_job(
     return job_id
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _flip_job_textures_in_place(job_dir: Path) -> dict:
+    """Scan typical texture locations under ``job_dir`` and flip PNG/TGA
+    files vertically in-place (used by the manual-convert "上下翻转
+    贴图" toggle).
+
+    Returns a summary so the caller can record what happened in the
+    manifest's ``conversion_history``.
+    """
+    summary: dict = {"performed": True, "flipped": [], "skipped": [], "notes": []}
+    if _PIL_Image is None:
+        summary["notes"].append("当前环境未安装 PIL，跳过贴图二次翻转")
+        return summary
+
+    candidate_roots: list[Path] = []
+    candidate_roots.append(job_dir / "textures")
+    exports_root = job_dir / "exports"
+    if exports_root.is_dir():
+        candidate_roots.append(exports_root)
+
+    seen: set[Path] = set()
+    for root in candidate_roots:
+        if not root or not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            suffix = path.suffix.lower()
+            if suffix not in {".png", ".tga"}:
+                if suffix == ".dds":
+                    rel = str(path.relative_to(job_dir)).replace("\\", "/")
+                    summary["skipped"].append({"path": rel, "reason": "dds 格式 PIL 无法原地翻转"})
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            try:
+                with _PIL_Image.open(path) as image:
+                    flipped = image.transpose(_PIL_Image.FLIP_TOP_BOTTOM)
+                    flipped.save(path)
+                summary["flipped"].append(str(path.relative_to(job_dir)).replace("\\", "/"))
+            except Exception as exc:
+                summary["skipped"].append(
+                    {
+                        "path": str(path.relative_to(job_dir)).replace("\\", "/"),
+                        "reason": f"PIL 翻转失败: {exc}",
+                    }
+                )
+    return summary
+
+
 def _run_csv_conversion_for_job(
     *,
     job_id: str,
@@ -256,6 +319,7 @@ def _run_csv_conversion_for_job(
     csv_files: list[Path],
     output_format: str,
     mapping: dict,
+    flip_texture_y: bool = False,
 ) -> dict:
     try:
         job_dir = asset_export_store.job_path(job_id)
@@ -296,24 +360,40 @@ def _run_csv_conversion_for_job(
                 output_path=output_path,
                 mapping=applied_mapping,
                 fmt=output_format,
+                flip_texture_y=bool(flip_texture_y),
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"CSV 转换失败: {csv_file.name}: {exc}") from exc
 
         output_ref = asset_export_service._artifact_ref(job_dir, output_path)
-        manual_conversions.append(
-            {
-                "csv_name": csv_file.name,
-                "csv_source_path": str(csv_file),
-                "output_format": output_format.upper(),
-                "output_path": output_ref,
-                "mapping_suggested": suggested_mapping.to_dict(),
-                "mapping_applied": applied_mapping.to_dict(),
-                "mapping_notes": mapping_notes,
-            }
-        )
+        conversion_entry = {
+            "csv_name": csv_file.name,
+            "csv_source_path": str(csv_file),
+            "output_format": output_format.upper(),
+            "output_path": output_ref,
+            "mapping_suggested": suggested_mapping.to_dict(),
+            "mapping_applied": applied_mapping.to_dict(),
+            "mapping_notes": mapping_notes,
+        }
+        if flip_texture_y:
+            conversion_entry["flip_texture_y"] = True
+        manual_conversions.append(conversion_entry)
         if output_ref not in model_files:
             model_files.append(output_ref)
+
+    texture_flip_summary: dict = {"performed": False, "flipped": [], "skipped": [], "notes": []}
+    if flip_texture_y:
+        texture_flip_summary = _flip_job_textures_in_place(job_dir)
+        history_entry = {
+            "action": "flip_texture_y",
+            "timestamp": _utc_now_iso(),
+            "flipped": list(texture_flip_summary.get("flipped") or []),
+            "skipped": list(texture_flip_summary.get("skipped") or []),
+            "notes": list(texture_flip_summary.get("notes") or []),
+        }
+        conversion_history = list(manifest.get("conversion_history") or [])
+        conversion_history.append(history_entry)
+        manifest["conversion_history"] = conversion_history
 
     manifest["manual_conversions"] = manual_conversions
     asset_export_store.write_json_artifact(job_id, "artifacts/manifest.json", manifest)
@@ -577,12 +657,103 @@ def _perf_artifact_path(job_dir: Path, relative: str) -> Path:
     return candidate
 
 
+# Match preview URLs the perf service emits.  Both the direct-replay
+# path and the xml_fallback path produce ``<img>`` references like
+#   /perf-session-files/<job>/artifacts/previews/wireframe_528.png   (direct_replay)
+#   /perf-session-files/<job>/artifacts/qr_replay/wf_wireframe_eid528.png  (xml_fallback)
+# We need to catch BOTH directories or the xml_fallback download ends
+# up with absolute, service-only URLs that break offline.
+_PERF_PREVIEW_URL_PATTERN = re.compile(
+    r"/perf-session-files/(?P<job>[^/\"' >]+)/artifacts/(?P<dir>previews|qr_replay)/(?P<file>[A-Za-z0-9_.\-]+\.(?:png|jpg|jpeg|webp))"
+)
+
+# Whitelist of artifact sub-directories that are allowed to host
+# preview images.  Anything outside is rejected by the rewriter to
+# avoid reaching into unrelated job files.
+_PERF_PREVIEW_ALLOWED_DIRS = ("previews", "qr_replay")
+
+
+def _rewrite_perf_html_previews(
+    html_text: str,
+    job_dir: Path,
+    job_id: str,
+    *,
+    mode: str,
+) -> tuple[str, list[Path]]:
+    """Rewrite preview ``<img src=...>`` URLs in the saved HTML report so
+    that downloaded copies still resolve when the local FastAPI service is
+    not running.
+
+    ``mode='base64'``  → replace each preview URL with an inline
+                         ``data:image/...;base64,...`` URI.  Use this for
+                         standalone HTML downloads.
+
+    ``mode='relative'`` → replace each preview URL with the relative
+                          path ``<dir>/<file>`` (preserving whichever
+                          artifact sub-directory the original URL used)
+                          so it resolves against the report sitting
+                          next to a matching sibling folder.  Use this
+                          when bundling into a ZIP.
+
+    Returns ``(rewritten_html, referenced_image_paths)`` so callers can
+    bundle the referenced preview files alongside the report.  Image
+    files that cannot be read are left as-is (the original URL is kept
+    so users will still see a broken-image placeholder rather than a
+    silent removal).
+    """
+    if mode not in {"base64", "relative"}:
+        raise ValueError(f"unsupported rewrite mode: {mode}")
+
+    artifacts_root = (job_dir / "artifacts").resolve()
+    referenced: list[Path] = []
+    seen_paths: set[Path] = set()
+
+    def repl(match: re.Match[str]) -> str:
+        ref_job = match.group("job")
+        # Only rewrite URLs belonging to *this* job - never reach into
+        # another session's preview directory even by accident.
+        if ref_job != job_id:
+            return match.group(0)
+        subdir = match.group("dir")
+        if subdir not in _PERF_PREVIEW_ALLOWED_DIRS:
+            return match.group(0)
+        filename = match.group("file")
+        dir_root = (artifacts_root / subdir).resolve()
+        candidate = (dir_root / filename).resolve()
+        try:
+            if not candidate.is_relative_to(dir_root) or not candidate.exists():
+                return match.group(0)
+        except Exception:
+            return match.group(0)
+
+        if mode == "relative":
+            if candidate not in seen_paths:
+                seen_paths.add(candidate)
+                referenced.append(candidate)
+            return f"{subdir}/{filename}"
+
+        # mode == "base64" - inline.
+        try:
+            data = candidate.read_bytes()
+        except Exception:
+            return match.group(0)
+        mime, _ = mimetypes.guess_type(filename)
+        if not mime:
+            mime = "image/png"
+        b64 = base64.b64encode(data).decode("ascii")
+        if candidate not in seen_paths:
+            seen_paths.add(candidate)
+            referenced.append(candidate)
+        return f"data:{mime};base64,{b64}"
+
+    return _PERF_PREVIEW_URL_PATTERN.sub(repl, html_text), referenced
+
+
 def _build_perf_zip_bytes(job_dir: Path, job_id: str) -> bytes:
     buffer = io.BytesIO()
     candidate_paths: list[tuple[Path, str]] = []
     for relative in (
         "artifacts/perf_report.md",
-        "artifacts/perf_report.html",
         "artifacts/perf_analysis.json",
         "artifacts/findings.json",
         "artifacts/perf_run_log.txt",
@@ -595,11 +766,40 @@ def _build_perf_zip_bytes(job_dir: Path, job_id: str) -> bytes:
         for path in sorted(exports_dir.iterdir()):
             if path.is_file():
                 candidate_paths.append((path, f"artifacts/exports/{path.name}"))
-    if not candidate_paths:
+
+    # The HTML report is handled specially: every preview image gets
+    # inlined as a base64 ``data:`` URI so the resulting file is fully
+    # self-contained.  This avoids a Windows-shell footgun where users
+    # double-click ``perf_report.html`` from *inside* the ZIP (Explorer
+    # extracts only the HTML to a temp directory, so a sibling
+    # ``previews/`` folder isn't present and every <img> would 404).
+    # Now the report works regardless of how the user opens it.
+    html_path = (job_dir / "artifacts" / "perf_report.html").resolve()
+    rewritten_html: Optional[str] = None
+    referenced_previews: list[Path] = []
+    if html_path.exists() and html_path.is_relative_to(job_dir):
+        original_html = html_path.read_text(encoding="utf-8", errors="replace")
+        rewritten_html, referenced_previews = _rewrite_perf_html_previews(
+            original_html, job_dir, job_id, mode="base64"
+        )
+
+    if not candidate_paths and rewritten_html is None:
         raise HTTPException(status_code=404, detail="该任务还没有可导出的报告/CSV")
+
+    # Note: ``referenced_previews`` is populated by the base64 rewrite
+    # for diagnostics but the PNG files themselves are NOT bundled as
+    # a separate folder.  All previews are already inlined into the
+    # HTML, and shipping a redundant ``previews/`` folder would roughly
+    # double the ZIP size (~65 MB for a 100-draw analysis) without
+    # giving the typical reader anything more than what the HTML
+    # already provides.
+    _ = referenced_previews
+
     with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         for path, arcname in candidate_paths:
             zf.write(path, arcname=f"{job_id}/{arcname}")
+        if rewritten_html is not None:
+            zf.writestr(f"{job_id}/artifacts/perf_report.html", rewritten_html)
     return buffer.getvalue()
 
 
@@ -634,6 +834,25 @@ async def export_perf_job(job_id: str, format: str = "zip") -> Response:
     else:
         relative = f"artifacts/{_PERF_EXPORT_FILENAMES[fmt]}"
     target = _perf_artifact_path(job_dir, relative)
+
+    # For standalone HTML downloads, inline every wireframe preview as a
+    # base64 ``data:`` URI so the file works offline without any sibling
+    # ``previews/`` folder and without the local FastAPI service.
+    if fmt == "html":
+        original_html = target.read_text(encoding="utf-8", errors="replace")
+        rewritten_html, _ = _rewrite_perf_html_previews(
+            original_html, job_dir, job_id, mode="base64"
+        )
+        return Response(
+            content=rewritten_html.encode("utf-8"),
+            media_type=_PERF_EXPORT_MEDIA_TYPES.get(fmt, "text/html; charset=utf-8"),
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{job_id}_{target.name}"'
+                ),
+            },
+        )
+
     return FileResponse(
         path=str(target),
         filename=f"{job_id}_{target.name}",
@@ -892,6 +1111,7 @@ async def create_asset_export_job(
     pass_end: str = Form(""),
     export_fbx: str = Form("true"),
     export_obj: str = Form("false"),
+    flip_texture_y: str = Form("false"),
     texture_format: str = Form("png"),
     notes: str = Form(""),
     position: str = Form(""),
@@ -906,6 +1126,7 @@ async def create_asset_export_job(
     _ensure_rdc_file(capture_file.filename)
     requested_scope = export_scope.strip() or "single"
     requested_texture_format = texture_format.strip().lower() or "png"
+    requested_flip_texture_y = str(flip_texture_y).lower() in {"true", "1", "yes", "on"}
     if requested_scope == "single" and not (pass_id.strip() or pass_name.strip()):
         raise HTTPException(status_code=400, detail="单个 Pass 模式下必须选择 pass_name")
     if requested_scope == "range" and not ((pass_start_id.strip() or pass_start.strip()) and (pass_end_id.strip() or pass_end.strip())):
@@ -924,6 +1145,7 @@ async def create_asset_export_job(
             "pass_end": pass_end.strip(),
             "export_fbx": str(export_fbx).lower() in {"true", "1", "yes", "on"},
             "export_obj": str(export_obj).lower() in {"true", "1", "yes", "on"},
+            "flip_texture_y": requested_flip_texture_y,
             "texture_format": requested_texture_format,
             "notes": notes.strip(),
             "export_mapping": _extract_mapping_form(
@@ -973,6 +1195,7 @@ async def create_asset_export_job(
             export_fbx=str(export_fbx).lower() in {"true", "1", "yes", "on"},
             export_obj=str(export_obj).lower() in {"true", "1", "yes", "on"},
             texture_format=requested_texture_format,
+            flip_texture_y=requested_flip_texture_y,
             mapping_override=_extract_mapping_form(
                 position=position,
                 normal=normal,
@@ -1014,6 +1237,7 @@ async def create_asset_export_job_by_path(
     pass_end: str = Form(""),
     export_fbx: str = Form("true"),
     export_obj: str = Form("false"),
+    flip_texture_y: str = Form("false"),
     texture_format: str = Form("png"),
     notes: str = Form(""),
     position: str = Form(""),
@@ -1028,6 +1252,7 @@ async def create_asset_export_job_by_path(
     capture_file = _require_existing_file(capture_path, ".rdc", "capture_path")
     requested_scope = export_scope.strip() or "single"
     requested_texture_format = texture_format.strip().lower() or "png"
+    requested_flip_texture_y = str(flip_texture_y).lower() in {"true", "1", "yes", "on"}
     if requested_scope == "single" and not (pass_id.strip() or pass_name.strip()):
         raise HTTPException(status_code=400, detail="单个 Pass 模式下必须选择 pass_name")
     if requested_scope == "range" and not ((pass_start_id.strip() or pass_start.strip()) and (pass_end_id.strip() or pass_end.strip())):
@@ -1046,6 +1271,7 @@ async def create_asset_export_job_by_path(
             "pass_end": pass_end.strip(),
             "export_fbx": str(export_fbx).lower() in {"true", "1", "yes", "on"},
             "export_obj": str(export_obj).lower() in {"true", "1", "yes", "on"},
+            "flip_texture_y": requested_flip_texture_y,
             "texture_format": requested_texture_format,
             "notes": notes.strip(),
             "export_mapping": _extract_mapping_form(
@@ -1090,6 +1316,7 @@ async def create_asset_export_job_by_path(
             export_fbx=str(export_fbx).lower() in {"true", "1", "yes", "on"},
             export_obj=str(export_obj).lower() in {"true", "1", "yes", "on"},
             texture_format=requested_texture_format,
+            flip_texture_y=requested_flip_texture_y,
             mapping_override=_extract_mapping_form(
                 position=position,
                 normal=normal,
@@ -1133,6 +1360,7 @@ async def convert_asset_export_csv(
     uv3: str = Form(""),
     color: str = Form(""),
     tangent: str = Form(""),
+    flip_texture_y: str = Form("false"),
 ) -> dict:
     _ensure_csv_file(csv_file.filename)
     content = await csv_file.read()
@@ -1168,6 +1396,7 @@ async def convert_asset_export_csv(
         csv_files=[csv_path],
         output_format=output_format,
         mapping=mapping,
+        flip_texture_y=str(flip_texture_y).lower() in {"true", "1", "yes", "on"},
     )
 
 
@@ -1184,6 +1413,7 @@ async def convert_asset_export_csv_by_path(
     uv3: str = Form(""),
     color: str = Form(""),
     tangent: str = Form(""),
+    flip_texture_y: str = Form("false"),
 ) -> dict:
     csv_sources, csv_files = _collect_csv_targets(csv_path, "csv_path")
     mapping = {
@@ -1208,6 +1438,7 @@ async def convert_asset_export_csv_by_path(
         csv_files=csv_files,
         output_format=output_format,
         mapping=mapping,
+        flip_texture_y=str(flip_texture_y).lower() in {"true", "1", "yes", "on"},
     )
 
 
@@ -1223,6 +1454,7 @@ async def convert_asset_export_csv_by_path_standalone(
     uv3: str = Form(""),
     color: str = Form(""),
     tangent: str = Form(""),
+    flip_texture_y: str = Form("false"),
 ) -> dict:
     csv_sources, csv_files = _collect_csv_targets(csv_path, "csv_path")
     mapping = _extract_mapping_form(
@@ -1253,6 +1485,7 @@ async def convert_asset_export_csv_by_path_standalone(
         csv_files=csv_files,
         output_format=requested_format,
         mapping=mapping,
+        flip_texture_y=str(flip_texture_y).lower() in {"true", "1", "yes", "on"},
     )
 
 
@@ -1269,6 +1502,7 @@ async def convert_asset_export_csv_standalone(
     uv3: str = Form(""),
     color: str = Form(""),
     tangent: str = Form(""),
+    flip_texture_y: str = Form("false"),
 ) -> dict:
     _ensure_csv_file(csv_file.filename)
     mapping = _extract_mapping_form(
@@ -1312,6 +1546,7 @@ async def convert_asset_export_csv_standalone(
         csv_files=[csv_path],
         output_format=requested_format,
         mapping=mapping,
+        flip_texture_y=str(flip_texture_y).lower() in {"true", "1", "yes", "on"},
     )
 
 
@@ -1420,90 +1655,6 @@ async def run_renderdoc_perf(
         raise HTTPException(status_code=500, detail=f"性能分析失败: {exc}") from exc
 
 
-
-
-@app.post("/api/visual-probe/run")
-async def run_visual_probe(
-    capture_path: str = Form(...),
-    eid: str = Form(...),
-    stage: str = Form("ps"),
-    ssim_threshold: str = Form("0.995"),
-    max_probes: str = Form("200"),
-    compile_only: str = Form("true"),
-    use_llm: str = Form("false"),
-) -> dict:
-    rdc_path = _require_existing_file(capture_path, ".rdc", "RDC 路径")
-    try:
-        eid_int = int(eid)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="EID 必须为整数")
-
-    try:
-        threshold = float(ssim_threshold)
-    except ValueError:
-        threshold = 0.995
-
-    try:
-        max_p = int(max_probes)
-    except ValueError:
-        max_p = 200
-
-    is_compile_only = compile_only.lower() in ("true", "1", "yes", "on")
-    is_use_llm = use_llm.lower() in ("true", "1", "yes", "on")
-
-    export_root = Path(str(rdc_path).rsplit(".", 1)[0] + "_RenderdocDiffExport")
-    shader_dir = export_root / "shaders"
-    glsl_source = ""
-    params_json = ""
-
-    eid_pattern = f"*{eid_int}*"
-    if shader_dir.exists():
-        for eid_dir in shader_dir.iterdir():
-            if eid_dir.is_dir() and str(eid_int) in eid_dir.name:
-                for fs in eid_dir.glob("*_fs.glsl"):
-                    glsl_source = fs.read_text(encoding="utf-8", errors="replace")
-                    break
-                for pf in eid_dir.glob("*_shader_params.json"):
-                    params_json = pf.read_text(encoding="utf-8", errors="replace")
-                    break
-                break
-
-    if not glsl_source:
-        raise HTTPException(
-            status_code=400,
-            detail=f"未找到 EID {eid_int} 的 fragment shader。请先通过资产导出功能导出 shader。",
-        )
-
-    from app.services.visual_probe_simplifier import VisualProbeSimplifier
-    from app.services.llm_shader_simplifier import LlmShaderSimplifier
-
-    llm_simp = LlmShaderSimplifier() if is_use_llm else None
-    probe = VisualProbeSimplifier(llm_simplifier=llm_simp)
-
-    output_dir = export_root / "visual_probe_sessions" / f"EID_{eid_int}"
-
-    try:
-        result = probe.run(
-            capture_path=rdc_path,
-            eid=eid_int,
-            original_glsl=glsl_source,
-            shader_params_json=params_json,
-            output_dir=output_dir,
-            stage=stage,
-            ssim_threshold=threshold,
-            max_probes=max_p,
-            compile_only=is_compile_only,
-            use_llm=is_use_llm,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"视觉探针简化失败: {exc}") from exc
-
-    return {
-        "success": True,
-        **result.to_dict(),
-        "final_source": result.final_source,
-        "static_simplified_source": result.static_simplified_source,
-    }
 
 
 if __name__ == "__main__":

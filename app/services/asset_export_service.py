@@ -59,6 +59,7 @@ class AssetExportService:
         export_fbx: bool,
         export_obj: bool,
         texture_format: str,
+        flip_texture_y: bool = False,
         mapping_override: Optional[Dict[str, str]] = None,
         isolated: bool = False,
     ) -> Dict[str, Any]:
@@ -82,6 +83,7 @@ class AssetExportService:
                     export_fbx,
                     export_obj,
                     texture_format,
+                    bool(flip_texture_y),
                     dict(mapping_override or {}),
                 ),
                 daemon=False,
@@ -116,6 +118,7 @@ class AssetExportService:
             "selected_passes": [],
             "texture_format_requested": texture_format,
             "texture_format_effective": "png" if texture_format.lower() in {"hdr", "exr"} else texture_format.lower(),
+            "flip_texture_y": bool(flip_texture_y),
             "notes": [],
             "items": [],
             "export_mapping": dict(mapping_override or {}),
@@ -359,6 +362,7 @@ class AssetExportService:
                                     base_name=f"{binding['slot_label']}_{binding['name']}",
                                     preferred_format=texture_format,
                                     notes=manifest["notes"],
+                                    flip_texture_y=flip_texture_y,
                                 )
                                 relative_texture_path = self._artifact_ref(job_dir, texture_path)
                                 exported_texture_paths[export_key] = relative_texture_path
@@ -1036,6 +1040,7 @@ result = items
         base_name: str,
         preferred_format: str,
         notes: List[str],
+        flip_texture_y: bool = False,
     ) -> Path:
         preferred = preferred_format.lower().strip() or "png"
         safe_name = self._slugify(base_name)[:80] or f"texture_{texture_id}"
@@ -1050,6 +1055,7 @@ result = items
                 safe_name=safe_name,
                 preferred=preferred,
                 notes=notes,
+                flip_texture_y=flip_texture_y,
             )
             if direct_result is not None:
                 return direct_result
@@ -1058,7 +1064,7 @@ result = items
         rc, output = self._run(["rdc", "texture", texture_id, "-o", str(png_path)])
         if rc != 0 or not png_path.exists():
             raise RuntimeError(output or f"rdc texture 失败: {texture_id}")
-        return self._postprocess_saved_texture(png_path, preferred, notes)
+        return self._postprocess_saved_texture(png_path, preferred, notes, flip_texture_y=flip_texture_y)
 
     def _save_texture_via_direct_replay(
         self,
@@ -1072,6 +1078,7 @@ result = items
         safe_name: str,
         preferred: str,
         notes: List[str],
+        flip_texture_y: bool = False,
     ) -> Optional[Path]:
         preferred_exts = ["png", "dds"] if preferred == "png" else [preferred, "png", "dds"]
         output_root = texture_dir / f"{texture_id}_{safe_name}"
@@ -1091,21 +1098,47 @@ result = items
                 continue
             if ext == "dds":
                 notes.append(f"纹理 `{texture_id}` 通过直接 replay 仅成功导出为 DDS，未能直接保存为 PNG。")
+                if flip_texture_y:
+                    notes.append(f"纹理 `{texture_id}` 为 DDS 格式，PIL 无法原地翻转，已跳过 flip_texture_y。")
                 return saved
-            return self._postprocess_saved_texture(saved, preferred, notes)
+            return self._postprocess_saved_texture(saved, preferred, notes, flip_texture_y=flip_texture_y)
         return None
 
-    def _postprocess_saved_texture(self, source_path: Path, preferred: str, notes: List[str]) -> Path:
+    def _postprocess_saved_texture(
+        self,
+        source_path: Path,
+        preferred: str,
+        notes: List[str],
+        *,
+        flip_texture_y: bool = False,
+    ) -> Path:
+        target_path = source_path
         if preferred == "png":
-            return source_path
-        if preferred == "tga" and Image is not None:
+            target_path = source_path
+        elif preferred == "tga" and Image is not None:
             target = source_path.with_suffix(".tga")
             with Image.open(source_path) as image:
                 image.save(target)
             source_path.unlink(missing_ok=True)
-            return target
-        notes.append(f"纹理 `{source_path.name}` 请求格式 `{preferred}`，当前回退为 `{source_path.suffix}`。")
-        return source_path
+            target_path = target
+        else:
+            notes.append(f"纹理 `{source_path.name}` 请求格式 `{preferred}`，当前回退为 `{source_path.suffix}`。")
+            target_path = source_path
+
+        if flip_texture_y:
+            suffix = target_path.suffix.lower()
+            if suffix in {".png", ".tga"} and Image is not None:
+                try:
+                    with Image.open(target_path) as image:
+                        flipped = image.transpose(Image.FLIP_TOP_BOTTOM)
+                        flipped.save(target_path)
+                except Exception as exc:
+                    notes.append(f"纹理 `{target_path.name}` 上下翻转失败：{exc}")
+            elif suffix == ".dds":
+                notes.append(f"纹理 `{target_path.name}` 为 DDS 格式，PIL 无法原地翻转，已跳过 flip_texture_y。")
+            elif Image is None:
+                notes.append(f"纹理 `{target_path.name}` 上下翻转失败：当前环境未安装 PIL。")
+        return target_path
 
     @staticmethod
     def resolve_output_root(job_dir: Path, capture_source_path: str, capture_name: str) -> Path:
@@ -1204,6 +1237,7 @@ def _asset_export_worker(
     export_fbx: bool,
     export_obj: bool,
     texture_format: str,
+    flip_texture_y: bool,
     mapping_override: Dict[str, str],
 ) -> None:
     try:
@@ -1222,6 +1256,7 @@ def _asset_export_worker(
             export_fbx=export_fbx,
             export_obj=export_obj,
             texture_format=texture_format,
+            flip_texture_y=flip_texture_y,
             mapping_override=mapping_override,
             isolated=False,
         )

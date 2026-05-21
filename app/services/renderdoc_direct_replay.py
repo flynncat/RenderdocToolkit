@@ -15,6 +15,12 @@ import app.config as app_config
 
 _REPLAY_LOCK = threading.Lock()
 
+# Maximum long-edge (in pixels) for the "RT + wireframe" composite PNG
+# written to ``wireframe_<eid>.png``.  Keeps the per-draw thumbnail file
+# size reasonable (~50-200 KB rather than 2-6 MB) so base64-inlined HTML
+# downloads stay manageable.  Set to ``0`` to disable resizing.
+_COMPOSITE_MAX_EDGE = 640
+
 
 class RenderdocDirectReplay:
     _STAGE_MAP = {
@@ -217,6 +223,44 @@ class RenderdocDirectReplay:
         output_path: str | Path,
         size: int = 256,
     ) -> Optional[Path]:
+        """Compatibility wrapper: writes ONLY the wireframe-overlay PNG.
+
+        Prefer :meth:`save_draw_rt_and_overlay_preview` for new callers - it
+        produces both the RT screenshot and the wireframe overlay so the
+        front-end can render them as two stacked layers (matching the
+        ``qr_replay_worker`` behaviour).
+        """
+        result = self.save_draw_rt_and_overlay_preview(
+            eid=eid,
+            rt_output_path=None,
+            overlay_output_path=output_path,
+            size=size,
+        )
+        return result.get("overlay_path") if result else None
+
+    def save_draw_rt_and_overlay_preview(
+        self,
+        *,
+        eid: str | int,
+        rt_output_path: Optional[str | Path],
+        overlay_output_path: Optional[str | Path],
+        size: int = 256,
+    ) -> Dict[str, Optional[Path]]:
+        """Save the RT screenshot and a wireframe overlay PNG for ``eid``.
+
+        Matches the per-draw output of ``external_tools/renderdoccmp/
+        qr_replay_worker.py`` so the front-end can render a "screenshot +
+        wireframe" stacked preview for every draw under the direct-replay
+        code path, instead of only the first 8 rows.
+
+        Either ``rt_output_path`` or ``overlay_output_path`` may be ``None``
+        if the caller only wants one of the two PNGs; in that case only the
+        requested side is rendered/saved.
+
+        Returns ``{"rt_path": Path|None, "overlay_path": Path|None}``.
+        Both can be ``None`` if RenderDoc couldn't bind an RT/depth target
+        for the draw.
+        """
         if self.controller is None or self.rd is None:
             raise RuntimeError("RenderDoc replay is not opened")
 
@@ -234,42 +278,119 @@ class RenderdocDirectReplay:
             if str(depth_target.resource) != "ResourceId::0":
                 target_resource = depth_target.resource
         if target_resource is None:
-            return None
+            return {"rt_path": None, "overlay_path": None}
 
-        replay_output = self.controller.CreateOutput(
-            self.rd.CreateHeadlessWindowingData(int(size), int(size)),
-            self.rd.ReplayOutputType.Texture,
-        )
-        try:
-            display = self.rd.TextureDisplay()
-            display.resourceId = target_resource
-            display.typeCast = self.rd.CompType.Typeless
-            display.overlay = self.rd.DebugOverlay.Wireframe
-            display.subresource.mip = 0
-            display.subresource.slice = 0
-            display.subresource.sample = 0
-            replay_output.SetTextureDisplay(display)
-            replay_output.Display()
+        rt_path_out: Optional[Path] = None
+        if rt_output_path is not None:
+            rt_path = Path(rt_output_path)
+            rt_save = self.rd.TextureSave()
+            rt_save.resourceId = target_resource
+            rt_save.destType = self.rd.FileType.PNG
+            rt_save.alpha = self.rd.AlphaMapping.BlendToCheckerboard
+            rt_save.mip = 0
+            rt_save.slice.sliceIndex = 0
+            rt_save.sample.sampleIndex = 0
+            rt_ok = self.controller.SaveTexture(rt_save, str(rt_path))
+            if rt_ok == self.rd.ResultCode.Succeeded and rt_path.exists():
+                rt_path_out = rt_path
 
-            overlay_id = replay_output.GetDebugOverlayTexID()
-            if str(overlay_id) == "ResourceId::0":
-                return None
+        overlay_path_out: Optional[Path] = None
+        if overlay_output_path is not None:
+            replay_output = self.controller.CreateOutput(
+                self.rd.CreateHeadlessWindowingData(int(size), int(size)),
+                self.rd.ReplayOutputType.Texture,
+            )
+            try:
+                # ---- Force-dirty trick (ported from qr_replay_worker.py)
+                # ReplayOutput::SetTextureDisplay only flips m_OverlayDirty
+                # when the overlay enum or resourceId changes.  In a perf
+                # loop where many draws share the same RT (e.g. a single
+                # default FBO) the dirty flag stays false from iter #2 on,
+                # so ``Display()`` skips the overlay refresh and every PNG
+                # after iter #0 comes back blank.  Pushing NoOverlay first
+                # then Wireframe forces the enum transition.
+                clear_disp = self.rd.TextureDisplay()
+                clear_disp.resourceId = target_resource
+                clear_disp.typeCast = self.rd.CompType.Typeless
+                clear_disp.overlay = self.rd.DebugOverlay.NoOverlay
+                clear_disp.subresource.mip = 0
+                clear_disp.subresource.slice = 0
+                clear_disp.subresource.sample = 0
+                replay_output.SetTextureDisplay(clear_disp)
 
-            output = Path(output_path)
-            save = self.rd.TextureSave()
-            save.resourceId = overlay_id
-            save.destType = self.rd.FileType.PNG
-            save.alpha = self.rd.AlphaMapping.BlendToCheckerboard
-            save.mip = 0
-            save.slice.sliceIndex = 0
-            save.sample.sampleIndex = 0
+                display = self.rd.TextureDisplay()
+                display.resourceId = target_resource
+                display.typeCast = self.rd.CompType.Typeless
+                display.overlay = self.rd.DebugOverlay.Wireframe
+                display.subresource.mip = 0
+                display.subresource.slice = 0
+                display.subresource.sample = 0
+                replay_output.SetTextureDisplay(display)
+                replay_output.Display()
 
-            result = self.controller.SaveTexture(save, str(output))
-            if result == self.rd.ResultCode.Succeeded and output.exists():
-                return output
-            return None
-        finally:
-            replay_output.Shutdown()
+                overlay_id = replay_output.GetDebugOverlayTexID()
+                if str(overlay_id) != "ResourceId::0":
+                    overlay_path = Path(overlay_output_path)
+                    save = self.rd.TextureSave()
+                    save.resourceId = overlay_id
+                    save.destType = self.rd.FileType.PNG
+                    # NOTE: ``Preserve`` (not ``BlendToCheckerboard``) so the
+                    # transparent regions stay truly transparent.  We are
+                    # about to alpha-composite this PNG on top of the RT
+                    # screenshot below, and a baked checkerboard pattern
+                    # would bleed onto the final composite.
+                    save.alpha = self.rd.AlphaMapping.Preserve
+                    save.mip = 0
+                    save.slice.sliceIndex = 0
+                    save.sample.sampleIndex = 0
+                    overlay_ok = self.controller.SaveTexture(save, str(overlay_path))
+                    if overlay_ok == self.rd.ResultCode.Succeeded and overlay_path.exists():
+                        overlay_path_out = overlay_path
+            finally:
+                replay_output.Shutdown()
+
+        # ---- Local composite: RT colour + transparent wireframe overlay
+        # → a single PNG that matches what RenderDoc Texture Viewer
+        # shows on screen.  Pure post-processing on artifacts already on
+        # disk: zero extra RenderDoc replay calls, zero extra capture
+        # time.  Overwriting ``overlay_path_out`` (the wireframe PNG)
+        # means every downstream consumer (URL field, embedded HTML
+        # report, base64-inlined download, ZIP) automatically picks up
+        # the composite without any further code changes.
+        #
+        # We downscale the composite to ``_COMPOSITE_MAX_EDGE`` px on the
+        # longest side.  RenderDoc's SaveTexture writes the RT and the
+        # overlay at native render-target resolution (e.g. 1920x1080),
+        # which compresses poorly when the RT is a full-colour frame.
+        # A 100-draw analysis at full res produces a ~500 MB
+        # base64-embedded HTML download; the same analysis at 640 px
+        # composites lands around 20-30 MB while still showing legible
+        # wireframe-over-frame previews.  RT-only callers and the
+        # depth-aware popup keep using ``rt_path_out`` which stays at
+        # native resolution.
+        if rt_path_out is not None and overlay_path_out is not None:
+            try:
+                from PIL import Image  # bundled; see requirements.txt
+                rt_img = Image.open(rt_path_out).convert("RGBA")
+                ov_img = Image.open(overlay_path_out).convert("RGBA")
+                if ov_img.size != rt_img.size:
+                    ov_img = ov_img.resize(rt_img.size, Image.BILINEAR)
+                rt_img.alpha_composite(ov_img)
+                max_edge = _COMPOSITE_MAX_EDGE
+                w, h = rt_img.size
+                long_edge = max(w, h)
+                if max_edge and long_edge > max_edge:
+                    scale = max_edge / float(long_edge)
+                    new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+                    rt_img = rt_img.resize(new_size, Image.LANCZOS)
+                rt_img.save(overlay_path_out, format="PNG", optimize=True)
+            except Exception:
+                # Best-effort: if PIL trips on a weird image we keep the
+                # original transparent-overlay PNG so the row is never
+                # blank, just falls back to the pre-composite look.
+                pass
+
+        return {"rt_path": rt_path_out, "overlay_path": overlay_path_out}
 
     def capture_original_draw(
         self,
@@ -914,15 +1035,40 @@ class RenderdocDirectReplay:
         return 0.0
 
     @staticmethod
-    def _pick_shader_target(targets: list[str]) -> str:
+    def _pick_shader_target(
+        targets: list[str],
+        *,
+        priority: tuple[str, ...] = ("glsl", "opengl"),
+    ) -> str:
         if not targets:
             return ""
         lowered = [(item, item.lower()) for item in targets]
-        for keyword in ("glsl", "opengl"):
+        for keyword in priority:
             for original, text in lowered:
                 if keyword in text:
                     return original
         return targets[0]
+
+    @staticmethod
+    def _classify_shader_target(target: str) -> str:
+        """Return a coarse family name (``glsl``/``spirv``/``msl``/``dxbc``/``hlsl``/``other``)
+        for the given disassembly target string."""
+        lowered = (target or "").lower()
+        if not lowered:
+            return "other"
+        if "spir" in lowered or "spv" in lowered:
+            return "spirv"
+        if "glsl" in lowered or "opengl" in lowered or "gles" in lowered:
+            return "glsl"
+        if "msl" in lowered or "metal" in lowered:
+            return "msl"
+        if "dxbc" in lowered:
+            return "dxbc"
+        if "dxil" in lowered:
+            return "dxil"
+        if "hlsl" in lowered:
+            return "hlsl"
+        return "other"
 
     @staticmethod
     def _build_shader_source_text(stage_key: str, payload: Dict[str, Any]) -> str:

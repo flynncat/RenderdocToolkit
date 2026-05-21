@@ -7,7 +7,7 @@ import subprocess
 from collections import defaultdict
 from multiprocessing.connection import Connection
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from app.services.perf_report_builder import PerfReportBuilder
 from app.services.perf_rule_engine import PerfRuleEngine
@@ -119,6 +119,7 @@ class RenderdocPerfService:
         draw_rows = self._extract_draw_rows(draws_payload)
         counter_map = self._extract_counter_map(counters_payload)
 
+        shader_cache: Dict[str, Dict[str, Any]] = {}
         with RenderdocDirectReplay(capture_path, renderdoc_python_path=rd_ctx.renderdoc_python_path) as replay:
             capture_info = replay.get_capture_metadata()
             texture_desc_map = replay.get_texture_description_map()
@@ -133,6 +134,7 @@ class RenderdocPerfService:
                 action_map=action_map,
                 texture_desc_map=texture_desc_map,
                 run_log_lines=run_log_lines,
+                shader_cache=shader_cache,
             )
             self._populate_initial_draw_previews(
                 replay=replay,
@@ -146,12 +148,38 @@ class RenderdocPerfService:
         pass_chart = self._build_pass_chart(rows)
         hotspot_hints = self._build_hotspot_hints(pass_chart, rows)
         warnings = self._build_warnings(capture_info)
+
+        # Direct replay used to leave ``analysis_features`` empty which made
+        # the exporter fall back to ``analysis_mode="xml_fallback"``.
+        # Surface the disassembly targets we actually ended up using so
+        # downstream tools (and humans) can tell at a glance why a given
+        # capture's instruction counts came back the way they did.
+        disassembly_targets_seen: List[str] = []
+        any_estimated = False
+        for entry in shader_cache.values():
+            tgt = self._stringify(entry.get("disassembly_target"))
+            if tgt and tgt not in disassembly_targets_seen:
+                disassembly_targets_seen.append(tgt)
+            if entry.get("estimated"):
+                any_estimated = True
+        analysis_features = {
+            "analysis_mode": "direct_replay",
+            "instruction_count_estimated": any_estimated,
+            "instruction_count_disassembly_targets": disassembly_targets_seen,
+        }
+        run_log_lines.append(
+            f"[shader] disassembly_targets={disassembly_targets_seen or '[]'} "
+            f"estimated={any_estimated}"
+        )
+
         analysis = {
             "capture_name": capture_path.name,
             "capture_path": str(capture_path),
             "capture_info": capture_info,
             "overview": overview,
             "warnings": warnings,
+            "analysis_mode": "direct_replay",
+            "analysis_features": analysis_features,
             "sort_fields": [
                 {"id": "stable_sort_score", "label": "稳定得分(估算)"},
                 {"id": "screen_coverage_percent", "label": "屏幕覆盖率(估算%)"},
@@ -294,16 +322,27 @@ class RenderdocPerfService:
         capture_path = self._resolve_capture_path(job_id, detail)
         preview_dir = self.store.job_path(job_id) / "artifacts" / "previews"
         preview_dir.mkdir(parents=True, exist_ok=True)
-        output_path = preview_dir / f"wireframe_{eid}.png"
+        rt_output_path = preview_dir / f"rt_{eid}.png"
+        wf_output_path = preview_dir / f"wireframe_{eid}.png"
 
-        if not output_path.exists():
+        # Re-render iff at least one of the two PNGs is missing - this way
+        # an on-demand request always tops up whatever the eager pass might
+        # have skipped (e.g. RT was OK but overlay came back blank).
+        if not (rt_output_path.exists() and wf_output_path.exists()):
             inputs = (detail.get("metadata") or {}).get("inputs", {})
             renderdoc_dir = self._stringify(inputs.get("renderdoc_dir_requested"))
             ctx = multiprocessing.get_context("spawn")
             parent_conn, child_conn = ctx.Pipe(duplex=False)
             process = ctx.Process(
                 target=_preview_worker_entry,
-                args=(str(capture_path), eid, str(output_path), renderdoc_dir, child_conn),
+                args=(
+                    str(capture_path),
+                    eid,
+                    str(rt_output_path),
+                    str(wf_output_path),
+                    renderdoc_dir,
+                    child_conn,
+                ),
                 daemon=False,
             )
             process.start()
@@ -316,20 +355,32 @@ class RenderdocPerfService:
             if process.exitcode not in (0, None):
                 raise RuntimeError(f"预览子进程异常退出，exit_code={process.exitcode}")
             if result and not result.get("ok"):
-                raise RuntimeError(str(result.get("error") or f"无法生成 EID {eid} 的线框预览"))
-            if not output_path.exists():
-                raise RuntimeError(f"无法生成 EID {eid} 的线框预览")
+                raise RuntimeError(str(result.get("error") or f"无法生成 EID {eid} 的预览"))
+            if not (rt_output_path.exists() or wf_output_path.exists()):
+                raise RuntimeError(f"无法生成 EID {eid} 的预览")
 
-        rel = output_path.relative_to(self.store.job_path(job_id)).as_posix()
-        url = f"/perf-session-files/{job_id}/{rel}"
+        rt_url = ""
+        if rt_output_path.exists():
+            rt_rel = rt_output_path.relative_to(self.store.job_path(job_id)).as_posix()
+            rt_url = f"/perf-session-files/{job_id}/{rt_rel}"
+        wf_url = ""
+        if wf_output_path.exists():
+            wf_rel = wf_output_path.relative_to(self.store.job_path(job_id)).as_posix()
+            wf_url = f"/perf-session-files/{job_id}/{wf_rel}"
+
+        primary_url = rt_url or wf_url
+        primary_kind = "rt_replay" if rt_url else "wireframe_overlay"
 
         analysis = detail.get("analysis") or {}
         rows = analysis.get("rows") or []
         changed = False
         for row in rows:
             if self._stringify(row.get("eid")) == self._stringify(eid):
-                row["draw_preview_url"] = url
-                row["draw_preview_kind"] = "wireframe_overlay"
+                row["draw_preview_url"] = primary_url
+                row["draw_preview_kind"] = primary_kind
+                if wf_url:
+                    row["draw_preview_overlay_url"] = wf_url
+                    row["draw_preview_overlay_kind"] = "wireframe"
                 changed = True
                 break
         if changed:
@@ -337,8 +388,10 @@ class RenderdocPerfService:
 
         return {
             "eid": self._stringify(eid),
-            "url": url,
-            "kind": "wireframe_overlay",
+            "url": primary_url,
+            "kind": primary_kind,
+            "overlay_url": wf_url,
+            "overlay_kind": "wireframe" if wf_url else "",
         }
 
     def _analyze_capture_via_xml(
@@ -623,6 +676,14 @@ class RenderdocPerfService:
             # and overlay kind ("wireframe" or "drawcall") through so the
             # frontend can stack & label it.
             if overlay_png and rt_png:
+                # PIL composite: RT colour + transparent wireframe overlay
+                # → write back to the overlay PNG so every downstream
+                # consumer (SPA, embedded HTML report table, base64
+                # inlined HTML download, ZIP) picks up the "RT + 线框"
+                # look without any further URL/field changes.  Mirrors
+                # the post-processing in
+                # ``RenderdocDirectReplay.save_draw_rt_and_overlay_preview``.
+                self._composite_qr_replay_preview(qr_out / rt_png, qr_out / overlay_png)
                 row["draw_preview_overlay_url"] = f"{base_url}/{overlay_png}"
                 row["draw_preview_overlay_kind"] = overlay_kind or "wireframe"
 
@@ -673,9 +734,11 @@ class RenderdocPerfService:
         action_map: Dict[str, Dict[str, Any]],
         texture_desc_map: Dict[str, Dict[str, Any]],
         run_log_lines: List[str],
+        shader_cache: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
-        shader_cache: Dict[str, Dict[str, Any]] = {}
+        if shader_cache is None:
+            shader_cache = {}
 
         for draw in draw_rows:
             eid = self._stringify(draw.get("eid"))
@@ -698,7 +761,8 @@ class RenderdocPerfService:
             )
 
             pass_name = self._stringify(metadata.get("pass_name")) or self._stringify(draw.get("marker")) or f"EID {eid}"
-            scene_pass = self._normalize_scene_pass_name(self._stringify(metadata.get("scene_pass")))
+            scene_pass_from_marker = self._normalize_scene_pass_name(self._stringify(metadata.get("scene_pass")))
+            scene_pass_source = self._stringify(metadata.get("scene_pass_source"))
             triangle_count = int(draw.get("triangles") or 0)
             instances = int(draw.get("instances") or 0)
             ps_invocations = int(counters.get("PS Invocations", 0))
@@ -716,9 +780,62 @@ class RenderdocPerfService:
                 (float(instruction_total) if instruction_total > 0 else float(ps_invocations)) * coverage_ratio,
                 6,
             )
+
+            # Render-state heuristic: classify every draw so captures
+            # without debug markers (Cocos / Unity / in-house) still get a
+            # meaningful ``scene_pass`` instead of "Other".
+            try:
+                state_info = self._classify_pass_from_state(
+                    replay=replay,
+                    pipe=pipe,
+                    draw=draw,
+                    target_metrics=target_metrics,
+                    screen_coverage_percent=coverage_percent,
+                    triangle_count=triangle_count,
+                )
+            except Exception as exc:
+                run_log_lines.append(f"[pass-state] eid={eid} FAILED: {exc}")
+                state_info = {"pass_kind": "Other"}
+            inferred_pass_kind = self._stringify(state_info.get("pass_kind")) or "Other"
+
+            # Pick the final scene_pass.  Order:
+            #   1. marker-derived (only if it matched a known keyword)
+            #   2. render-state heuristic
+            #   3. outermost breadcrumb (raw engine name, last-resort fallback)
+            #   4. "Other"
+            marker_was_known = bool(
+                scene_pass_from_marker
+                and scene_pass_from_marker
+                in {label for _, label in self._SCENE_PASS_KEYWORDS}
+            )
+            if marker_was_known:
+                scene_pass = scene_pass_from_marker
+                scene_pass_decided_by = "marker"
+            elif inferred_pass_kind and inferred_pass_kind != "Other":
+                scene_pass = inferred_pass_kind
+                scene_pass_decided_by = "render_state"
+            elif scene_pass_from_marker:
+                scene_pass = scene_pass_from_marker
+                scene_pass_decided_by = "marker_raw"
+            else:
+                scene_pass = "Other"
+                scene_pass_decided_by = "fallback"
+
             row = {
                 "eid": eid,
                 "scene_pass": scene_pass or "Other",
+                "scene_pass_decided_by": scene_pass_decided_by,
+                "inferred_pass_kind": inferred_pass_kind,
+                "marker_scene_pass": scene_pass_from_marker,
+                "marker_scene_pass_source": scene_pass_source,
+                "render_state": {
+                    "blend_enable": bool(state_info.get("blend_enable")),
+                    "color_write_mask": int(state_info.get("color_write_mask") or 0),
+                    "depth_test": bool(state_info.get("depth_test")),
+                    "depth_write": bool(state_info.get("depth_write")),
+                    "cull_mode": self._stringify(state_info.get("cull_mode")),
+                    "blend_summary": self._stringify(state_info.get("blend_summary")),
+                },
                 "pass_name": pass_name,
                 "selection_label": f"EID {eid} | {pass_name}",
                 "breadcrumbs": metadata.get("breadcrumbs") or [],
@@ -744,6 +861,8 @@ class RenderdocPerfService:
                 "stable_sort_basis": stable_sort_basis,
                 "draw_preview_url": "",
                 "draw_preview_kind": "wireframe_overlay_pending",
+                "draw_preview_overlay_url": "",
+                "draw_preview_overlay_kind": "",
                 "texture_count": int(texture_summary.get("texture_count", 0)),
                 "texture_total_bytes": int(texture_summary.get("total_bytes", 0)),
                 "texture_total_mb": round(float(texture_summary.get("total_bytes", 0)) / (1024.0 * 1024.0), 3),
@@ -773,6 +892,49 @@ class RenderdocPerfService:
         )
         return rows
 
+    # Cap for the eager direct-replay preview pass.  Captures with thousands
+    # of draws (e.g. UE mobile open-world) would otherwise generate
+    # thousands of PNGs synchronously and bloat analysis time.  Any draw
+    # beyond this cap keeps its ``wireframe_overlay_pending`` placeholder
+    # and is generated on-demand via :meth:`generate_draw_preview`.
+    _DIRECT_PREVIEW_HARD_CAP = 500
+
+    # Maximum long-edge (px) for the "RT + wireframe" composite produced
+    # by ``_composite_qr_replay_preview``.  Kept in sync with
+    # ``renderdoc_direct_replay._COMPOSITE_MAX_EDGE`` so SPA, direct
+    # replay and xml_fallback paths all emit similarly-sized PNGs.
+    _COMPOSITE_MAX_EDGE = 640
+
+    @classmethod
+    def _composite_qr_replay_preview(
+        cls, rt_path: Path, overlay_path: Path
+    ) -> None:
+        """In-place: take the RT screenshot and the transparent wireframe
+        overlay produced by ``qr_replay_worker.py`` and overwrite the
+        wireframe PNG with a baked "RT + wireframe" composite.  Best
+        effort - any PIL error leaves the original PNGs untouched so
+        the row never goes blank.
+        """
+        if not (rt_path.exists() and overlay_path.exists()):
+            return
+        try:
+            from PIL import Image
+            rt_img = Image.open(rt_path).convert("RGBA")
+            ov_img = Image.open(overlay_path).convert("RGBA")
+            if ov_img.size != rt_img.size:
+                ov_img = ov_img.resize(rt_img.size, Image.BILINEAR)
+            rt_img.alpha_composite(ov_img)
+            max_edge = cls._COMPOSITE_MAX_EDGE
+            w, h = rt_img.size
+            long_edge = max(w, h)
+            if max_edge and long_edge > max_edge:
+                scale = max_edge / float(long_edge)
+                new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+                rt_img = rt_img.resize(new_size, Image.LANCZOS)
+            rt_img.save(overlay_path, format="PNG", optimize=True)
+        except Exception:
+            return
+
     def _populate_initial_draw_previews(
         self,
         *,
@@ -781,70 +943,135 @@ class RenderdocPerfService:
         preview_dir: Path,
         rows: List[Dict[str, Any]],
         run_log_lines: List[str],
-        limit: int = 8,
+        limit: Optional[int] = None,
     ) -> None:
-        for row in rows[:limit]:
+        # "应有尽有": match the qrenderdoc worker behaviour and emit both an
+        # RT screenshot and a wireframe overlay PNG for every draw, up to a
+        # safety cap so very large captures don't grind the analysis to a
+        # halt.
+        if limit is None:
+            effective_limit = min(len(rows), self._DIRECT_PREVIEW_HARD_CAP)
+        else:
+            effective_limit = max(0, min(int(limit), len(rows)))
+        saved_count = 0
+        skipped_count = 0
+        for row in rows[:effective_limit]:
             eid = self._stringify(row.get("eid"))
             if not eid:
                 continue
-            output_path = preview_dir / f"wireframe_{eid}.png"
-            saved = replay.save_draw_wireframe_preview(
-                eid=eid,
-                output_path=output_path,
-            )
-            if saved is None or not saved.exists():
+            rt_path = preview_dir / f"rt_{eid}.png"
+            wf_path = preview_dir / f"wireframe_{eid}.png"
+            try:
+                result = replay.save_draw_rt_and_overlay_preview(
+                    eid=eid,
+                    rt_output_path=rt_path,
+                    overlay_output_path=wf_path,
+                )
+            except Exception as exc:
+                run_log_lines.append(f"[preview] eid={eid} FAILED: {exc}")
+                skipped_count += 1
                 continue
-            rel = saved.relative_to(self.store.job_path(job_id)).as_posix()
-            row["draw_preview_url"] = f"/perf-session-files/{job_id}/{rel}"
-            row["draw_preview_kind"] = "wireframe_overlay"
-            run_log_lines.append(f"[wireframe] eid={eid} saved={row['draw_preview_url']}")
+            rt_saved = result.get("rt_path")
+            overlay_saved = result.get("overlay_path")
+            if rt_saved is not None and rt_saved.exists():
+                rt_rel = rt_saved.relative_to(self.store.job_path(job_id)).as_posix()
+                row["draw_preview_url"] = f"/perf-session-files/{job_id}/{rt_rel}"
+                row["draw_preview_kind"] = "rt_replay"
+            if overlay_saved is not None and overlay_saved.exists():
+                wf_rel = overlay_saved.relative_to(self.store.job_path(job_id)).as_posix()
+                row["draw_preview_overlay_url"] = f"/perf-session-files/{job_id}/{wf_rel}"
+                row["draw_preview_overlay_kind"] = "wireframe"
+                # Fallback: if RT capture failed for some reason we still
+                # surface the overlay so the row is not blank.
+                if not row.get("draw_preview_url"):
+                    row["draw_preview_url"] = row["draw_preview_overlay_url"]
+                    row["draw_preview_kind"] = "wireframe_overlay"
+            if rt_saved is None and overlay_saved is None:
+                skipped_count += 1
+            else:
+                saved_count += 1
+        run_log_lines.append(
+            f"[preview] direct_replay saved={saved_count} skipped={skipped_count} "
+            f"cap={effective_limit}/{len(rows)} (hard_cap={self._DIRECT_PREVIEW_HARD_CAP})"
+        )
 
     def _collect_action_map(self, replay: RenderdocDirectReplay) -> Dict[str, Dict[str, Any]]:
+        """Walk the RenderDoc action tree and collect breadcrumbs + best-guess
+        pass labels for every event.
+
+        Earlier this code hard-required a ``customName == "MobileSceneRender"``
+        node at the top of the tree to populate ``scene_pass``; this only
+        worked for Unreal Engine 4/5 Mobile captures.  Captures from other
+        engines (Unity, Cocos, in-house engines) usually never have that
+        marker - or any debug markers at all - so every draw came back as
+        ``scene_pass=Other`` and ``pass_name=EID xxx``.
+
+        The new logic is engine-agnostic:
+
+        * ``breadcrumbs`` = full ancestor ``customName`` chain (most outer
+          first).  Empty names are skipped.
+        * ``pass_name`` = nearest non-empty ancestor name, or the outermost
+          one if the nearest is the same as a known UE root.  This is what
+          we display in the row's ``pass_name`` column.
+        * ``scene_pass`` = the **outermost recognisable group name** in the
+          breadcrumbs (e.g. an Unreal ``MobileBasePass`` at depth 1, or any
+          group name returned by `_normalize_scene_pass_name`).  This is
+          what aggregations (pass chart, R005/R006 rules) key on.
+        * ``scene_pass_source`` = ``"marker"`` when we found a name in
+          breadcrumbs, otherwise ``""`` so the caller can fall back to the
+          render-state heuristic.
+        """
         result: Dict[str, Dict[str, Any]] = {}
 
-        def walk(
-            actions: Iterable[Any],
-            ancestors: List[str],
-            *,
-            inside_mobile: bool,
-            mobile_pass: str,
-            parent_is_mobile_root: bool,
-        ) -> None:
+        def walk(actions: Iterable[Any], ancestors: List[str]) -> None:
             for action in actions:
                 name = self._stringify(getattr(action, "customName", ""))
                 named_ancestors = ancestors + ([name] if name else [])
-                current_inside_mobile = inside_mobile or name == "MobileSceneRender"
-                current_mobile_pass = mobile_pass
-                if parent_is_mobile_root and name:
-                    current_mobile_pass = name
                 event_id = self._stringify(getattr(action, "eventId", ""))
                 if event_id:
                     nearest_name = named_ancestors[-1] if named_ancestors else ""
-                    if current_inside_mobile and nearest_name == "MobileSceneRender":
-                        nearest_name = ""
+                    # Walk from outer to inner and pick the first crumb that
+                    # _normalize_scene_pass_name() recognises as a pass.  If
+                    # nothing matches, leave scene_pass empty so the state
+                    # heuristic can take over.
+                    scene_pass = ""
+                    for crumb in named_ancestors:
+                        normalised = self._normalize_scene_pass_name(crumb)
+                        if normalised and normalised != crumb:
+                            # Real match against a known keyword.
+                            scene_pass = normalised
+                            break
+                    if not scene_pass and named_ancestors:
+                        # No known-keyword hit, but the engine *did* leave a
+                        # marker.  Use the outermost as a fallback so users
+                        # see *something* meaningful instead of "Other".
+                        scene_pass = self._normalize_scene_pass_name(named_ancestors[0]) or named_ancestors[0]
                     result[event_id] = {
                         "pass_name": nearest_name,
-                        "scene_pass": current_mobile_pass,
+                        "scene_pass": scene_pass,
+                        "scene_pass_source": "marker" if scene_pass else "",
                         "breadcrumbs": named_ancestors,
                     }
-                walk(
-                    getattr(action, "children", []),
-                    named_ancestors,
-                    inside_mobile=current_inside_mobile,
-                    mobile_pass=current_mobile_pass,
-                    parent_is_mobile_root=name == "MobileSceneRender",
-                )
+                walk(getattr(action, "children", []), named_ancestors)
 
-        walk(replay.controller.GetRootActions(), [], inside_mobile=False, mobile_pass="", parent_is_mobile_root=False)
+        walk(replay.controller.GetRootActions(), [])
         return result
 
     def _get_shader_metrics(self, replay: RenderdocDirectReplay, pipe: Any, shader_cache: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-        metrics = {
+        metrics: Dict[str, Any] = {
             "vs_instruction_count": 0,
             "ps_instruction_count": 0,
             "instruction_total": 0,
             "shader_ids": {},
+            "disassembly_targets": {},
+            "instruction_count_estimated": False,
         }
+        try:
+            available_targets_raw = list(replay.controller.GetDisassemblyTargets(True))
+        except Exception:
+            available_targets_raw = []
+        available_targets = [self._stringify(item) for item in available_targets_raw if self._stringify(item)]
+
         pipeline_object = pipe.GetGraphicsPipelineObject()
         for stage_name, stage_enum in (("vs", replay.rd.ShaderStage.Vertex), ("ps", replay.rd.ShaderStage.Pixel)):
             shader_id = str(pipe.GetShader(stage_enum))
@@ -853,16 +1080,86 @@ class RenderdocPerfService:
                 continue
             if shader_id not in shader_cache:
                 refl = pipe.GetShaderReflection(stage_enum)
-                count = 0
-                try:
-                    disassembly = replay.controller.DisassembleShader(pipeline_object, refl, "DXBC")
-                    count = self._count_shader_instructions(disassembly)
-                except Exception:
-                    count = 0
-                shader_cache[shader_id] = {"instruction_count": count}
-            metrics[f"{stage_name}_instruction_count"] = int(shader_cache[shader_id]["instruction_count"])
+                count, used_target, estimated = self._disassemble_and_count_instructions(
+                    replay=replay,
+                    pipeline_object=pipeline_object,
+                    refl=refl,
+                    available_targets=available_targets,
+                )
+                shader_cache[shader_id] = {
+                    "instruction_count": count,
+                    "disassembly_target": used_target,
+                    "estimated": estimated,
+                }
+            cache_entry = shader_cache[shader_id]
+            metrics[f"{stage_name}_instruction_count"] = int(cache_entry["instruction_count"])
+            metrics["disassembly_targets"][stage_name] = cache_entry.get("disassembly_target", "")
+            if cache_entry.get("estimated"):
+                metrics["instruction_count_estimated"] = True
         metrics["instruction_total"] = metrics["vs_instruction_count"] + metrics["ps_instruction_count"]
         return metrics
+
+    def _disassemble_and_count_instructions(
+        self,
+        *,
+        replay: RenderdocDirectReplay,
+        pipeline_object: Any,
+        refl: Any,
+        available_targets: List[str],
+    ) -> Tuple[int, str, bool]:
+        """Try several disassembly targets in order of fidelity for instruction
+        counting and return ``(count, used_target, estimated)``.
+
+        Earlier the perf path hard-coded ``"DXBC"`` which threw on every
+        GLES/Vulkan capture (e.g. the user's ``DZ_ZMXT-frame71704.rdc``),
+        making the three instruction-count fields silently zero.  We now
+        walk a prioritised list of targets and apply a format-appropriate
+        counting heuristic to each, falling back to a conservative
+        line-count estimate so the result is rarely zero in practice.
+        """
+        if not available_targets:
+            return 0, "", False
+
+        priority_order = ("dxbc", "dxil", "hlsl", "glsl", "opengl", "gles", "spir", "msl", "metal")
+        seen: set[str] = set()
+        ordered: List[str] = []
+        for keyword in priority_order:
+            for target in available_targets:
+                if keyword in target.lower() and target not in seen:
+                    ordered.append(target)
+                    seen.add(target)
+        # Then anything left over so we always try every published target.
+        for target in available_targets:
+            if target not in seen:
+                ordered.append(target)
+                seen.add(target)
+
+        last_disassembly = ""
+        last_target = ""
+        for target in ordered:
+            try:
+                disassembly = replay.controller.DisassembleShader(pipeline_object, refl, target)
+            except Exception:
+                continue
+            if not disassembly:
+                continue
+            last_disassembly = disassembly
+            last_target = target
+            family = replay._classify_shader_target(target)  # type: ignore[attr-defined]
+            count = self._count_shader_instructions(disassembly, family=family)
+            if count > 0:
+                return count, target, False
+
+        # Final fallback: use the most recent disassembly that came back
+        # but apply a conservative 0.6 multiplier to raw line count.  This
+        # at least keeps the metric non-zero so downstream rules can fire,
+        # and we flag it as estimated.
+        if last_disassembly:
+            raw_lines = sum(1 for ln in last_disassembly.splitlines() if ln.strip())
+            est = int(raw_lines * 0.6)
+            return max(est, 0), last_target, True
+
+        return 0, "", False
 
     def _get_texture_summary(
         self,
@@ -900,6 +1197,173 @@ class RenderdocPerfService:
             "total_bytes": total_bytes,
             "items": items[:6],
         }
+
+    @staticmethod
+    def _render_state_enum_name(value: Any, rd_module: Any, enum_name: str) -> str:
+        """Best-effort conversion of a RenderDoc pipeline-state enum to a
+        lowercase symbolic name.
+
+        The Python bindings expose enums as classes on the ``rd`` module
+        (``rd.BlendMultiplier``, ``rd.BlendOperation``, ...).  Calling
+        ``str(enum_value)`` typically returns the **integer** form, which
+        is useless for substring matching.  We try, in order:
+
+          1. ``value.name`` (works for some bindings)
+          2. ``rd.<EnumClass>(value).name`` (works on most pybind11 builds)
+          3. ``str(value)`` (fallback)
+        """
+        if value is None:
+            return ""
+        name = getattr(value, "name", None)
+        if isinstance(name, str) and name:
+            return name.lower()
+        enum_cls = getattr(rd_module, enum_name, None)
+        if enum_cls is not None:
+            try:
+                wrapped = enum_cls(int(value))
+                wrapped_name = getattr(wrapped, "name", None)
+                if isinstance(wrapped_name, str) and wrapped_name:
+                    return wrapped_name.lower()
+            except Exception:
+                pass
+        return str(value).lower()
+
+    def _classify_pass_from_state(
+        self,
+        *,
+        replay: RenderdocDirectReplay,
+        pipe: Any,
+        draw: Mapping[str, Any],
+        target_metrics: Mapping[str, Any],
+        screen_coverage_percent: float,
+        triangle_count: int,
+    ) -> Dict[str, Any]:
+        """Infer a ``pass_kind`` from pipeline render state.
+
+        This is the fallback when the capture has no useful debug markers
+        (e.g. Cocos / Unity / in-house engines that don't call
+        ``glPushDebugGroup``).  We classify each draw into one of:
+
+          DepthOnly | Shadow | Translucent | Additive | PostProcess |
+          Sky | UI | Opaque | Other
+
+        The decision is driven by colour write mask, blend equation,
+        depth state, viewport coverage, and draw topology.  All three
+        ingredients - state + coverage + triangle count - are also
+        surfaced verbatim on the row so a human can sanity-check the
+        classifier or filter the perf table by hand.
+        """
+        rd = replay.rd
+        info: Dict[str, Any] = {
+            "blend_enable": False,
+            "color_write_mask": 0xF,
+            "depth_test": False,
+            "depth_write": False,
+            "cull_mode": "",
+            "blend_summary": "",
+            "pass_kind": "Other",
+        }
+
+        # Colour blend / write mask (one entry per render target).
+        try:
+            blends = list(pipe.GetColorBlends() or [])
+        except Exception:
+            try:
+                blends = list(pipe.GetColorBlendStates() or [])  # older API
+            except Exception:
+                blends = []
+        first_blend = blends[0] if blends else None
+        if first_blend is not None:
+            info["blend_enable"] = bool(getattr(first_blend, "enabled", False))
+            mask = int(getattr(first_blend, "writeMask", 0xF) or 0)
+            info["color_write_mask"] = mask
+            color_blend = getattr(first_blend, "colorBlend", None)
+            src = self._render_state_enum_name(getattr(color_blend, "source", None), rd, "BlendMultiplier")
+            dst = self._render_state_enum_name(getattr(color_blend, "destination", None), rd, "BlendMultiplier")
+            op = self._render_state_enum_name(getattr(color_blend, "operation", None), rd, "BlendOperation")
+            # Only surface the blend equation when the stage is actually
+            # enabled.  When blend is off the API still returns the cached
+            # state-machine defaults, which would otherwise mislead users
+            # looking at the tooltip.
+            if info["blend_enable"] and (src or dst or op):
+                info["blend_summary"] = f"{src}|{dst}|{op}"
+
+        # Depth state.
+        try:
+            depth = pipe.GetDepthState() if hasattr(pipe, "GetDepthState") else None
+        except Exception:
+            depth = None
+        if depth is None:
+            try:
+                depth = pipe.GetDepthStencilState()
+            except Exception:
+                depth = None
+        if depth is not None:
+            info["depth_test"] = bool(getattr(depth, "depthEnable", False) or getattr(depth, "enabled", False))
+            info["depth_write"] = bool(getattr(depth, "depthWrites", False) or getattr(depth, "writeEnable", False))
+
+        # Rasterizer / cull mode.
+        try:
+            raster = pipe.GetRasterizer() if hasattr(pipe, "GetRasterizer") else None
+            if raster is None and hasattr(pipe, "GetRasterizerState"):
+                raster = pipe.GetRasterizerState()
+            if raster is not None:
+                info["cull_mode"] = self._stringify(getattr(raster, "cullMode", ""))
+        except Exception:
+            pass
+
+        # Heuristic decision tree (most specific → most general).
+        blend_summary = info["blend_summary"]
+        color_off = (info["color_write_mask"] & 0xF) == 0
+        depth_only = color_off and info["depth_write"]
+        target_width = int(target_metrics.get("target_width") or 0)
+        target_height = int(target_metrics.get("target_height") or 0)
+        target_area = target_width * target_height
+        is_small_rt = target_area > 0 and target_area < 1280 * 720
+        is_fullscreen_geometry = triangle_count <= 2 and screen_coverage_percent >= 70.0
+
+        # Treat blend names like ``srcalpha``, ``src_alpha``, ``invsrcalpha``,
+        # ``inv_src_alpha``, ``oneminussrcalpha`` etc. as the canonical alpha
+        # blend.  Strip the divider characters so we can use simple substring
+        # checks instead of cataloguing every variant.
+        bs_clean = blend_summary.replace("_", "").replace(" ", "")
+        is_alpha_blend = (
+            ("srcalpha" in bs_clean and ("invsrcalpha" in bs_clean or "oneminussrcalpha" in bs_clean))
+            or "premultiplied" in bs_clean
+        )
+        is_additive = "one|one" in blend_summary or "one|one|add" in bs_clean
+        is_multiplicative = "dstcolor" in bs_clean or "destcolor" in bs_clean
+
+        pass_kind = "Other"
+        if depth_only:
+            pass_kind = "Shadow" if is_small_rt else "DepthOnly"
+        elif info["blend_enable"] and is_additive:
+            pass_kind = "Additive"
+        elif info["blend_enable"] and is_alpha_blend:
+            if is_fullscreen_geometry:
+                pass_kind = "PostProcess"
+            elif is_small_rt:
+                pass_kind = "UI"
+            else:
+                pass_kind = "Translucent"
+        elif info["blend_enable"] and is_multiplicative:
+            pass_kind = "Translucent"
+        elif info["blend_enable"]:
+            # Some other blend - still treat as translucent-ish but flag.
+            pass_kind = "Translucent" if not is_fullscreen_geometry else "PostProcess"
+        elif is_fullscreen_geometry and not info["depth_test"]:
+            pass_kind = "Sky" if info["depth_write"] is False else "PostProcess"
+        elif is_fullscreen_geometry:
+            pass_kind = "PostProcess"
+        elif info["depth_write"] and not color_off:
+            pass_kind = "Opaque"
+        elif not info["depth_write"] and not color_off and not info["blend_enable"]:
+            # Opaque-style draw that doesn't write depth (e.g. some emissive
+            # or decal passes).  Still much more informative than "Other".
+            pass_kind = "Opaque"
+
+        info["pass_kind"] = pass_kind
+        return info
 
     @staticmethod
     def _get_draw_target_metrics(
@@ -1096,23 +1560,131 @@ class RenderdocPerfService:
         return dict(result)
 
     @staticmethod
-    def _count_shader_instructions(disassembly: str) -> int:
-        return sum(1 for line in (disassembly or "").splitlines() if re.match(r"^\s*\d+:", line))
+    def _count_shader_instructions(disassembly: str, *, family: str = "dxbc") -> int:
+        """Count shader instructions in ``disassembly`` using a heuristic
+        tailored to the target ``family``.
 
-    @staticmethod
-    def _normalize_scene_pass_name(name: str) -> str:
+        The intent is not to match a specific compiler's instruction count
+        byte-for-byte but to give a stable proxy that scales with shader
+        complexity so the perf rules can rank draws sensibly across very
+        different graphics APIs.
+        """
+        text = disassembly or ""
+        if not text:
+            return 0
+        lines = text.splitlines()
+        family_norm = (family or "").lower()
+        if family_norm in ("dxbc", "dxil"):
+            return sum(1 for line in lines if re.match(r"^\s*\d+:", line))
+        if family_norm == "spirv":
+            return sum(
+                1
+                for line in lines
+                if re.match(r"^\s*%\w+\s*=", line) or re.match(r"^\s*Op[A-Z]", line)
+            )
+        if family_norm in ("glsl", "hlsl", "msl"):
+            count = 0
+            in_block_comment = False
+            for raw in lines:
+                line = raw.strip()
+                if not line:
+                    continue
+                if in_block_comment:
+                    if "*/" in line:
+                        in_block_comment = False
+                    continue
+                if line.startswith("/*"):
+                    if "*/" not in line:
+                        in_block_comment = True
+                    continue
+                if line.startswith("//") or line.startswith("#"):
+                    continue
+                if line in ("{", "}", "};"):
+                    continue
+                # Skip pure declarations / qualifiers / function signatures
+                # but keep statements that look like work (assignment, call,
+                # control flow).
+                if line.endswith("{") and "(" not in line:
+                    continue
+                count += 1
+            return count
+        # Generic fallback: any non-empty, non-comment line.
+        count = 0
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith(("//", "#", ";")):
+                continue
+            count += 1
+        return count
+
+    # Known pass-name keywords mapped to a canonical label.  The mapping is
+    # intentionally broad so we recognise debug markers across UE, Unity,
+    # Cocos, and custom engines.  Order matters: more specific keywords
+    # (e.g. "mobilebasepass") must come before more generic ones
+    # (e.g. "basepass") to win the substring match.
+    _SCENE_PASS_KEYWORDS: List[Tuple[str, str]] = [
+        # Unreal Engine 4/5 Mobile
+        ("shadowdepths", "ShadowDepths"),
+        ("mobilerenderprepass", "MobileRenderPrePass"),
+        ("mobilebasepass", "MobileBasePass"),
+        ("postprocessing", "PostProcessing"),
+        ("translucency", "Translucency"),
+        # Generic / Unity / Cocos / in-house
+        ("prepass", "PrePass"),
+        ("gbuffer", "GBuffer"),
+        ("basepass", "BasePass"),
+        ("depthonly", "DepthOnly"),
+        ("shadow", "Shadow"),
+        ("velocity", "Velocity"),
+        ("decal", "Decal"),
+        ("lighting", "Lighting"),
+        ("ssao", "SSAO"),
+        ("ssr", "SSR"),
+        ("reflection", "Reflection"),
+        ("refraction", "Refraction"),
+        ("transparent", "Translucent"),
+        ("translucent", "Translucent"),
+        ("additive", "Translucent"),
+        ("alphablend", "Translucent"),
+        ("alpha-blend", "Translucent"),
+        ("alpha_blend", "Translucent"),
+        ("sky", "Sky"),
+        ("skybox", "Sky"),
+        ("tonemap", "PostProcess"),
+        ("bloom", "PostProcess"),
+        ("fxaa", "PostProcess"),
+        ("taa", "PostProcess"),
+        ("smaa", "PostProcess"),
+        ("dof", "PostProcess"),
+        ("postprocess", "PostProcess"),
+        ("post-process", "PostProcess"),
+        ("post_process", "PostProcess"),
+        ("blit", "Blit"),
+        ("copy", "Copy"),
+        ("resolve", "Resolve"),
+        ("clear", "Clear"),
+        ("ui", "UI"),
+        ("hud", "UI"),
+        ("widget", "UI"),
+        ("imgui", "UI"),
+        ("particle", "Particle"),
+        ("fluid", "Particle"),
+        ("water", "Water"),
+        ("foliage", "Foliage"),
+        ("opaque", "Opaque"),
+        ("emissive", "Emissive"),
+        ("outline", "Outline"),
+        ("edge", "Outline"),
+        ("stencil", "Stencil"),
+    ]
+
+    @classmethod
+    def _normalize_scene_pass_name(cls, name: str) -> str:
         text = (name or "").strip()
         if not text:
             return ""
         lowers = text.lower()
-        known = {
-            "shadowdepths": "ShadowDepths",
-            "mobilerenderprepass": "MobileRenderPrePass",
-            "mobilebasepass": "MobileBasePass",
-            "translucency": "Translucency",
-            "postprocessing": "PostProcessing",
-        }
-        for key, value in known.items():
+        for key, value in cls._SCENE_PASS_KEYWORDS:
             if key in lowers:
                 return value
         return text
@@ -1161,16 +1733,29 @@ def _perf_worker_entry(session_root: str, job_id: str, capture_path: str, conn: 
         conn.close()
 
 
-def _preview_worker_entry(capture_path: str, eid: str, output_path: str, renderdoc_dir: str, conn: Connection) -> None:
+def _preview_worker_entry(
+    capture_path: str,
+    eid: str,
+    rt_output_path: str,
+    wf_output_path: str,
+    renderdoc_dir: str,
+    conn: Connection,
+) -> None:
     try:
         from app.services.renderdoc_runtime_resolver import resolve_renderdoc_runtime
         rd_ctx = resolve_renderdoc_runtime(renderdoc_dir)
         with RenderdocDirectReplay(capture_path, renderdoc_python_path=rd_ctx.renderdoc_python_path) as replay:
-            saved = replay.save_draw_wireframe_preview(eid=eid, output_path=output_path)
-        if saved is None or not Path(saved).exists():
-            conn.send({"ok": False, "error": f"无法生成 EID {eid} 的线框预览"})
+            result = replay.save_draw_rt_and_overlay_preview(
+                eid=eid,
+                rt_output_path=rt_output_path,
+                overlay_output_path=wf_output_path,
+            )
+        rt_ok = bool(result.get("rt_path") and Path(result["rt_path"]).exists())
+        overlay_ok = bool(result.get("overlay_path") and Path(result["overlay_path"]).exists())
+        if not rt_ok and not overlay_ok:
+            conn.send({"ok": False, "error": f"无法生成 EID {eid} 的预览"})
         else:
-            conn.send({"ok": True})
+            conn.send({"ok": True, "rt": rt_ok, "overlay": overlay_ok})
     except Exception as exc:
         conn.send({"ok": False, "error": str(exc)})
     finally:

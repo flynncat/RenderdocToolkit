@@ -24,7 +24,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
-from app.services.perf_recommendation_templates import get_template
 from app.services.perf_rule_engine import Finding
 
 
@@ -155,7 +154,7 @@ class PerfReportBuilder:
             for idx, finding in enumerate(findings, start=1):
                 sev = finding.get("severity", "low")
                 category = finding.get("category", "")
-                title = finding.get("title") or get_template(finding.get("rule_id", "")).get("title", "")
+                title = finding.get("title") or finding.get("rule_id", "")
                 affected = finding.get("affected") or []
                 anchor = finding.get("report_anchor") or ""
                 one_line = self._one_line_summary(finding)
@@ -225,15 +224,24 @@ class PerfReportBuilder:
                 )
                 lines.append("")
                 lines.append(
-                    "| EID | Scene Pass | Pass | GPU ms | PS 调用 | 三角面 | 贴图 MB | 覆盖% | 稳定得分 |"
+                    "| EID | 渲染分类 | 来源 | Pass marker | GPU ms | PS 调用 | 三角面 | 贴图 MB | 覆盖% | 稳定得分 |"
                 )
-                lines.append("|---|---|---|---|---|---|---|---|---|")
+                lines.append("|---|---|---|---|---|---|---|---|---|---|")
                 for row in top:
                     eid = _stringify(row.get("eid"))
                     eid_link = f"[EID {eid}](#perf-row-{eid})" if eid else "-"
+                    decided_by = _stringify(row.get("scene_pass_decided_by")) or "-"
+                    source_label = {
+                        "marker": "marker",
+                        "marker_raw": "marker(raw)",
+                        "render_state": "状态推断",
+                        "fallback": "未识别",
+                        "-": "-",
+                    }.get(decided_by, decided_by)
                     lines.append(
                         f"| {eid_link} "
                         f"| {_md_inline(row.get('scene_pass'))} "
+                        f"| {source_label} "
                         f"| {_md_inline(row.get('pass_name'))} "
                         f"| {float(row.get('gpu_duration_ms') or 0.0):.3f} "
                         f"| {int(row.get('ps_invocations') or 0):,} "
@@ -254,10 +262,9 @@ class PerfReportBuilder:
         capture_name: str,
     ) -> List[str]:
         rule_id = finding.get("rule_id", "")
-        template = get_template(rule_id)
         anchor = finding.get("report_anchor") or ""
         sev = finding.get("severity", "low")
-        title = finding.get("title") or template.get("title", rule_id)
+        title = finding.get("title") or rule_id
         affected = finding.get("affected") or []
         evidence = finding.get("evidence") or {}
 
@@ -271,32 +278,10 @@ class PerfReportBuilder:
         block.append(f"- **规则**: `{rule_id}` · **类别**: `{finding.get('category', '')}` · **作用域**: `{finding.get('scope', '')}`")
         block.append(f"- **定位**: {self._affected_link(affected, capture_name, max_n=8)}")
 
-        # Evidence as a small key/value table for readability.
         if evidence:
             block.append("- **证据**:")
             for k, v in evidence.items():
                 block.append(f"  - `{k}` = `{_format_value(v)}`")
-
-        hypothesis = template.get("root_cause_hypothesis", "").strip()
-        if hypothesis:
-            block.append(f"- **根因假设**: {hypothesis}")
-
-        block.append("- **优化建议**:")
-        for role_label, role_key in (("TA / 渲染", "ta"), ("美术", "art"), ("引擎", "engine")):
-            items = template.get(role_key) or []
-            if not items:
-                continue
-            block.append(f"  - **{role_label}**:")
-            for line in items:
-                block.append(f"    - {line}")
-
-        gain_text = finding.get("expected_gain_text") or template.get("expected_gain_text", "")
-        if gain_text:
-            block.append(f"- **预计收益**: {gain_text}")
-
-        verification = finding.get("verification") or template.get("verification", "")
-        if verification:
-            block.append(f"- **验证方法**: {verification}")
         return block
 
     @staticmethod
@@ -331,16 +316,35 @@ class PerfReportBuilder:
                     float(r.get("stable_sort_score") or 0.0),
                 ),
             }
-        return [
-            primary,
-            {
+        # Prefer PS instruction count for the second variant - it answers
+        # "which draws are doing the most pixel work per pixel?" much more
+        # directly than raw invocation counts.  We only fall back to PS
+        # invocations when the disassembly-based instruction count is
+        # entirely unavailable (e.g. very old captures or unsupported
+        # backends), so this variant degrades gracefully instead of
+        # disappearing.
+        has_ps_instructions = any(int(r.get("ps_instruction_count") or 0) > 0 for r in rows)
+        if has_ps_instructions:
+            ps_variant = {
+                "label": "PS 指令数",
+                "sort_key": lambda r: (
+                    int(r.get("ps_instruction_count") or 0),
+                    int(r.get("ps_invocations") or 0),
+                    float(r.get("stable_sort_score") or 0.0),
+                ),
+            }
+        else:
+            ps_variant = {
                 "label": "PS 调用数",
                 "sort_key": lambda r: (
                     int(r.get("ps_invocations") or 0),
                     int(r.get("ps_instruction_count") or 0),
                     float(r.get("stable_sort_score") or 0.0),
                 ),
-            },
+            }
+        return [
+            primary,
+            ps_variant,
             {
                 "label": "三角面数",
                 "sort_key": lambda r: (
@@ -479,8 +483,9 @@ class PerfReportBuilder:
             "#perf-results-table tr:target>td{background:rgba(255,215,0,0.18);"
             "outline:1px solid rgba(255,215,0,0.65);}\n"
             "#perf-results-table tr.zebra>td{background:#11141a;}\n"
-            "#perf-results-wrap{max-height:60vh;overflow:auto;border:1px solid #272b33;"
+            "#perf-results-wrap{max-height:70vh;overflow:auto;border:1px solid #272b33;"
             "border-radius:6px;}\n"
+            "#perf-results-table td img{display:block;margin:0;}\n"
             "</style>\n"
             "</head>\n"
             "<body>\n"
@@ -507,18 +512,48 @@ class PerfReportBuilder:
         )
 
         header_cells = (
-            "EID", "Scene Pass", "Pass", "稳定得分", "GPU ms",
+            "EID", "线框预览", "渲染分类", "来源", "Pass marker", "稳定得分", "GPU ms",
             "三角面", "PS 调用", "PS 指令", "覆盖%", "贴图 MB", "贴图数",
         )
         head_html = "".join(f"<th>{html_module.escape(h)}</th>" for h in header_cells)
+
+        source_label_map = {
+            "marker": "marker",
+            "marker_raw": "marker(raw)",
+            "render_state": "状态推断",
+            "fallback": "未识别",
+        }
 
         body_lines: List[str] = []
         for idx, row in enumerate(sorted_rows):
             eid = _stringify(row.get("eid"))
             row_id = f"perf-row-{html_module.escape(eid)}" if eid else ""
-            cells = (
+            decided_by = _stringify(row.get("scene_pass_decided_by"))
+            # Build the wireframe preview cell as raw HTML so it is exempt
+            # from the escape loop below.  We prefer the dedicated overlay
+            # URL, but fall back to the legacy ``draw_preview_url`` if it is
+            # the only thing we have for this row.
+            overlay_url = _stringify(row.get("draw_preview_overlay_url"))
+            if not overlay_url and _stringify(row.get("draw_preview_kind")) in {
+                "wireframe", "wireframe_overlay",
+            }:
+                overlay_url = _stringify(row.get("draw_preview_url"))
+            if overlay_url:
+                preview_html = (
+                    f'<img src="{html_module.escape(overlay_url)}" '
+                    f'alt="wireframe EID {html_module.escape(eid)}" '
+                    f'loading="lazy" '
+                    'style="max-width:160px;max-height:96px;background:#0a0c10;'
+                    'border:1px solid #272b33;border-radius:3px;display:block;"/>'
+                )
+            else:
+                preview_html = (
+                    '<span style="color:#7d8696;font-size:11px;">未生成</span>'
+                )
+            text_cells = (
                 eid or "-",
                 _stringify(row.get("scene_pass")) or "-",
+                source_label_map.get(decided_by, decided_by or "-"),
                 _stringify(row.get("pass_name")) or "-",
                 f"{float(row.get('stable_sort_score') or 0.0):.2f}",
                 f"{float(row.get('gpu_duration_ms') or 0.0):.3f}",
@@ -529,7 +564,12 @@ class PerfReportBuilder:
                 f"{float(row.get('texture_total_mb') or 0.0):.3f}",
                 f"{int(row.get('texture_count') or 0)}",
             )
-            tds = "".join(f"<td>{html_module.escape(str(c))}</td>" for c in cells)
+            # First cell is the EID (escaped); second cell is the preview
+            # (raw HTML, not escaped); the remainder are escaped text.
+            eid_td = f"<td>{html_module.escape(text_cells[0])}</td>"
+            preview_td = f"<td>{preview_html}</td>"
+            rest_tds = "".join(f"<td>{html_module.escape(str(c))}</td>" for c in text_cells[1:])
+            tds = eid_td + preview_td + rest_tds
             row_classes = "zebra" if idx % 2 == 1 else ""
             attrs = []
             if row_id:

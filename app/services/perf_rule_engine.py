@@ -7,11 +7,12 @@ Design philosophy:
 - Rules are small, independent ``if`` blocks for easy human review.  No DSL.
 - All numeric thresholds are top-level constants so they can be tuned without
   hunting through code.
-- Each ``Finding`` carries a stable ``recommendation_id`` that points into
-  ``perf_recommendation_templates.TEMPLATES`` for human-readable copy.
 - Each ``Finding`` carries an ``affected`` list of ``{capture_name, eid,
   pass_name}`` dicts so downstream report renderers can build deep links
   back into the perf table (``#perf-row-{eid}``).
+- Findings stay strictly evidence-only: there are no recommendation
+  templates or "expected gain" estimates - that copy was found to be
+  generic and unhelpful in practice and has been removed.
 
 The engine currently ships 10 rules (R001-R008, R010, R014).  Five additional
 rule IDs (R009/R011/R012/R013/R015) are reserved in comments and will be
@@ -20,7 +21,7 @@ implemented after M3 (pipeline-state extras + malioc) lands.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +41,13 @@ FULLSCREEN_BANDWIDTH_TEXTURE_MB = 4.0
 FULLSCREEN_BANDWIDTH_TEXTURE_COUNT = 4
 
 # R004: translucency pass overdraw
-TRANSLUCENCY_PASS_NAMES = {"Translucency"}
+# Pass-label aliases.  The perf service emits both UE-style names
+# (Translucency, ShadowDepths, PostProcessing) and shorter generic names
+# (Translucent, Shadow, PostProcess) produced by the render-state
+# heuristic.  Rules need to recognise both styles.
+TRANSLUCENCY_PASS_NAMES = {"Translucency", "Translucent", "Additive"}
+SHADOW_PASS_NAMES = {"ShadowDepths", "Shadow"}
+POST_PROCESSING_PASS_NAMES = {"PostProcessing", "PostProcess"}
 TRANSLUCENCY_OVERDRAW_PS_INVOCATIONS = 1_000_000
 
 # R005/R006: pass-level percentage thresholds
@@ -73,13 +80,9 @@ class Finding:
     category: str               # overdraw | fillrate_alu | fillrate_bw | shader | texture | geometry | rt | other
     severity: str               # high | med | low
     scope: str                  # draw | pass | shader | frame
-    title: str                  # short human-readable title (copied from template)
+    title: str                  # short human-readable title (evidence summary)
     affected: List[Dict[str, Any]] = field(default_factory=list)
     evidence: Dict[str, Any] = field(default_factory=dict)
-    expected_gain_ms: Optional[float] = None
-    expected_gain_text: str = ""
-    recommendation_id: str = ""
-    verification: str = ""
     report_anchor: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -91,10 +94,6 @@ class Finding:
             "title": self.title,
             "affected": list(self.affected),
             "evidence": dict(self.evidence),
-            "expected_gain_ms": self.expected_gain_ms,
-            "expected_gain_text": self.expected_gain_text,
-            "recommendation_id": self.recommendation_id,
-            "verification": self.verification,
             "report_anchor": self.report_anchor,
         }
 
@@ -176,7 +175,6 @@ class PerfRuleEngine:
                 "worst_fill_to_coverage_ratio": round(evidence_ratio, 3),
                 "threshold_ratio": OVERDRAW_FILL_TO_COVERAGE_RATIO,
             },
-            recommendation_id="R001_overdraw_heavy",
         )]
 
     def _r002_fullscreen_heavy_ps(self, rows, capture_name) -> List[Finding]:
@@ -209,7 +207,6 @@ class PerfRuleEngine:
                 "threshold_ps_instruction_count": FULLSCREEN_PS_INSTRUCTION_COUNT,
                 "threshold_coverage_percent": FULLSCREEN_COVERAGE_PERCENT,
             },
-            recommendation_id="R002_fullscreen_heavy_ps",
         )]
 
     def _r003_fullscreen_bandwidth(self, rows, capture_name) -> List[Finding]:
@@ -243,7 +240,6 @@ class PerfRuleEngine:
                 "threshold_texture_mb": FULLSCREEN_BANDWIDTH_TEXTURE_MB,
                 "threshold_texture_count": FULLSCREEN_BANDWIDTH_TEXTURE_COUNT,
             },
-            recommendation_id="R003_fullscreen_bandwidth",
         )]
 
     def _r004_translucency_overdraw(self, rows, capture_name) -> List[Finding]:
@@ -272,18 +268,21 @@ class PerfRuleEngine:
                 "worst_triangles": int(evidence_row.get("triangles") or 0),
                 "threshold_ps_invocations": TRANSLUCENCY_OVERDRAW_PS_INVOCATIONS,
             },
-            recommendation_id="R004_translucency_overdraw",
         )]
 
     def _r005_shadow_pass_too_heavy(self, pass_chart, rows, capture_name) -> List[Finding]:
-        chart_item = _find_pass(pass_chart, "ShadowDepths")
+        chart_item = None
+        for name in SHADOW_PASS_NAMES:
+            chart_item = _find_pass(pass_chart, name)
+            if chart_item is not None:
+                break
         if chart_item is None:
             return []
         percent = float(chart_item.get("percent") or 0.0)
         if percent < SHADOW_PASS_PERCENT:
             return []
         affected = sorted(
-            [row for row in rows if _stringify(row.get("scene_pass")) == "ShadowDepths"],
+            [row for row in rows if _stringify(row.get("scene_pass")) in SHADOW_PASS_NAMES],
             key=lambda row: int(row.get("triangles") or 0),
             reverse=True,
         )[:5]
@@ -301,18 +300,21 @@ class PerfRuleEngine:
                 "pass_total_triangles": int(chart_item.get("triangles") or 0),
                 "threshold_percent": SHADOW_PASS_PERCENT,
             },
-            recommendation_id="R005_shadow_pass_too_heavy",
         )]
 
     def _r006_post_processing_heavy(self, pass_chart, rows, capture_name) -> List[Finding]:
-        chart_item = _find_pass(pass_chart, "PostProcessing")
+        chart_item = None
+        for name in POST_PROCESSING_PASS_NAMES:
+            chart_item = _find_pass(pass_chart, name)
+            if chart_item is not None:
+                break
         if chart_item is None:
             return []
         percent = float(chart_item.get("percent") or 0.0)
         if percent < POST_PROCESSING_PASS_PERCENT:
             return []
         affected = sorted(
-            [row for row in rows if _stringify(row.get("scene_pass")) == "PostProcessing"],
+            [row for row in rows if _stringify(row.get("scene_pass")) in POST_PROCESSING_PASS_NAMES],
             key=lambda row: float(row.get("gpu_duration_ms") or 0.0),
             reverse=True,
         )[:5]
@@ -329,7 +331,6 @@ class PerfRuleEngine:
                 "pass_draw_count": int(chart_item.get("draw_count") or 0),
                 "threshold_percent": POST_PROCESSING_PASS_PERCENT,
             },
-            recommendation_id="R006_post_processing_heavy",
         )]
 
     def _r007_shader_alu_outlier(self, rows, capture_name) -> List[Finding]:
@@ -379,7 +380,6 @@ class PerfRuleEngine:
                     if isinstance(evidence_row.get("shader_ids"), Mapping) else ""
                 ),
             },
-            recommendation_id="R007_shader_alu_outlier",
         )]
 
     def _r008_huge_texture_low_use(self, rows, capture_name) -> List[Finding]:
@@ -407,7 +407,6 @@ class PerfRuleEngine:
                 "threshold_texture_mb": HUGE_TEXTURE_MB,
                 "threshold_coverage_percent": HUGE_TEXTURE_LOW_COVERAGE_PERCENT,
             },
-            recommendation_id="R008_huge_texture_low_use",
         )]
 
     def _r010_high_tri_low_pixel(self, rows, capture_name) -> List[Finding]:
@@ -435,7 +434,6 @@ class PerfRuleEngine:
                 "threshold_triangles": HIGH_TRI_LOW_PIXEL_TRIANGLES,
                 "threshold_coverage_percent": HIGH_TRI_LOW_PIXEL_COVERAGE_PERCENT,
             },
-            recommendation_id="R010_high_tri_low_pixel",
         )]
 
     def _r014_unique_texture_explosion(self, rows, capture_name) -> List[Finding]:
@@ -475,7 +473,6 @@ class PerfRuleEngine:
                     "threshold": UNIQUE_TEXTURE_EXPLOSION_PER_PASS,
                     "draw_count_in_pass": len(per_pass_eids.get(pass_name) or []),
                 },
-                recommendation_id="R014_unique_texture_explosion",
             ))
         return findings
 

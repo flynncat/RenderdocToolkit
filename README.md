@@ -12,7 +12,7 @@
 
 | 功能 | 说明 |
 | --- | --- |
-| `性能` | 针对单个 `.rdc` 做 Pass 级性能分析，支持多维排序、热点提示、绘制预览，以及基于规则引擎的**性能诊断报告**（HTML / Markdown / CSV 导出） |
+| `性能` | 针对单个 `.rdc` 做 Pass 级性能分析，支持多维排序、热点提示、绘制预览（RT / 线框 / 绑定纹理，含按需生成），以及基于规则引擎的**证据型性能诊断报告**（HTML / Markdown / CSV 导出） |
 | `性能 Diff` | 基于 `renderdoc_cmp` 对两份抓帧做性能差异分析，并在界面内查看 HTML 报告 |
 | `资产批量导出` | 扫描 Pass、批量导出资产、导出当前 draw 的 shader/参数、检查 CSV 列映射，并将 CSV 转换为 `FBX` / `OBJ` |
 
@@ -120,12 +120,13 @@ RenderdocDiffPortable\RenderdocDiffTools.exe
 2. 选择单个 `.rdc`
 3. 点击 `执行性能分析`
 4. 使用排序维度和排序方向查看热点
-5. 结合图表、日志和绘制预览定位高开销 Pass
-6. 在结果区下方查看**性能诊断报告**（分析完成后自动生成），并按需下载或复制导出
+5. 结合图表、日志和绘制预览定位高开销 Pass（支持 RT + 线框叠加；XML 回退路径下可懒加载绑定纹理缩略图；点击预览可按需生成单 Draw 的 RT / 线框 PNG）
+6. 若线框预览上下颠倒，可勾选工具栏「上下翻转贴图」（仅影响界面显示）
+7. 在结果区下方查看**性能诊断报告**（分析完成后自动生成），并按需下载或复制导出
 
 #### 性能诊断报告与导出
 
-每次性能分析完成后，工具会自动运行确定性规则引擎（无 LLM），生成结构化诊断结论并写入任务目录：
+每次性能分析完成后，工具会自动运行确定性规则引擎（无 LLM），生成**仅含证据与阈值命中**的结构化诊断结论并写入任务目录（不再附带通用建议模板或预期收益估算）：
 
 - **界面内嵌报告**：结果面板下方的「性能诊断报告」区域，默认展示 HTML；结论中的 EID 可点击跳转到上方性能表对应行
 - **规则覆盖**：过绘、全屏 ALU/带宽、半透明、Shadow/后处理占比、Shader ALU 离群、超大纹理绑定、微三角浪费、Pass 纹理爆炸等（见 `app/services/perf_rule_engine.py`）
@@ -137,6 +138,8 @@ RenderdocDiffPortable\RenderdocDiffTools.exe
 
 - `GET /api/renderdoc-perf/jobs/{job_id}/report?format=html|md` — 内嵌报告
 - `GET /api/renderdoc-perf/jobs/{job_id}/export?format=csv|tsv|json|md|html|zip` — 单文件或 zip 导出
+- `POST /api/renderdoc-perf/jobs/{job_id}/draw-preview` — 按需生成单 Draw 的 RT / 线框预览
+- `GET /api/renderdoc-perf/jobs/{job_id}/draw-texture-thumbnail` — XML 回退路径下的绑定纹理缩略图
 
 ### 2. 性能 Diff
 
@@ -153,9 +156,10 @@ RenderdocDiffPortable\RenderdocDiffTools.exe
 1. 打开 `资产批量导出`
 2. 读取 Pass 列表并选择导出范围，或直接手动填写单个 `EID`
 3. 按需启用 `FBX` / `OBJ`
-4. 点击 `确认范围并准备批量映射`
-5. 在批量映射确认窗口中检查样本映射，并开始导出
-6. 如需手工转换 CSV，可在 `CSV 列映射预览` 中点击 `按当前映射开始批量转换`
+4. 若贴图在 DX/GL 手性差异下上下颠倒，可勾选「上下翻转贴图」（导出 PNG/TGA 时写盘前翻转一次）
+5. 点击 `确认范围并准备批量映射`
+6. 在批量映射确认窗口中检查样本映射，并开始导出
+7. 如需手工转换 CSV，可在 `CSV 列映射预览` 中点击 `按当前映射开始批量转换`
 
 关于“批量映射确认”的行为说明：
 
@@ -207,9 +211,8 @@ RenderdocDiffPortable\RenderdocDiffTools.exe
 
 ```text
 app/                                    FastAPI 应用与前端模板
-app/services/perf_rule_engine.py        性能诊断规则引擎（确定性 Finding）
+app/services/perf_rule_engine.py        性能诊断规则引擎（证据型 Finding）
 app/services/perf_report_builder.py       Markdown / HTML 报告渲染
-app/services/perf_recommendation_templates.py  规则对应的人类可读建议模板
 app/services/renderdoc_perf_exporter.py  CSV / TSV / JSON 扁平化导出
 docs/                                   用户文档、发布说明与技术方案
 config/                                 本地配置

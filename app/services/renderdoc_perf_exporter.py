@@ -55,6 +55,9 @@ DRAW_COLUMNS = [
     "capture_name",
     "eid",
     "scene_pass",
+    "scene_pass_decided_by",
+    "inferred_pass_kind",
+    "marker_scene_pass",
     "pass_name",
     "breadcrumbs_path",
     "draw_type",
@@ -148,8 +151,6 @@ FINDING_COLUMNS = [
     "affected_eids",
     "affected_count",
     "title",
-    "expected_gain_text",
-    "expected_gain_ms",
     "report_anchor",
 ]
 
@@ -234,9 +235,9 @@ class PerfExporter:
         report_html_relpath: str,
     ) -> Path:
         severity_counts = _count_by_severity(findings)
-        analysis_mode = ""
+        analysis_mode = str(analysis.get("analysis_mode") or "")
         features = analysis.get("analysis_features") or {}
-        if isinstance(features, Mapping):
+        if not analysis_mode and isinstance(features, Mapping):
             analysis_mode = str(features.get("analysis_mode") or "")
         if not analysis_mode:
             analysis_mode = "xml_fallback" if features else "direct_replay"
@@ -287,6 +288,9 @@ class PerfExporter:
                 "capture_name": capture_name,
                 "eid": _stringify(row.get("eid")),
                 "scene_pass": _stringify(row.get("scene_pass")),
+                "scene_pass_decided_by": _stringify(row.get("scene_pass_decided_by")),
+                "inferred_pass_kind": _stringify(row.get("inferred_pass_kind")),
+                "marker_scene_pass": _stringify(row.get("marker_scene_pass")),
                 "pass_name": _stringify(row.get("pass_name")),
                 "breadcrumbs_path": breadcrumbs_path,
                 "draw_type": _stringify(row.get("draw_type")),
@@ -500,7 +504,6 @@ class PerfExporter:
                         eid = _stringify(item.get("eid"))
                         if eid:
                             eids.append(eid)
-            expected_gain_ms = finding.get("expected_gain_ms")
             out_rows.append({
                 "capture_id": capture_id,
                 "capture_name": capture_name,
@@ -511,8 +514,6 @@ class PerfExporter:
                 "affected_eids": ";".join(eids[:50]),
                 "affected_count": len(eids),
                 "title": _stringify(finding.get("title")),
-                "expected_gain_text": _stringify(finding.get("expected_gain_text")),
-                "expected_gain_ms": "" if expected_gain_ms is None else float(expected_gain_ms),
                 "report_anchor": _stringify(finding.get("report_anchor")),
             })
         _write_csv(path, FINDING_COLUMNS, out_rows, delimiter=",")
