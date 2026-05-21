@@ -1,5 +1,5 @@
 ---
-description: When user says 推送到git, sync remote, commit, update README, and push
+description: When user says 推送到git, sync remote, commit, update README, and push to GitHub + git.woa
 alwaysApply: true
 ---
 
@@ -7,14 +7,30 @@ alwaysApply: true
 
 当用户说 **「推送到 git」**、**「推送到git」** 或含义相同的表述时，**不要只执行 `git push`**。按以下顺序自动完成，无需再次确认（除非提交信息确实无法从 diff 推断）：
 
+## 远程仓库（双推送）
+
+本仓库需同步到 **两个** 远程：
+
+| 远程名 | 地址 | 用途 |
+| --- | --- | --- |
+| `origin` | `git@github.com:flynncat/RenderdocToolkit.git` | GitHub |
+| `woa` | `https://git.woa.com/flynnxue/RenderdocToolkit.git` | 腾讯工蜂 git.woa |
+
+若本地缺少 `woa` 远程，先执行：
+
+```powershell
+git remote add woa https://git.woa.com/flynnxue/RenderdocToolkit.git
+```
+
 ## 1. 检查远程更新
 
 ```powershell
 Set-Location <repo-root>
 git fetch origin
+git fetch woa
 ```
 
-- 若 `origin/main` 领先本地：先 `git pull --rebase origin main`（或当前分支对应远程），解决冲突后再继续。
+- 若 `origin/main` 或 `woa/main` 领先本地：先 `git pull --rebase` 对应远程（优先 `origin`），解决冲突后再继续。
 - 汇报：`git status -sb` 与是否有未拉取的远程提交。
 
 ## 2. 处理本地改动
@@ -34,12 +50,15 @@ git fetch origin
 
 若本次仅为 typo / 内部重构且不影响用户文档，可只改 commit message，README 可不动。
 
-## 4. 推送
+## 4. 推送（双远程）
 
 ```powershell
 git push origin <current-branch>
+git push woa <current-branch>
 ```
+
+两个远程都必须推送；若其中一个失败，汇报失败原因并尝试修复后重推，不要只推一个就结束。
 
 ## 5. 汇报
 
-用中文简要说明：是否拉取了远程、提交 hash 与 message、README 是否更新、推送是否成功。
+用中文简要说明：是否拉取了远程、提交 hash 与 message、README 是否更新、**GitHub 与 git.woa 各自**推送是否成功。
