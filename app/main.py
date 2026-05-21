@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -259,6 +260,46 @@ def _create_manual_csv_conversion_job(
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Keep a strong reference to background perf-analysis tasks so the asyncio
+# event loop doesn't garbage-collect them mid-flight.  Cleared in the task's
+# own done-callback to avoid an unbounded leak.
+_BACKGROUND_PERF_TASKS: set[asyncio.Task] = set()
+
+
+def _launch_perf_analysis_background(
+    *,
+    job_id: str,
+    capture_file: Path,
+    renderdoc_dir: str,
+) -> None:
+    """Schedule ``analyze_capture_isolated`` as a background task and return
+    immediately.  All exceptions are funnelled into the job's metadata so
+    the SPA poller surfaces them without us having to ``await`` here.
+    """
+
+    async def _runner() -> None:
+        try:
+            await run_in_threadpool(
+                perf_service.analyze_capture_isolated,
+                job_id,
+                capture_file,
+                renderdoc_dir,
+            )
+        except Exception as exc:
+            try:
+                perf_service._emit_progress(job_id, "failed", f"性能分析失败：{exc}")
+            except Exception:
+                pass
+            try:
+                perf_service.store.update_metadata(job_id, {"status": "failed"})
+            except Exception:
+                pass
+
+    task = asyncio.create_task(_runner())
+    _BACKGROUND_PERF_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_PERF_TASKS.discard)
 
 
 def _flip_job_textures_in_place(job_dir: Path) -> dict:
@@ -952,7 +993,7 @@ async def run_renderdoc_perf_by_path(
     title = f"renderdoc_perf: {capture_file.name}"
     metadata = perf_service.create_job(title=title)
     job_id = metadata["job_id"]
-    perf_service.store.update_metadata(
+    metadata = perf_service.store.update_metadata(
         job_id,
         {
             "status": "running",
@@ -960,18 +1001,19 @@ async def run_renderdoc_perf_by_path(
                 "capture_file": str(capture_file),
                 "renderdoc_dir_requested": renderdoc_dir.strip(),
             },
+            "progress": {
+                "stage": "init",
+                "message": "已创建任务，等待 worker 启动…",
+                "updated_at": _utc_now_iso(),
+            },
         },
     )
-    try:
-        return await run_in_threadpool(
-            perf_service.analyze_capture_isolated,
-            job_id,
-            capture_file,
-            renderdoc_dir,
-        )
-    except Exception as exc:
-        perf_service.store.update_metadata(job_id, {"status": "failed"})
-        raise HTTPException(status_code=500, detail=f"性能分析失败: {exc}") from exc
+    _launch_perf_analysis_background(
+        job_id=job_id,
+        capture_file=capture_file,
+        renderdoc_dir=renderdoc_dir,
+    )
+    return {"job_id": job_id, "status": "running", "metadata": metadata}
 
 
 @app.post("/api/asset-export/scan-passes/by-path")
@@ -1633,7 +1675,7 @@ async def run_renderdoc_perf(
     metadata = perf_service.create_job(title=title)
     job_id = metadata["job_id"]
     saved_capture = perf_service.store.save_input_file(job_id, "capture.rdc", await capture_file.read())
-    perf_service.store.update_metadata(
+    metadata = perf_service.store.update_metadata(
         job_id,
         {
             "status": "running",
@@ -1641,18 +1683,19 @@ async def run_renderdoc_perf(
                 "capture_file": str(Path(saved_capture).relative_to(Path(saved_capture).parents[1])),
                 "renderdoc_dir_requested": renderdoc_dir.strip(),
             },
+            "progress": {
+                "stage": "init",
+                "message": "已创建任务，等待 worker 启动…",
+                "updated_at": _utc_now_iso(),
+            },
         },
     )
-    try:
-        return await run_in_threadpool(
-            perf_service.analyze_capture_isolated,
-            job_id,
-            saved_capture,
-            renderdoc_dir,
-        )
-    except Exception as exc:
-        perf_service.store.update_metadata(job_id, {"status": "failed"})
-        raise HTTPException(status_code=500, detail=f"性能分析失败: {exc}") from exc
+    _launch_perf_analysis_background(
+        job_id=job_id,
+        capture_file=Path(saved_capture),
+        renderdoc_dir=renderdoc_dir,
+    )
+    return {"job_id": job_id, "status": "running", "metadata": metadata}
 
 
 

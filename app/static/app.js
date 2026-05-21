@@ -1455,6 +1455,78 @@ async function handleCmpRun(event) {
   }
 }
 
+// Stage -> human-readable Chinese label.  Used by the perf progress
+// polling UI.  Keep these aligned with the stages emitted by
+// ``RenderdocPerfService._emit_progress`` in renderdoc_perf_service.py.
+const PERF_STAGE_LABELS = {
+  init: "初始化",
+  load_draws: "加载 draw 列表",
+  replay_open: "打开 RenderDoc capture",
+  fetch_counters: "采集 GPU counter",
+  build_rows: "分析每个 draw",
+  previews: "生成线框预览",
+  report: "生成性能诊断报告",
+  completed: "已完成",
+  failed: "失败",
+  // XML fallback path
+  convert: "转换 capture 为 XML",
+  xml_parse: "解析 XML",
+  qr_replay: "qrenderdoc 升级预览",
+};
+
+let _perfPollIntervalId = null;
+let _perfPollStartedAt = 0;
+
+function _showPerfProgress(stage, message, current, total) {
+  const wrap = document.getElementById("perf-progress");
+  const stageEl = document.getElementById("perf-progress-stage");
+  const msgEl = document.getElementById("perf-progress-message");
+  const elapsedEl = document.getElementById("perf-progress-elapsed");
+  if (!wrap) return;
+  wrap.classList.remove("hidden");
+  const label = PERF_STAGE_LABELS[stage] || stage || "运行中";
+  let stageText = label;
+  if (typeof current === "number" && typeof total === "number" && total > 0) {
+    stageText = `${label} (${current}/${total})`;
+  }
+  if (stageEl) stageEl.textContent = stageText;
+  if (msgEl) msgEl.textContent = message || "";
+  if (elapsedEl) {
+    const sec = Math.max(0, Math.round((Date.now() - _perfPollStartedAt) / 1000));
+    elapsedEl.textContent = `已用时 ${sec}s`;
+  }
+}
+
+function _hidePerfProgress() {
+  const wrap = document.getElementById("perf-progress");
+  if (wrap) wrap.classList.add("hidden");
+}
+
+function _stopPerfPoll() {
+  if (_perfPollIntervalId !== null) {
+    clearInterval(_perfPollIntervalId);
+    _perfPollIntervalId = null;
+  }
+}
+
+async function _pollPerfJobOnce(jobId, onDone) {
+  try {
+    const resp = await fetch(`/api/renderdoc-perf/jobs/${jobId}`);
+    if (!resp.ok) return;
+    const detail = await resp.json();
+    const metadata = detail.metadata || {};
+    const progress = metadata.progress || {};
+    const status = metadata.status || "running";
+    _showPerfProgress(progress.stage, progress.message, progress.current, progress.total);
+    if (status === "completed" || status === "failed") {
+      _stopPerfPoll();
+      onDone(status, detail);
+    }
+  } catch (_e) {
+    // transient network error - keep polling.
+  }
+}
+
 async function handlePerfRun(event) {
   event.preventDefault();
 
@@ -1470,14 +1542,16 @@ async function handlePerfRun(event) {
     "说明: 正在执行单帧性能分析，请稍候...",
   ].filter(Boolean));
   setLogBusy("perf-run-log", "正在读取 draw/counter 并分析性能，请稍候...");
+  _perfPollStartedAt = Date.now();
+  _showPerfProgress("init", "已提交任务，等待 worker 启动…", 0, 0);
 
+  let submitResp;
   try {
-    let response;
     if (capturePath) {
       const formData = new FormData();
       formData.append("capture_path", capturePath);
       formData.append("renderdoc_dir", renderdocDir);
-      response = await fetch("/api/renderdoc-perf/analyze/by-path", {
+      submitResp = await fetch("/api/renderdoc-perf/analyze/by-path", {
         method: "POST",
         body: formData,
       });
@@ -1489,25 +1563,71 @@ async function handlePerfRun(event) {
       const formData = new FormData();
       formData.append("capture_file", captureFile);
       formData.append("renderdoc_dir", renderdocDir);
-      response = await fetch("/api/renderdoc-perf/analyze", {
+      submitResp = await fetch("/api/renderdoc-perf/analyze", {
         method: "POST",
         body: formData,
       });
     }
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.detail || "性能分析失败");
-    }
-    currentPerfJobId = data.metadata.job_id;
-    renderPerfSummary(data);
-    await loadPerfJobs();
-    switchTab("perf");
   } catch (error) {
-    alert(error.message);
-  } finally {
+    _hidePerfProgress();
     button.disabled = false;
     button.textContent = "执行性能分析";
+    alert(error.message);
+    return;
   }
+
+  let initialPayload;
+  try {
+    initialPayload = await submitResp.json();
+  } catch (_e) {
+    initialPayload = null;
+  }
+  if (!submitResp.ok || !initialPayload || !initialPayload.job_id) {
+    _hidePerfProgress();
+    button.disabled = false;
+    button.textContent = "执行性能分析";
+    alert((initialPayload && initialPayload.detail) || "性能分析提交失败");
+    return;
+  }
+
+  const jobId = initialPayload.job_id;
+  currentPerfJobId = jobId;
+
+  // Hard upper bound: 1 hour of consecutive polling without success.
+  // Mirrors the qrenderdoc backend timeout (900s) plus headroom.
+  const pollDeadline = Date.now() + 60 * 60 * 1000;
+
+  _stopPerfPoll();
+  _perfPollIntervalId = setInterval(async () => {
+    if (Date.now() > pollDeadline) {
+      _stopPerfPoll();
+      _hidePerfProgress();
+      button.disabled = false;
+      button.textContent = "执行性能分析";
+      alert("性能分析超过 1 小时仍未完成，已停止轮询。请查看 server 日志。");
+      return;
+    }
+    await _pollPerfJobOnce(jobId, async (status, detail) => {
+      _hidePerfProgress();
+      button.disabled = false;
+      button.textContent = "执行性能分析";
+      if (status === "failed") {
+        const err = (detail.metadata && detail.metadata.progress && detail.metadata.progress.message)
+          || "性能分析失败";
+        alert(err);
+        return;
+      }
+      try {
+        renderPerfSummary(detail);
+        await loadPerfJobs();
+        switchTab("perf");
+      } catch (renderErr) {
+        alert(`渲染性能结果失败: ${renderErr.message}`);
+      }
+    });
+  }, 1000);
+  // Fire one immediate poll so the user doesn't wait a full second to see the first stage.
+  _pollPerfJobOnce(jobId, () => {});
 }
 
 async function handleAssetPassScan(event) {

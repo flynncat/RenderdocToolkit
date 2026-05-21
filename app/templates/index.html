@@ -65,6 +65,13 @@
         </div>
 
         <button id="perf-run-btn" type="submit">执行性能分析</button>
+
+        <div id="perf-progress" class="perf-progress hidden" role="status" aria-live="polite">
+          <div class="perf-progress-stage" id="perf-progress-stage">准备中…</div>
+          <div class="perf-progress-message" id="perf-progress-message"></div>
+          <div class="perf-progress-bar"><div class="perf-progress-bar-indet"></div></div>
+          <div class="perf-progress-elapsed" id="perf-progress-elapsed"></div>
+        </div>
       </form>
 
       <div class="health-block">

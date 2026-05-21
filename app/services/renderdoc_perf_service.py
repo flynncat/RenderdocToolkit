@@ -5,6 +5,7 @@ import multiprocessing
 import re
 import subprocess
 from collections import defaultdict
+from datetime import datetime, timezone
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -59,6 +60,37 @@ class RenderdocPerfService:
     def __init__(self, store: RenderdocPerfStore) -> None:
         self.store = store
 
+    def _emit_progress(
+        self,
+        job_id: str,
+        stage: str,
+        message: str,
+        *,
+        current: Optional[int] = None,
+        total: Optional[int] = None,
+    ) -> None:
+        """Best-effort progress write into the job's metadata.
+
+        The SPA polls ``GET /api/renderdoc-perf/jobs/{job_id}`` once per
+        second; that endpoint returns the full metadata, so writing
+        ``progress`` here is the only thing the frontend needs.  Failures
+        (e.g. metadata.json briefly locked) are swallowed - progress
+        reporting must never break the analysis.
+        """
+        try:
+            payload: Dict[str, Any] = {
+                "stage": stage,
+                "message": message,
+                "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            if current is not None:
+                payload["current"] = int(current)
+            if total is not None:
+                payload["total"] = int(total)
+            self.store.update_metadata(job_id, {"progress": payload})
+        except Exception:
+            pass
+
     def create_job(self, title: str) -> Dict[str, Any]:
         return self.store.create_job(title)
 
@@ -85,10 +117,17 @@ class RenderdocPerfService:
         parent_conn.close()
 
         if process.exitcode not in (0, None):
+            self._emit_progress(
+                job_id,
+                "failed",
+                f"性能分析子进程异常退出，exit_code={process.exitcode}",
+            )
             self.store.update_metadata(job_id, {"status": "failed"})
             raise RuntimeError(f"性能分析子进程异常退出，exit_code={process.exitcode}")
         if result and not result.get("ok"):
-            raise RuntimeError(str(result.get("error") or "性能分析失败"))
+            err_text = str(result.get("error") or "性能分析失败")
+            self._emit_progress(job_id, "failed", err_text)
+            raise RuntimeError(err_text)
         return self.store.get_job_detail(job_id)
 
     def analyze_capture(self, job_id: str, capture_path: Path, renderdoc_dir: str = "") -> Dict[str, Any]:
@@ -96,6 +135,7 @@ class RenderdocPerfService:
             resolve_renderdoc_runtime,
             capture_needs_foreign_renderdoc,
         )
+        self._emit_progress(job_id, "init", "正在解析 RenderDoc 运行时…")
         rd_ctx = resolve_renderdoc_runtime(renderdoc_dir)
 
         if capture_needs_foreign_renderdoc(capture_path):
@@ -114,19 +154,59 @@ class RenderdocPerfService:
             f"[renderdoc] dir={rd_ctx.renderdoc_dir} python={rd_ctx.renderdoc_python_path} source={rd_ctx.source}",
         ]
 
+        self._emit_progress(job_id, "load_draws", "正在加载 draw 列表（rdc draws --json）…")
         draws_payload = self._load_draws_payload(capture_path)
-        counters_payload = self._load_counters_payload(capture_path)
         draw_rows = self._extract_draw_rows(draws_payload)
-        counter_map = self._extract_counter_map(counters_payload)
+        # Opt-1: skip ``rdc counters --json`` (one full capture open/close).
+        # The 6 counters consumed by ``_build_rows`` come from the same
+        # underlying RenderDoc Python API; ``fetch_counter_map`` filters
+        # out names that the current backend doesn't expose, which matches
+        # the CLI path's behaviour when those counters are unavailable.
+        counter_map: Dict[str, Dict[str, float]] = {}
 
         shader_cache: Dict[str, Dict[str, Any]] = {}
+        self._emit_progress(job_id, "replay_open", "正在打开 RenderDoc capture（直连回放）…")
         with RenderdocDirectReplay(capture_path, renderdoc_python_path=rd_ctx.renderdoc_python_path) as replay:
             capture_info = replay.get_capture_metadata()
             texture_desc_map = replay.get_texture_description_map()
-            gpu_duration_map = replay.fetch_counter_map(["GPU Duration"])
-            for eid, values in gpu_duration_map.items():
-                counter_map.setdefault(eid, {}).update(values)
+            self._emit_progress(job_id, "fetch_counters", f"正在批量采集 GPU counter ({len(self.COUNTER_NAMES)} 个)…")
+            counter_map = replay.fetch_counter_map(self.COUNTER_NAMES)
+            missing_counters = [
+                name for name in self.COUNTER_NAMES
+                if not any(name in values for values in counter_map.values())
+            ]
+            if missing_counters:
+                run_log_lines.append(
+                    f"[counters] missing from backend: {missing_counters} (相关字段会回退为 0)"
+                )
+            # Opt-2: pre-fetch ``GetDisassemblyTargets`` once per analysis
+            # instead of once per draw inside ``_get_shader_metrics``.
+            try:
+                disassembly_targets_raw = list(replay.controller.GetDisassemblyTargets(True))
+            except Exception:
+                disassembly_targets_raw = []
+            available_disassembly_targets = [
+                self._stringify(item) for item in disassembly_targets_raw if self._stringify(item)
+            ]
             action_map = self._collect_action_map(replay)
+            total_draws_to_build = len(draw_rows)
+            self._emit_progress(
+                job_id,
+                "build_rows",
+                f"正在分析 draw 0/{total_draws_to_build}…",
+                current=0,
+                total=total_draws_to_build,
+            )
+
+            def _build_progress(current: int, total: int, last_eid: str) -> None:
+                self._emit_progress(
+                    job_id,
+                    "build_rows",
+                    f"正在分析 draw {current}/{total}（当前 EID {last_eid}）",
+                    current=current,
+                    total=total,
+                )
+
             rows = self._build_rows(
                 replay=replay,
                 draw_rows=draw_rows,
@@ -135,15 +215,37 @@ class RenderdocPerfService:
                 texture_desc_map=texture_desc_map,
                 run_log_lines=run_log_lines,
                 shader_cache=shader_cache,
+                available_targets=available_disassembly_targets,
+                progress_callback=_build_progress,
             )
+            preview_total = min(len(rows), self._DIRECT_PREVIEW_HARD_CAP) if rows else 0
+            self._emit_progress(
+                job_id,
+                "previews",
+                f"正在生成线框预览 0/{preview_total}…",
+                current=0,
+                total=preview_total,
+            )
+
+            def _preview_progress(current: int, total: int, last_eid: str) -> None:
+                self._emit_progress(
+                    job_id,
+                    "previews",
+                    f"正在生成线框预览 {current}/{total}（当前 EID {last_eid}）",
+                    current=current,
+                    total=total,
+                )
+
             self._populate_initial_draw_previews(
                 replay=replay,
                 job_id=job_id,
                 preview_dir=preview_dir,
                 rows=rows,
                 run_log_lines=run_log_lines,
+                progress_callback=_preview_progress,
             )
 
+        self._emit_progress(job_id, "report", "正在生成性能诊断报告…")
         overview = self._build_overview(rows)
         pass_chart = self._build_pass_chart(rows)
         hotspot_hints = self._build_hotspot_hints(pass_chart, rows)
@@ -208,6 +310,13 @@ class RenderdocPerfService:
             run_log_lines=run_log_lines,
         )
         self.store.write_text_artifact(job_id, "artifacts/perf_run_log.txt", "\n".join(run_log_lines) + "\n")
+        self._emit_progress(
+            job_id,
+            "completed",
+            f"分析完成，共处理 {len(rows)} 个 draw。",
+            current=len(rows),
+            total=len(rows),
+        )
         metadata = self.store.update_metadata(
             job_id,
             {
@@ -424,6 +533,11 @@ class RenderdocPerfService:
         preview_dir = job_dir / "artifacts" / "previews"
         preview_dir.mkdir(parents=True, exist_ok=True)
 
+        self._emit_progress(
+            job_id,
+            "convert",
+            "正在用 renderdoccmd 把 capture 转成 XML（capture 较大时可能 1-3 分钟）…",
+        )
         # Prefer zip.xml (XML + companion .zip with raw resource buffers) so
         # we can lazily generate per-draw texture thumbnails later.  Fall back
         # to pure xml if the conversion fails (e.g. very old renderdoccmd).
@@ -451,6 +565,7 @@ class RenderdocPerfService:
             capture_path, rd_ctx.renderdoc_cmd_path, preview_dir,
         )
 
+        self._emit_progress(job_id, "xml_parse", "正在解析 XML（提取 draw / counter / texture 信息）…")
         analysis = analyze_capture_xml(xml_path, chrome_json_path=chrome_path)
         analysis["capture_path"] = str(capture_path)
         analysis["capture_name"] = capture_path.name
@@ -497,6 +612,11 @@ class RenderdocPerfService:
         # ------------------------------------------------------------------
         # Upgrade path: GPU replay via QRenderdocScriptBackend
         # ------------------------------------------------------------------
+        self._emit_progress(
+            job_id,
+            "qr_replay",
+            "正在用 qrenderdoc 升级线框预览（可能 2-15 分钟，最多 60 个最热 draw）…",
+        )
         replay_info = self._run_qrenderdoc_replay(
             job_id=job_id,
             capture_path=capture_path,
@@ -506,6 +626,7 @@ class RenderdocPerfService:
 
         self.store.write_json_artifact(job_id, "artifacts/perf_analysis.json", analysis)
 
+        self._emit_progress(job_id, "report", "正在生成性能诊断报告…")
         report_log_lines: list[str] = []
         report_summary = self._generate_report_artifacts(
             job_id=job_id,
@@ -542,6 +663,13 @@ class RenderdocPerfService:
         overview = analysis.get("overview", {})
         pass_chart = analysis.get("pass_chart", [])
         rows = analysis.get("rows", [])
+        self._emit_progress(
+            job_id,
+            "completed",
+            f"分析完成，共处理 {len(rows)} 个 draw（XML 回退）。",
+            current=len(rows),
+            total=len(rows),
+        )
         metadata = self.store.update_metadata(
             job_id,
             {
@@ -735,12 +863,15 @@ class RenderdocPerfService:
         texture_desc_map: Dict[str, Dict[str, Any]],
         run_log_lines: List[str],
         shader_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+        available_targets: Optional[List[str]] = None,
+        progress_callback: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         if shader_cache is None:
             shader_cache = {}
 
-        for draw in draw_rows:
+        total_draws = len(draw_rows)
+        for draw_index, draw in enumerate(draw_rows, start=1):
             eid = self._stringify(draw.get("eid"))
             if not eid:
                 continue
@@ -749,7 +880,7 @@ class RenderdocPerfService:
             replay._set_frame_event(int(eid))
             pipe = replay.controller.GetPipelineState()
 
-            shader_metrics = self._get_shader_metrics(replay, pipe, shader_cache)
+            shader_metrics = self._get_shader_metrics(replay, pipe, shader_cache, available_targets)
             texture_summary = self._get_texture_summary(
                 replay=replay,
                 pipe=pipe,
@@ -879,6 +1010,12 @@ class RenderdocPerfService:
             run_log_lines.append(
                 f"[row] eid={eid} scene_pass={row['scene_pass']} gpu_ms={row['gpu_duration_ms']:.4f} tris={triangle_count} instr={row['instruction_total']} cover={row['screen_coverage_percent']:.4f}% stable={row['stable_sort_score']:.6f} basis={row['stable_sort_basis']} tex_mb={row['texture_total_mb']:.3f} tex_risk={row['texture_bandwidth_risk']:.3f}"
             )
+            if progress_callback is not None and (draw_index % 50 == 0 or draw_index == total_draws):
+                try:
+                    progress_callback(draw_index, total_draws, eid)
+                except Exception:
+                    # Progress reporting must never break the analysis.
+                    pass
 
         rows.sort(
             key=lambda item: (
@@ -944,6 +1081,7 @@ class RenderdocPerfService:
         rows: List[Dict[str, Any]],
         run_log_lines: List[str],
         limit: Optional[int] = None,
+        progress_callback: Optional[Any] = None,
     ) -> None:
         # "应有尽有": match the qrenderdoc worker behaviour and emit both an
         # RT screenshot and a wireframe overlay PNG for every draw, up to a
@@ -955,7 +1093,7 @@ class RenderdocPerfService:
             effective_limit = max(0, min(int(limit), len(rows)))
         saved_count = 0
         skipped_count = 0
-        for row in rows[:effective_limit]:
+        for preview_index, row in enumerate(rows[:effective_limit], start=1):
             eid = self._stringify(row.get("eid"))
             if not eid:
                 continue
@@ -970,6 +1108,11 @@ class RenderdocPerfService:
             except Exception as exc:
                 run_log_lines.append(f"[preview] eid={eid} FAILED: {exc}")
                 skipped_count += 1
+                if progress_callback is not None and (preview_index % 20 == 0 or preview_index == effective_limit):
+                    try:
+                        progress_callback(preview_index, effective_limit, eid)
+                    except Exception:
+                        pass
                 continue
             rt_saved = result.get("rt_path")
             overlay_saved = result.get("overlay_path")
@@ -990,6 +1133,11 @@ class RenderdocPerfService:
                 skipped_count += 1
             else:
                 saved_count += 1
+            if progress_callback is not None and (preview_index % 20 == 0 or preview_index == effective_limit):
+                try:
+                    progress_callback(preview_index, effective_limit, eid)
+                except Exception:
+                    pass
         run_log_lines.append(
             f"[preview] direct_replay saved={saved_count} skipped={skipped_count} "
             f"cap={effective_limit}/{len(rows)} (hard_cap={self._DIRECT_PREVIEW_HARD_CAP})"
@@ -1057,7 +1205,13 @@ class RenderdocPerfService:
         walk(replay.controller.GetRootActions(), [])
         return result
 
-    def _get_shader_metrics(self, replay: RenderdocDirectReplay, pipe: Any, shader_cache: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    def _get_shader_metrics(
+        self,
+        replay: RenderdocDirectReplay,
+        pipe: Any,
+        shader_cache: Dict[str, Dict[str, Any]],
+        available_targets: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         metrics: Dict[str, Any] = {
             "vs_instruction_count": 0,
             "ps_instruction_count": 0,
@@ -1066,11 +1220,16 @@ class RenderdocPerfService:
             "disassembly_targets": {},
             "instruction_count_estimated": False,
         }
-        try:
-            available_targets_raw = list(replay.controller.GetDisassemblyTargets(True))
-        except Exception:
-            available_targets_raw = []
-        available_targets = [self._stringify(item) for item in available_targets_raw if self._stringify(item)]
+        # Opt-2: ``available_targets`` is pre-fetched once per analysis
+        # by ``analyze_capture`` and passed in.  The legacy per-draw
+        # ``GetDisassemblyTargets`` call is kept as a defensive fallback
+        # so this method still works if a caller forgets to pass it in.
+        if available_targets is None:
+            try:
+                available_targets_raw = list(replay.controller.GetDisassemblyTargets(True))
+            except Exception:
+                available_targets_raw = []
+            available_targets = [self._stringify(item) for item in available_targets_raw if self._stringify(item)]
 
         pipeline_object = pipe.GetGraphicsPipelineObject()
         for stage_name, stage_enum in (("vs", replay.rd.ShaderStage.Vertex), ("ps", replay.rd.ShaderStage.Pixel)):
@@ -1727,6 +1886,7 @@ def _perf_worker_entry(session_root: str, job_id: str, capture_path: str, conn: 
         service.analyze_capture(job_id, Path(capture_path), renderdoc_dir=renderdoc_dir)
         conn.send({"ok": True})
     except Exception as exc:
+        service._emit_progress(job_id, "failed", f"性能分析失败：{exc}")
         store.update_metadata(job_id, {"status": "failed"})
         conn.send({"ok": False, "error": str(exc)})
     finally:

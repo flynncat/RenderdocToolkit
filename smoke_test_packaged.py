@@ -59,6 +59,48 @@ def wait_for_health(base_url: str, timeout_seconds: int = 30) -> dict[str, Any]:
     raise RuntimeError(f"健康检查超时: {last_error}")
 
 
+def wait_for_perf_job(
+    base_url: str,
+    job_id: str,
+    *,
+    timeout_seconds: int = 900,
+    poll_interval: float = 2.0,
+) -> dict[str, Any]:
+    """Poll ``GET /api/renderdoc-perf/jobs/{job_id}`` until the job
+    reaches ``completed`` or ``failed``.
+
+    Mirrors the SPA's polling loop after the perf-analysis endpoint was
+    converted to fire-and-forget.  Raises ``RuntimeError`` on timeout or
+    when the job reports ``failed``.
+    """
+    deadline = time.time() + timeout_seconds
+    last_stage = ""
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(
+                f"{base_url}/api/renderdoc-perf/jobs/{job_id}", timeout=30
+            ) as response:
+                detail = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            time.sleep(poll_interval)
+            continue
+        metadata = detail.get("metadata") or {}
+        status = metadata.get("status") or "running"
+        progress = metadata.get("progress") or {}
+        stage = str(progress.get("stage") or "")
+        if stage and stage != last_stage:
+            print(f"  [perf {job_id}] stage={stage} msg={progress.get('message', '')}")
+            last_stage = stage
+        if status == "completed":
+            return detail
+        if status == "failed":
+            raise RuntimeError(
+                f"perf job {job_id} failed: stage={stage} message={progress.get('message', '')}"
+            )
+        time.sleep(poll_interval)
+    raise RuntimeError(f"perf job {job_id} timed out after {timeout_seconds}s")
+
+
 def choose_rdc_files() -> tuple[Path, Path] | None:
     captures = sorted(PROJECT_ROOT.glob("*.rdc"))
     if len(captures) < 2:
@@ -428,16 +470,23 @@ def run_api_regression(base_url: str, before_rdc: Path, after_rdc: Path, csv_pat
     print("cmp_job:", cmp_result["metadata"]["job_id"], cmp_result["metadata"]["status"])
     results["cmp_job_id"] = cmp_result["metadata"]["job_id"]
 
-    perf_first = post_form(
+    # ``/analyze[/by-path]`` was converted to fire-and-forget: it now
+    # returns ``{job_id, status:"running"}`` immediately and the analysis
+    # runs in the background.  We mirror the SPA's polling loop here.
+    perf_first_submit = post_form(
         f"{base_url}/api/renderdoc-perf/analyze/by-path",
         {"capture_path": str(before_rdc), "renderdoc_dir": ""},
-        timeout=900,
+        timeout=60,
     )
+    ensure(bool(perf_first_submit.get("job_id")), "首次性能分析提交未返回 job_id")
+    perf_first = wait_for_perf_job(base_url, perf_first_submit["job_id"])
     rows_first = (perf_first.get("analysis") or {}).get("rows") or []
     ensure(perf_first.get("metadata", {}).get("status") == "completed", "第一次性能分析未完成")
     ensure(bool(rows_first), "第一次性能分析没有 rows")
     perf_inputs = perf_first.get("metadata", {}).get("inputs", {})
     ensure("renderdoc_source" in perf_inputs, "性能分析 metadata 缺少 renderdoc_source 字段")
+    perf_progress = perf_first.get("metadata", {}).get("progress", {})
+    ensure(perf_progress.get("stage") == "completed", "性能分析未写入 progress.stage=completed")
     top_first = rows_first[0]
     preview_result = post_form(
         f"{base_url}/api/renderdoc-perf/jobs/{perf_first['metadata']['job_id']}/draw-preview",
@@ -448,11 +497,13 @@ def run_api_regression(base_url: str, before_rdc: Path, after_rdc: Path, csv_pat
     print("perf_job_first:", perf_first["metadata"]["job_id"], len(rows_first), top_first.get("eid"))
     results["perf_job_first"] = perf_first["metadata"]["job_id"]
 
-    perf_second = post_form(
+    perf_second_submit = post_form(
         f"{base_url}/api/renderdoc-perf/analyze/by-path",
         {"capture_path": str(after_rdc)},
-        timeout=900,
+        timeout=60,
     )
+    ensure(bool(perf_second_submit.get("job_id")), "第二次性能分析提交未返回 job_id")
+    perf_second = wait_for_perf_job(base_url, perf_second_submit["job_id"])
     rows_second = (perf_second.get("analysis") or {}).get("rows") or []
     ensure(perf_second.get("metadata", {}).get("status") == "completed", "第二次性能分析未完成")
     ensure(bool(rows_second), "第二次性能分析没有 rows")
