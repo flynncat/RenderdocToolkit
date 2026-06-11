@@ -1,0 +1,6 @@
+# Bundled portable runtime must stay as normal git blobs (NOT Git LFS).
+# UGit/TGit default LFS rules turn *.exe/*.dll/*.png into ~130-byte pointer
+# stubs — clones without `git lfs pull` break PyInstaller builds silently.
+external_tools/** -filter -diff
+docs/images/** -filter -diff
+.cursor/skills/** -filter -diff

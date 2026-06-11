@@ -127,6 +127,7 @@ build_portable.bat -OutputRoot "D:\YourOutput"
 
 打包脚本会自动完成以下步骤：
 
+- 校验仓库内 bundled runtime 关键文件是否齐全（`scripts/verify_bundled_assets.py`）
 - 关闭正在运行的旧绿色包进程
 - 清理项目内的 `build/` 和 `dist/`
 - 调用 `PyInstaller` 重新打包
@@ -265,6 +266,24 @@ config/                                 本地配置
 launcher.py                             桌面入口
 build_portable.ps1                      绿色包打包脚本
 RenderdocDiffTools.spec                 PyInstaller 打包配置
+scripts/verify_bundled_assets.py      打包前 bundled 资源完整性校验
+```
+
+### 仓库资源与 `.gitignore` 说明
+
+绿色包依赖以下路径的**真实文件**（须以普通 git blob 提交，不能是 Git LFS 指针）：
+
+- `external_tools/renderdoccmp/tools/**` — `renderdoccmd.exe`、`renderdoc.dll`、`astcenc`、`malioc` 等
+- `external_tools/renderdoccmp/{qr_replay_worker.py,rdc_compare_ultimate.py}`
+- `docs/images/**` — README 截图
+- `.cursor/skills/renderdoc-compare-diagnose/**` — 诊断脚本
+
+以下内容**应忽略**（本地生成，不应提交）：`build/`、`dist/`、`user_data/`、各 `*_sessions/`、`*.rdc`、renderdoccmp 的 `output/` 与 `*.zip.xml` 等。详见根目录 `.gitignore`。
+
+克隆后可在打包前手动验证：
+
+```powershell
+python scripts/verify_bundled_assets.py
 ```
 
 ## 延伸阅读

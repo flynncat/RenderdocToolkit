@@ -9,64 +9,196 @@ let perfPreviewHideTimer = null;
 let pendingAssetExportDraft = null;
 let pendingAssetExportPreview = null;
 
-function hasDesktopBridge() {
-  return Boolean(window.pywebview && window.pywebview.api);
+// ---- Server-side filesystem picker -------------------------------------
+// The browser sandbox can't hand us absolute local paths, so for the
+// "server local path" fields (RenderDoc install dir, by-path .rdc/.csv) we
+// browse the *server's* filesystem through /api/fs/list and let the user
+// click their way to a folder/file.
+const fsPicker = {
+  mode: "dir",
+  exts: "",
+  append: false,
+  targetId: null,
+  current: "",
+};
+
+async function fsList(path) {
+  const params = new URLSearchParams();
+  params.set("path", path || "");
+  params.set("mode", fsPicker.mode);
+  if (fsPicker.exts) params.set("exts", fsPicker.exts);
+  const response = await fetch(`/api/fs/list?${params.toString()}`);
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.detail || "读取目录失败");
+  }
+  return data;
 }
 
-async function pickDesktopFile(apiMethod, targetInputId) {
-  if (!hasDesktopBridge()) {
-    alert("当前环境未启用桌面文件对话框，请手动输入本地路径。");
+function renderFsList(data) {
+  fsPicker.current = data.current || "";
+  const pathInput = document.getElementById("fs-picker-path");
+  if (pathInput) pathInput.value = fsPicker.current;
+  const list = document.getElementById("fs-picker-list");
+  const chooseBtn = document.getElementById("fs-picker-choose");
+  if (chooseBtn) chooseBtn.disabled = !fsPicker.current;
+  list.innerHTML = "";
+  const entries = data.entries || [];
+  if (!entries.length) {
+    list.innerHTML = '<div class="empty-state">（此处没有可显示的项目）</div>';
     return;
   }
+  entries.forEach((entry) => {
+    const item = document.createElement("div");
+    item.className = "fs-picker-item" + (entry.is_dir ? " is-dir" : " is-file");
+    
+    if (entry.is_dir) {
+      item.innerHTML = `
+        <span class="fs-picker-icon">📁</span>
+        <span class="fs-picker-name"></span>
+        <button type="button" class="fs-picker-enter-btn" title="进入此文件夹">进入 ➜</button>
+      `;
+      item.querySelector(".fs-picker-name").textContent = entry.name;
+      
+      // Click handler
+      item.addEventListener("click", (e) => {
+        if (e.target.classList.contains("fs-picker-enter-btn")) {
+          e.stopPropagation();
+          loadFsPath(entry.path);
+          return;
+        }
+        if (fsPicker.mode === "dir") {
+          // In dir mode, clicking the folder row directly selects it
+          applyFsPick(entry.path);
+        } else {
+          // In file mode, clicking the folder row enters it to look for files
+          loadFsPath(entry.path);
+        }
+      });
+      
+      // Double click handler
+      item.addEventListener("dblclick", (e) => {
+        e.preventDefault();
+        loadFsPath(entry.path);
+      });
+    } else {
+      item.innerHTML = `<span class="fs-picker-icon">📄</span><span class="fs-picker-name"></span>`;
+      item.querySelector(".fs-picker-name").textContent = entry.name;
+      item.addEventListener("click", () => {
+        if (fsPicker.mode === "file") {
+          applyFsPick(entry.path);
+        }
+      });
+    }
+    list.appendChild(item);
+  });
+}
+
+async function loadFsPath(path) {
+  const list = document.getElementById("fs-picker-list");
+  if (list) list.innerHTML = '<div class="empty-state">加载中...</div>';
   try {
-    const value = await window.pywebview.api[apiMethod]();
-    if (value) {
-      document.getElementById(targetInputId).value = value;
+    const data = await fsList(path);
+    renderFsList(data);
+  } catch (error) {
+    if (list) list.innerHTML = `<div class="empty-state">错误：${error.message}</div>`;
+  }
+}
+
+function applyFsPick(value) {
+  const target = fsPicker.targetId && document.getElementById(fsPicker.targetId);
+  if (target && value) {
+    if (fsPicker.append) {
+      const existing = target.value.trim();
+      const lines = existing ? existing.split(/\r?\n/).map((s) => s.trim()).filter(Boolean) : [];
+      if (!lines.includes(value)) lines.push(value);
+      target.value = lines.join("\n");
+    } else {
+      target.value = value;
+    }
+    target.dispatchEvent(new Event("change", { bubbles: true }));
+    
+    // Update file-like label if exists
+    const label = document.getElementById(`${fsPicker.targetId}-label`);
+    if (label) {
+      label.textContent = value;
+      label.title = value;
+    }
+  }
+  closeFsPicker();
+}
+
+async function openFsPicker(button) {
+  fsPicker.mode = button.dataset.fsPick === "file" ? "file" : "dir";
+  fsPicker.exts = button.dataset.fsExts || "";
+  fsPicker.append = button.dataset.fsAppend === "1";
+  fsPicker.targetId = button.dataset.fsTarget || null;
+
+  // Try native OS file dialog first (works when running locally)
+  try {
+    const params = new URLSearchParams();
+    params.set("mode", fsPicker.mode);
+    if (fsPicker.exts) params.set("exts", fsPicker.exts);
+    params.set("title", button.dataset.fsTitle || "");
+    const response = await fetch(`/api/fs/local-pick?${params.toString()}`);
+    if (response.ok) {
+      const data = await response.json();
+      if (data.path) {
+        applyFsPick(data.path);
+        return;
+      }
+      // If data.path is empty, user cancelled the native dialog. Just return.
+      return;
     }
   } catch (error) {
-    alert(error.message || "打开文件对话框失败");
+    console.warn("Native file picker failed, falling back to web-based explorer:", error);
   }
+
+  // Fallback to web-based folder explorer modal
+  const titleEl = document.getElementById("fs-picker-title");
+  if (titleEl) titleEl.textContent = button.dataset.fsTitle || (fsPicker.mode === "file" ? "选择文件" : "选择目录");
+  const chooseBtn = document.getElementById("fs-picker-choose");
+  if (chooseBtn) {
+    // In file mode the user picks by clicking a file row; the "choose current
+    // directory" button only makes sense when selecting a folder.
+    chooseBtn.classList.toggle("hidden", fsPicker.mode === "file");
+    chooseBtn.textContent = fsPicker.append ? "追加此目录" : "选择此目录";
+  }
+  const modal = document.getElementById("fs-picker-modal");
+  if (modal) modal.classList.remove("hidden");
+  // Seed from the target's current value (use its directory) when present.
+  const target = fsPicker.targetId && document.getElementById(fsPicker.targetId);
+  let seed = "";
+  if (target && target.value) {
+    const firstLine = target.value.split(/\r?\n/)[0].trim();
+    seed = firstLine;
+  }
+  loadFsPath(seed);
 }
 
-async function pickDesktopDirectory(targetInputId) {
-  if (!hasDesktopBridge()) {
-    alert("当前环境未启用桌面目录对话框，请手动输入本地路径。");
+function closeFsPicker() {
+  const modal = document.getElementById("fs-picker-modal");
+  if (modal) modal.classList.add("hidden");
+}
+
+async function copyServerPathToClipboard(path) {
+  // Web deployment: output files live on the server, so we can't open the
+  // host's file explorer.  Offer the server-side path on the clipboard
+  // instead so operators can locate it via their own session.
+  const value = (path || "").trim();
+  if (!value) {
     return;
   }
   try {
-    const value = await window.pywebview.api.pick_directory();
-    if (value) {
-      document.getElementById(targetInputId).value = value;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(value);
+      alert(`服务器端输出路径已复制到剪贴板：\n${value}`);
+      return;
     }
-  } catch (error) {
-    alert(error.message || "打开目录对话框失败");
+  } catch (_e) {
+    // fall through to prompt fallback
   }
-}
-
-async function pickDesktopCsvFiles(targetInputId) {
-  if (!hasDesktopBridge()) {
-    alert("当前环境未启用桌面文件对话框，请手动输入本地路径。");
-    return;
-  }
-  try {
-    const value = await window.pywebview.api.pick_csv_files();
-    if (value) {
-      document.getElementById(targetInputId).value = value;
-    }
-  } catch (error) {
-    alert(error.message || "打开 CSV 多选对话框失败");
-  }
-}
-
-async function revealDesktopPath(path) {
-  if (!path || !hasDesktopBridge()) {
-    return;
-  }
-  try {
-    await window.pywebview.api.reveal_path(path);
-  } catch (error) {
-    console.warn("打开目录失败", error);
-  }
+  window.prompt("服务器端输出路径（请手动复制）：", value);
 }
 
 async function fetchJson(url, options = {}) {
@@ -733,33 +865,6 @@ function flashPerfReportStatus(message, level = "info") {
   }, 2400);
 }
 
-async function downloadPerfArtifactViaBridge(url, suggestedName, statusLabel) {
-  // pywebview's WebView2 backend swallows blob/anchor downloads, so the
-  // portable build delegates to a Python-side Save dialog + urllib fetch.
-  flashPerfReportStatus(`${statusLabel} 选择保存位置...`);
-  try {
-    const result = await window.pywebview.api.save_artifact_from_url(url, suggestedName);
-    if (!result) {
-      flashPerfReportStatus(`${statusLabel} 已取消`);
-      return null;
-    }
-    if (result.error) {
-      throw new Error(result.error);
-    }
-    if (result.cancelled) {
-      flashPerfReportStatus(`${statusLabel} 已取消`);
-      return null;
-    }
-    flashPerfReportStatus(`${statusLabel} 已保存到 ${result.path} ✓`);
-    return result.path || null;
-  } catch (error) {
-    const msg = error && error.message ? error.message : String(error);
-    flashPerfReportStatus(`${statusLabel} 桌面保存失败：${msg}`, "error");
-    // Fall through to blob-fallback so the user always gets a path.
-    return undefined;
-  }
-}
-
 async function downloadPerfArtifactViaBlobFallback(url, suggestedName, statusLabel) {
   flashPerfReportStatus(`${statusLabel} 准备中...`);
   try {
@@ -786,15 +891,7 @@ async function downloadPerfArtifactViaBlobFallback(url, suggestedName, statusLab
 }
 
 async function downloadPerfArtifactViaBlob(url, suggestedName, statusLabel) {
-  // Prefer the native Save dialog when running in pywebview because the
-  // blob-anchor trick is unreliable in WebView2 (no visible feedback).
-  if (hasDesktopBridge() && window.pywebview.api.save_artifact_from_url) {
-    const result = await downloadPerfArtifactViaBridge(url, suggestedName, statusLabel);
-    if (result !== undefined) {
-      return;
-    }
-    // result === undefined means the bridge raised — fall through to blob.
-  }
+  // Web deployment: standard browser blob download.
   await downloadPerfArtifactViaBlobFallback(url, suggestedName, statusLabel);
 }
 
@@ -1115,7 +1212,6 @@ function buildAssetExportDraft() {
   const singleManualEid = document.getElementById("asset-pass-manual-eid").value.trim();
   const startManualEid = document.getElementById("asset-pass-start-manual-eid").value.trim();
   const endManualEid = document.getElementById("asset-pass-end-manual-eid").value.trim();
-  const captureFile = document.getElementById("asset-capture-file").files[0] || null;
 
   if (exportScope === "single" && !singlePass.id && !singleManualEid) {
     throw new Error("请先读取 Pass 列表并选择一个 Pass，或手动填写单个 EID。");
@@ -1123,13 +1219,12 @@ function buildAssetExportDraft() {
   if (exportScope === "range" && (!(startPass.id || startManualEid) || !(endPass.id || endManualEid))) {
     throw new Error("请先读取 Pass 列表并选择起始/结束 Pass，或手动填写起始/结束 EID。");
   }
-  if (!capturePath && !captureFile) {
-    throw new Error("请先选择 .rdc 文件或填写路径。");
+  if (!capturePath) {
+    throw new Error("请先选择 .rdc 文件。");
   }
 
   return {
     capturePath,
-    captureFile,
     exportScope,
     passId: singleManualEid || singlePass.id,
     passName: singleManualEid || singlePass.label || singlePass.displayName || singlePass.name,
@@ -1155,19 +1250,11 @@ async function requestAssetExportMappingPreview(draft) {
   formData.append("pass_start", draft.passStart);
   formData.append("pass_end_id", draft.passEndId);
   formData.append("pass_end", draft.passEnd);
-  if (draft.capturePath) {
-    formData.append("capture_path", draft.capturePath);
-    response = await fetch("/api/asset-export/export-mapping-preview/by-path", {
-      method: "POST",
-      body: formData,
-    });
-  } else {
-    formData.append("capture_file", draft.captureFile);
-    response = await fetch("/api/asset-export/export-mapping-preview", {
-      method: "POST",
-      body: formData,
-    });
-  }
+  formData.append("capture_path", draft.capturePath);
+  response = await fetch("/api/asset-export/export-mapping-preview/by-path", {
+    method: "POST",
+    body: formData,
+  });
   const data = await response.json();
   if (!response.ok) {
     throw new Error(data.detail || "批量映射预览失败");
@@ -1237,12 +1324,12 @@ function renderAssetExportSummary(detail) {
     <div><strong>Shader:</strong> ${(result.shader_files || []).length}</div>
     <div><strong>贴图:</strong> ${(result.texture_files || []).length}</div>
     <div><strong>失败:</strong> ${(result.failed_items || []).length}</div>
-    ${outputRoot ? `<div><button id="asset-export-open-output-btn" type="button" class="secondary-btn">打开输出目录</button></div>` : ""}
+    ${outputRoot ? `<div><button id="asset-export-open-output-btn" type="button" class="secondary-btn">复制输出目录路径</button></div>` : ""}
   `;
   const openButton = document.getElementById("asset-export-open-output-btn");
   if (openButton) {
     openButton.addEventListener("click", () => {
-      revealDesktopPath(outputRoot);
+      copyServerPathToClipboard(outputRoot);
     });
   }
   document.getElementById("asset-export-log").textContent = detail.job_log || "暂无日志";
@@ -1401,44 +1488,27 @@ async function handleCmpRun(event) {
   button.textContent = "运行中...";
   setSummaryBusy("cmp-summary", [
     "状态: 运行中",
-    `Base: ${basePath || document.getElementById('cmp-base-file').files[0]?.name || "-"}`,
-    `New: ${newPath || document.getElementById('cmp-new-file').files[0]?.name || "-"}`,
+    `Base: ${basePath || "-"}`,
+    `New: ${newPath || "-"}`,
     "说明: 正在执行性能 Diff，请稍候...",
   ]);
   setLogBusy("cmp-run-log", "正在执行 renderdoc_cmp，请稍候...");
 
   try {
-    let response;
-    if (basePath && newPath) {
-      const formData = new FormData();
-      formData.append("base_path", basePath);
-      formData.append("new_path", newPath);
-      formData.append("strict_mode", strictMode);
-      formData.append("verbose", verbose);
-      formData.append("renderdoc_dir", renderdocDir);
-      formData.append("malioc_path", maliocPath);
-      response = await fetch("/api/renderdoc-cmp/compare/by-path", {
-        method: "POST",
-        body: formData,
-      });
-    } else {
-      const formData = new FormData();
-      const baseFile = document.getElementById("cmp-base-file").files[0];
-      const newFile = document.getElementById("cmp-new-file").files[0];
-      if (!baseFile || !newFile) {
-        throw new Error("请提供 base/new 两个 .rdc 路径。");
-      }
-      formData.append("base_file", baseFile);
-      formData.append("new_file", newFile);
-      formData.append("strict_mode", strictMode);
-      formData.append("verbose", verbose);
-      formData.append("renderdoc_dir", renderdocDir);
-      formData.append("malioc_path", maliocPath);
-      response = await fetch("/api/renderdoc-cmp/compare", {
-        method: "POST",
-        body: formData,
-      });
+    if (!basePath || !newPath) {
+      throw new Error("请先选择 base/new 两个 .rdc 文件。");
     }
+    const formData = new FormData();
+    formData.append("base_path", basePath);
+    formData.append("new_path", newPath);
+    formData.append("strict_mode", strictMode);
+    formData.append("verbose", verbose);
+    formData.append("renderdoc_dir", renderdocDir);
+    formData.append("malioc_path", maliocPath);
+    const response = await fetch("/api/renderdoc-cmp/compare/by-path", {
+      method: "POST",
+      body: formData,
+    });
     const data = await response.json();
     if (!response.ok) {
       throw new Error(data.detail || "renderdoc_cmp 运行失败");
@@ -1537,7 +1607,7 @@ async function handlePerfRun(event) {
   button.textContent = "分析中...";
   setSummaryBusy("perf-summary", [
     "状态: 运行中",
-    `Capture: ${capturePath || document.getElementById('perf-capture-file').files[0]?.name || "-"}`,
+    `Capture: ${capturePath || "-"}`,
     renderdocDir ? `RenderDoc: ${renderdocDir}` : "",
     "说明: 正在执行单帧性能分析，请稍候...",
   ].filter(Boolean));
@@ -1547,27 +1617,16 @@ async function handlePerfRun(event) {
 
   let submitResp;
   try {
-    if (capturePath) {
-      const formData = new FormData();
-      formData.append("capture_path", capturePath);
-      formData.append("renderdoc_dir", renderdocDir);
-      submitResp = await fetch("/api/renderdoc-perf/analyze/by-path", {
-        method: "POST",
-        body: formData,
-      });
-    } else {
-      const captureFile = document.getElementById("perf-capture-file").files[0];
-      if (!captureFile) {
-        throw new Error("请提供一个 .rdc 路径或文件。");
-      }
-      const formData = new FormData();
-      formData.append("capture_file", captureFile);
-      formData.append("renderdoc_dir", renderdocDir);
-      submitResp = await fetch("/api/renderdoc-perf/analyze", {
-        method: "POST",
-        body: formData,
-      });
+    if (!capturePath) {
+      throw new Error("请先选择一个 .rdc 文件。");
     }
+    const formData = new FormData();
+    formData.append("capture_path", capturePath);
+    formData.append("renderdoc_dir", renderdocDir);
+    submitResp = await fetch("/api/renderdoc-perf/analyze/by-path", {
+      method: "POST",
+      body: formData,
+    });
   } catch (error) {
     _hidePerfProgress();
     button.disabled = false;
@@ -1638,26 +1697,15 @@ async function handleAssetPassScan(event) {
   button.textContent = "读取中...";
   setLogBusy("asset-pass-scan-output", "正在读取 Pass 列表，请稍候...");
   try {
-    let response;
-    if (capturePath) {
-      const formData = new FormData();
-      formData.append("capture_path", capturePath);
-      response = await fetch("/api/asset-export/scan-passes/by-path", {
-        method: "POST",
-        body: formData,
-      });
-    } else {
-      const captureFile = document.getElementById("asset-capture-file").files[0];
-      if (!captureFile) {
-        throw new Error("请先选择 .rdc 文件或填写路径。");
-      }
-      const formData = new FormData();
-      formData.append("capture_file", captureFile);
-      response = await fetch("/api/asset-export/scan-passes", {
-        method: "POST",
-        body: formData,
-      });
+    if (!capturePath) {
+      throw new Error("请先选择 .rdc 文件。");
     }
+    const formData = new FormData();
+    formData.append("capture_path", capturePath);
+    const response = await fetch("/api/asset-export/scan-passes/by-path", {
+      method: "POST",
+      body: formData,
+    });
     const data = await response.json();
     if (!response.ok) {
       throw new Error(data.detail || "读取 Pass 列表失败");
@@ -1765,20 +1813,11 @@ async function submitAssetExportDraft(draft, mapping) {
     commonForm.append(key, value || "");
   });
 
-  if (draft.capturePath) {
-    commonForm.append("capture_path", draft.capturePath);
-    response = await fetch("/api/asset-export/jobs/by-path", {
-      method: "POST",
-      body: commonForm,
-    });
-  } else {
-    commonForm.append("capture_file", draft.captureFile);
-    commonForm.append("capture_source_path", draft.capturePath);
-    response = await fetch("/api/asset-export/jobs", {
-      method: "POST",
-      body: commonForm,
-    });
-  }
+  commonForm.append("capture_path", draft.capturePath);
+  response = await fetch("/api/asset-export/jobs/by-path", {
+    method: "POST",
+    body: commonForm,
+  });
   const data = await response.json();
   if (!response.ok) {
     throw new Error(data.detail || "保存资产导出任务失败");
@@ -1786,14 +1825,6 @@ async function submitAssetExportDraft(draft, mapping) {
   currentExportJobId = data.metadata.job_id;
   renderAssetExportSummary(data);
   await loadAssetExportJobs();
-  const outputRoot = (((data || {}).metadata || {}).result || {}).output_root
-    || ((((data || {}).metadata || {}).artifacts || {}).output_root)
-    || "";
-  if (outputRoot) {
-    window.setTimeout(() => {
-      revealDesktopPath(outputRoot);
-    }, 50);
-  }
   switchTab("asset-export");
 }
 
@@ -1932,14 +1963,33 @@ document.getElementById("open-setup-btn").addEventListener("click", showSetupMod
 document.getElementById("setup-close-btn").addEventListener("click", hideSetupModal);
 document.getElementById("asset-export-mapping-confirm-btn").addEventListener("click", handleAssetExportMappingConfirm);
 document.getElementById("asset-export-mapping-cancel-btn").addEventListener("click", hideAssetExportMappingModal);
-document.getElementById("pick-cmp-base-path-btn").addEventListener("click", () => pickDesktopFile("pick_rdc_file", "cmp-base-path"));
-document.getElementById("pick-cmp-new-path-btn").addEventListener("click", () => pickDesktopFile("pick_rdc_file", "cmp-new-path"));
-document.getElementById("pick-perf-capture-path-btn").addEventListener("click", () => pickDesktopFile("pick_rdc_file", "perf-capture-path"));
-document.getElementById("pick-perf-renderdoc-dir-btn").addEventListener("click", () => pickDesktopDirectory("perf-renderdoc-dir"));
-document.getElementById("pick-cmp-renderdoc-dir-btn").addEventListener("click", () => pickDesktopDirectory("cmp-renderdoc-dir"));
-document.getElementById("pick-asset-capture-path-btn").addEventListener("click", () => pickDesktopFile("pick_rdc_file", "asset-capture-source-path"));
-document.getElementById("pick-asset-csv-path-btn").addEventListener("click", () => pickDesktopCsvFiles("asset-csv-source-path"));
-document.getElementById("pick-asset-csv-dir-btn").addEventListener("click", () => pickDesktopDirectory("asset-csv-source-path"));
+document.addEventListener("click", (event) => {
+  const btn = event.target.closest("[data-fs-pick]");
+  if (btn) {
+    event.preventDefault();
+    openFsPicker(btn);
+  }
+});
+{
+  const goBtn = document.getElementById("fs-picker-go");
+  const upBtn = document.getElementById("fs-picker-up");
+  const chooseBtn = document.getElementById("fs-picker-choose");
+  const cancelBtn = document.getElementById("fs-picker-cancel");
+  const pathInput = document.getElementById("fs-picker-path");
+  const modal = document.getElementById("fs-picker-modal");
+  if (goBtn && pathInput) goBtn.addEventListener("click", () => loadFsPath(pathInput.value.trim()));
+  if (pathInput) pathInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); loadFsPath(pathInput.value.trim()); } });
+  if (upBtn) upBtn.addEventListener("click", async () => {
+    try {
+      const data = await fsList(fsPicker.current);
+      if (data.parent === null) return;
+      loadFsPath(data.parent || "");
+    } catch (_e) { /* ignore */ }
+  });
+  if (chooseBtn) chooseBtn.addEventListener("click", () => applyFsPick(fsPicker.current));
+  if (cancelBtn) cancelBtn.addEventListener("click", closeFsPicker);
+  if (modal) modal.addEventListener("click", (e) => { if (e.target === modal) closeFsPicker(); });
+}
 document.getElementById("perf-sort-field").addEventListener("change", renderPerfTable);
 document.getElementById("perf-sort-direction").addEventListener("change", renderPerfTable);
 {

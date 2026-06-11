@@ -202,16 +202,11 @@ class PerfReportBuilder:
         if pass_chart:
             lines.append("### 5.1 Pass 占比")
             lines.append("")
-            lines.append("| Pass | GPU ms | Draw 数 | 三角面 | 占比 |")
-            lines.append("|---|---|---|---|---|")
-            for item in pass_chart:
-                lines.append(
-                    f"| {_md_inline(item.get('name'))} "
-                    f"| {float(item.get('gpu_duration_ms') or 0.0):.3f} "
-                    f"| {int(item.get('draw_count') or 0)} "
-                    f"| {int(item.get('triangles') or 0):,} "
-                    f"| {float(item.get('percent') or 0.0):.2f}% |"
-                )
+            # Raw HTML block: table on the left, MobileSceneRender 开销 donut
+            # chart on the right (mirrors the SPA's pie).  Markdown passes
+            # block-level HTML through untouched, so we render the table as
+            # HTML here too.
+            lines.append(self._render_pass_share_html(pass_chart))
             lines.append("")
 
         if rows:
@@ -283,6 +278,122 @@ class PerfReportBuilder:
             for k, v in evidence.items():
                 block.append(f"  - `{k}` = `{_format_value(v)}`")
         return block
+
+    # Palette mirrors the SPA pie (app.js renderPerfChart).
+    _PASS_CHART_COLORS = (
+        "#2f81f7", "#30a46c", "#f59e0b", "#ef4444",
+        "#8b5cf6", "#14b8a6", "#64748b",
+    )
+
+    @classmethod
+    def _render_pass_share_html(cls, pass_chart: Sequence[Mapping[str, Any]]) -> str:
+        """Render the 5.1 block as a two-column layout: the Pass-share table on
+        the left and a MobileSceneRender 开销 donut chart on the right."""
+        colors = cls._PASS_CHART_COLORS
+
+        # --- left: HTML table ---
+        head = (
+            "<tr><th>Pass</th><th>GPU ms</th><th>Draw 数</th>"
+            "<th>三角面</th><th>占比</th></tr>"
+        )
+        body_rows: List[str] = []
+        for idx, item in enumerate(pass_chart):
+            swatch = (
+                f'<span style="display:inline-block;width:10px;height:10px;'
+                f'border-radius:2px;margin-right:6px;background:'
+                f'{colors[idx % len(colors)]}"></span>'
+            )
+            body_rows.append(
+                "<tr>"
+                f"<td>{swatch}{html_module.escape(_stringify(item.get('name')) or '-')}</td>"
+                f"<td>{float(item.get('gpu_duration_ms') or 0.0):.3f}</td>"
+                f"<td>{int(item.get('draw_count') or 0)}</td>"
+                f"<td>{int(item.get('triangles') or 0):,}</td>"
+                f"<td>{float(item.get('percent') or 0.0):.2f}%</td>"
+                "</tr>"
+            )
+        table_html = (
+            '<table class="pass-share-table">'
+            f"<thead>{head}</thead><tbody>{''.join(body_rows)}</tbody></table>"
+        )
+
+        # --- right: donut chart (inline SVG) ---
+        chart_html = cls._render_pass_share_chart(pass_chart)
+
+        return (
+            '<div class="pass-share-grid">'
+            f'<div class="pass-share-left">{table_html}</div>'
+            f'<div class="pass-share-right">{chart_html}</div>'
+            "</div>"
+        )
+
+    @classmethod
+    def _render_pass_share_chart(cls, pass_chart: Sequence[Mapping[str, Any]]) -> str:
+        """Build a self-contained inline-SVG donut chart from the pass-share
+        percentages, plus a colour legend."""
+        colors = cls._PASS_CHART_COLORS
+        cx = cy = 80.0
+        radius = 60.0
+        stroke_w = 34.0
+        circumference = 2.0 * 3.141592653589793 * radius
+
+        items = [
+            (
+                _stringify(item.get("name")) or "-",
+                max(float(item.get("percent") or 0.0), 0.0),
+                float(item.get("gpu_duration_ms") or 0.0),
+            )
+            for item in pass_chart
+        ]
+        total_percent = sum(p for _, p, _ in items)
+
+        segments: List[str] = []
+        offset = 0.0
+        for idx, (_, percent, _gpu) in enumerate(items):
+            if percent <= 0:
+                continue
+            frac = percent / 100.0
+            seg_len = circumference * frac
+            color = colors[idx % len(colors)]
+            segments.append(
+                f'<circle cx="{cx}" cy="{cy}" r="{radius}" fill="none" '
+                f'stroke="{color}" stroke-width="{stroke_w}" '
+                f'stroke-dasharray="{seg_len:.4f} {circumference - seg_len:.4f}" '
+                f'stroke-dashoffset="{-offset:.4f}"></circle>'
+            )
+            offset += seg_len
+
+        center_label = f"{total_percent:.0f}%"
+        svg = (
+            '<svg viewBox="0 0 160 160" class="pass-share-svg" '
+            'role="img" aria-label="MobileSceneRender 开销饼图">'
+            '<g transform="rotate(-90 80 80)">'
+            f'<circle cx="{cx}" cy="{cy}" r="{radius}" fill="none" '
+            f'stroke="#272b33" stroke-width="{stroke_w}"></circle>'
+            + "".join(segments)
+            + "</g>"
+            f'<text x="80" y="86" text-anchor="middle" '
+            f'font-size="22" fill="#e6e6e6">{center_label}</text>'
+            "</svg>"
+        )
+
+        legend_items: List[str] = []
+        for idx, (name, percent, gpu) in enumerate(items):
+            color = colors[idx % len(colors)]
+            legend_items.append(
+                '<div class="pass-share-legend-item">'
+                f'<span class="pass-share-dot" style="background:{color}"></span>'
+                f'<span>{html_module.escape(name)} · {percent:.2f}% · {gpu:.3f} ms</span>'
+                "</div>"
+            )
+        legend_html = (
+            f'<div class="pass-share-legend">{"".join(legend_items)}</div>'
+        )
+
+        return (
+            '<div class="pass-share-chart-title">MobileSceneRender 开销</div>'
+            f"{svg}{legend_html}"
+        )
 
     @staticmethod
     def _top_variants(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
@@ -485,13 +596,94 @@ class PerfReportBuilder:
             "#perf-results-table tr.zebra>td{background:#11141a;}\n"
             "#perf-results-wrap{max-height:70vh;overflow:auto;border:1px solid #272b33;"
             "border-radius:6px;}\n"
-            "#perf-results-table td img{display:block;margin:0;}\n"
+            "#perf-results-table td img{display:block;margin:0;cursor:zoom-in;"
+            "transition:transform .12s ease,box-shadow .12s ease;}\n"
+            "#perf-results-table td img:hover{transform:scale(1.06);"
+            "box-shadow:0 0 0 1px #2f81f7;}\n"
+            # ---- 5.1 pass-share layout ----
+            ".pass-share-grid{display:flex;gap:24px;align-items:flex-start;"
+            "flex-wrap:wrap;margin:12px 0;}\n"
+            ".pass-share-left{flex:1 1 420px;min-width:320px;}\n"
+            ".pass-share-right{flex:0 0 240px;display:flex;flex-direction:column;"
+            "align-items:center;}\n"
+            ".pass-share-table{width:100%;border-collapse:collapse;}\n"
+            ".pass-share-table th,.pass-share-table td{border:1px solid #272b33;"
+            "padding:6px 10px;font-size:13px;text-align:left;}\n"
+            ".pass-share-table th{background:#171a20;}\n"
+            ".pass-share-chart-title{color:#fff;font-weight:600;margin-bottom:8px;}\n"
+            ".pass-share-svg{width:180px;height:180px;}\n"
+            ".pass-share-legend{margin-top:10px;width:100%;}\n"
+            ".pass-share-legend-item{display:flex;align-items:center;gap:8px;"
+            "font-size:12px;color:#a7b0bf;margin:3px 0;}\n"
+            ".pass-share-dot{width:10px;height:10px;border-radius:2px;flex:0 0 auto;}\n"
+            # ---- hover/pinned image preview ----
+            "#img-hover-preview{position:fixed;z-index:9998;pointer-events:none;"
+            "display:none;border:1px solid #2f81f7;border-radius:6px;background:#0a0c10;"
+            "box-shadow:0 8px 28px rgba(0,0,0,.55);max-width:520px;max-height:520px;}\n"
+            "#img-pin-overlay{position:fixed;inset:0;z-index:9999;display:none;"
+            "background:rgba(0,0,0,.78);align-items:center;justify-content:center;"
+            "cursor:zoom-out;}\n"
+            "#img-pin-overlay img{max-width:92vw;max-height:92vh;border-radius:6px;"
+            "box-shadow:0 10px 40px rgba(0,0,0,.6);}\n"
+            "#img-pin-hint{position:fixed;top:14px;left:50%;transform:translateX(-50%);"
+            "color:#cbd3e1;font-size:13px;background:#171a20;padding:6px 12px;"
+            "border-radius:6px;border:1px solid #272b33;}\n"
             "</style>\n"
             "</head>\n"
             "<body>\n"
             + body_html
             + (("\n" + extra_body_html) if extra_body_html else "")
+            + "\n" + self._image_preview_script()
             + "\n</body>\n</html>\n"
+        )
+
+    @staticmethod
+    def _image_preview_script() -> str:
+        """Vanilla JS embedded in the standalone report: hover a wireframe
+        thumbnail in section 6 to see a larger floating preview, double-click
+        to open a pinned full-screen overlay (click / Esc to close)."""
+        return (
+            '<div id="img-hover-preview"><img alt="preview"></div>\n'
+            '<div id="img-pin-overlay"><div id="img-pin-hint">双击图片放大 · 点击空白处或按 Esc 关闭</div>'
+            '<img alt="pinned preview"></div>\n'
+            "<script>\n"
+            "(function(){\n"
+            "  var hover=document.getElementById('img-hover-preview');\n"
+            "  var hoverImg=hover?hover.querySelector('img'):null;\n"
+            "  var overlay=document.getElementById('img-pin-overlay');\n"
+            "  var overlayImg=overlay?overlay.querySelector('img'):null;\n"
+            "  var table=document.getElementById('perf-results-table');\n"
+            "  if(!table||!hover||!overlay){return;}\n"
+            "  function moveHover(e){\n"
+            "    var pad=18, w=hover.offsetWidth, h=hover.offsetHeight;\n"
+            "    var x=e.clientX+pad, y=e.clientY+pad;\n"
+            "    if(x+w>window.innerWidth){x=e.clientX-pad-w;}\n"
+            "    if(y+h>window.innerHeight){y=e.clientY-pad-h;}\n"
+            "    if(x<4){x=4;} if(y<4){y=4;}\n"
+            "    hover.style.left=x+'px'; hover.style.top=y+'px';\n"
+            "  }\n"
+            "  table.addEventListener('mouseover',function(e){\n"
+            "    var img=e.target.closest('img'); if(!img){return;}\n"
+            "    hoverImg.src=img.src; hover.style.display='block'; moveHover(e);\n"
+            "  });\n"
+            "  table.addEventListener('mousemove',function(e){\n"
+            "    if(hover.style.display==='block'){moveHover(e);}\n"
+            "  });\n"
+            "  table.addEventListener('mouseout',function(e){\n"
+            "    var img=e.target.closest('img'); if(!img){return;}\n"
+            "    hover.style.display='none';\n"
+            "  });\n"
+            "  table.addEventListener('dblclick',function(e){\n"
+            "    var img=e.target.closest('img'); if(!img){return;}\n"
+            "    e.preventDefault(); hover.style.display='none';\n"
+            "    overlayImg.src=img.src; overlay.style.display='flex';\n"
+            "  });\n"
+            "  overlay.addEventListener('click',function(){overlay.style.display='none';});\n"
+            "  document.addEventListener('keydown',function(e){\n"
+            "    if(e.key==='Escape'){overlay.style.display='none';}\n"
+            "  });\n"
+            "})();\n"
+            "</script>\n"
         )
 
     @staticmethod

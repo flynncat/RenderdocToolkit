@@ -863,7 +863,16 @@ async def run_ui_regression(base_url: str, before_rdc: Path, after_rdc: Path, cs
         ensure(await page.locator("#cmp-renderdoc-dir").count() > 0, "性能 Diff Tab 缺少 RenderDoc 目录输入")
 
         await page.click('.tab-btn[data-tab="asset-export"]')
-        await page.fill("#asset-capture-source-path", str(before_rdc))
+        # ``#asset-capture-source-path`` is now a hidden input populated by the
+        # native OS file dialog, so set its value via JS instead of ``fill``.
+        await page.evaluate(
+            """(value) => {
+                const el = document.getElementById('asset-capture-source-path');
+                el.value = value;
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }""",
+            str(before_rdc),
+        )
         await page.click("#asset-pass-scan-btn")
         await page.wait_for_function(
             "() => document.querySelector('#asset-pass-name')?.options.length > 1",
@@ -1007,6 +1016,8 @@ def main() -> None:
 
     launch_env = os.environ.copy()
     launch_env["RENDERDOC_PORTABLE_HEADLESS"] = "1"
+    # Don't pop a browser during automated regression runs.
+    launch_env["RENDERDOC_WEBUI_NO_BROWSER"] = "1"
     proc = subprocess.Popen([str(EXE_PATH)], env=launch_env)
     try:
         port = wait_for_port()

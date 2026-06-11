@@ -2,8 +2,8 @@
 
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = []
-for package_name in ("fastapi", "starlette", "uvicorn", "httpx", "anyio", "jinja2", "webview", "markdown"):
+hiddenimports = ["app.services.win32_picker"]
+for package_name in ("fastapi", "starlette", "uvicorn", "httpx", "anyio", "jinja2", "markdown"):
     hiddenimports += collect_submodules(package_name)
 
 datas = [
@@ -23,7 +23,16 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        # Web-only build: no desktop window backend, so keep the heavy Qt /
+        # webview stacks out of the package entirely (saves ~100MB+).
+        "webview",
+        "PyQt5",
+        "PyQt6",
+        "PySide2",
+        "PySide6",
+        "tkinter",
+    ],
     noarchive=False,
     optimize=0,
 )
@@ -39,7 +48,10 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,
+    # Web-only build: show a console window so a double-click gives visible
+    # feedback (prints the URL + lets the user Ctrl+C to stop the service),
+    # instead of the previous silent background process.
+    console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

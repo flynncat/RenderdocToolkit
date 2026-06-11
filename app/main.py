@@ -520,6 +520,156 @@ async def ping() -> dict:
     return {"ok": True}
 
 
+def _list_windows_drives() -> list[str]:
+    drives: list[str] = []
+    import string
+
+    for letter in string.ascii_uppercase:
+        root = f"{letter}:\\"
+        try:
+            if os.path.exists(root):
+                drives.append(root)
+        except OSError:
+            continue
+    return drives
+
+
+@app.get("/api/fs/list")
+async def fs_list(path: str = "", mode: str = "dir", exts: str = "") -> dict:
+    """Browse the *server's* filesystem so the web UI can offer a native-like
+    folder/file picker (the browser sandbox can't hand us absolute local
+    paths).
+
+    - ``mode='dir'``  → list sub-directories only (for choosing a folder)
+    - ``mode='file'`` → list sub-directories + files matching ``exts``
+    - ``exts``        → comma-separated suffixes filter, e.g. ``.rdc,.csv``
+
+    With an empty ``path`` on Windows we return the available drive roots so
+    the user can start from "this PC".
+    """
+    mode = (mode or "dir").strip().lower()
+    if mode not in {"dir", "file"}:
+        mode = "dir"
+    suffixes = {
+        item.strip().lower()
+        for item in (exts or "").split(",")
+        if item.strip()
+    }
+
+    raw_path = (path or "").strip()
+    is_windows = platform.system().lower().startswith("win")
+
+    # Empty path → drive roots (Windows) or filesystem root (posix).
+    if not raw_path:
+        if is_windows:
+            drives = _list_windows_drives()
+            return {
+                "current": "",
+                "parent": None,
+                "is_root": True,
+                "drives": drives,
+                "entries": [{"name": d, "path": d, "is_dir": True} for d in drives],
+            }
+        raw_path = "/"
+
+    try:
+        current = Path(raw_path).expanduser().resolve()
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"无效路径: {raw_path}")
+
+    if not current.exists() or not current.is_dir():
+        raise HTTPException(status_code=400, detail=f"目录不存在: {current}")
+
+    # Determine parent (None means "go up to drive list" on Windows root).
+    parent: Optional[str]
+    if current.parent == current:
+        parent = "" if is_windows else None
+    else:
+        parent = str(current.parent)
+
+    entries: list[dict] = []
+    try:
+        children = sorted(
+            current.iterdir(),
+            key=lambda p: (not p.is_dir(), p.name.lower()),
+        )
+    except PermissionError:
+        raise HTTPException(status_code=403, detail=f"无权限访问: {current}")
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"读取目录失败: {exc}")
+
+    for child in children:
+        try:
+            is_dir = child.is_dir()
+        except OSError:
+            continue
+        if is_dir:
+            entries.append({"name": child.name, "path": str(child), "is_dir": True})
+        elif mode == "file":
+            if suffixes and child.suffix.lower() not in suffixes:
+                continue
+            entries.append({"name": child.name, "path": str(child), "is_dir": False})
+
+    return {
+        "current": str(current),
+        "parent": parent,
+        "is_root": False,
+        "drives": _list_windows_drives() if is_windows else [],
+        "entries": entries,
+    }
+
+
+@app.get("/api/fs/local-pick")
+async def fs_local_pick(mode: str = "dir", exts: str = "", title: str = "") -> dict:
+    """Open a native OS file/folder dialog on the server machine.
+    Only works if the server is running locally with a GUI session.
+    """
+    def _pick():
+        import platform
+        if platform.system().lower().startswith("win"):
+            from app.services.win32_picker import pick_directory_win32, pick_file_win32
+            if mode == "dir":
+                return pick_directory_win32(title or "选择文件夹")
+            else:
+                filetypes = []
+                if exts:
+                    suffixes = [item.strip() for item in exts.split(",") if item.strip()]
+                    for s in suffixes:
+                        ext_name = s.lstrip(".").upper()
+                        filetypes.append((f"{ext_name} Files (*{s})", f"*{s}"))
+                return pick_file_win32(title or "选择文件", filetypes=filetypes)
+        else:
+            try:
+                import tkinter as tk
+                from tkinter import filedialog
+                root = tk.Tk()
+                root.withdraw()
+                root.attributes('-topmost', True)
+                path = ""
+                if mode == "dir":
+                    path = filedialog.askdirectory(title=title or "选择文件夹")
+                else:
+                    filetypes = []
+                    if exts:
+                        suffixes = [item.strip() for item in exts.split(",") if item.strip()]
+                        for s in suffixes:
+                            ext_name = s.lstrip(".").upper()
+                            filetypes.append((f"{ext_name} Files (*{s})", f"*{s}"))
+                    filetypes.append(("All Files (*.*)", "*.*"))
+                    path = filedialog.askopenfilename(title=title or "选择文件", filetypes=filetypes)
+                root.destroy()
+                return path
+            except Exception:
+                return ""
+
+    try:
+        path = await run_in_threadpool(_pick)
+        return {"path": path}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"打开系统对话框失败: {exc}")
+        raise HTTPException(status_code=500, detail=f"打开系统对话框失败: {exc}")
+
+
 @app.get("/api/setup-status")
 async def setup_status() -> dict:
     payload = _health_payload()

@@ -1175,10 +1175,62 @@ class RenderdocDirectReplay:
             )
         return result
 
+    def list_draws(self) -> list[dict]:
+        """Enumerate drawcalls straight from the RenderDoc action tree.
+
+        Replaces the previous dependency on the external ``rdc draws --json``
+        CLI (which used a fixed, often-stale RenderDoc build) so the perf path
+        honours whatever RenderDoc install the user selected.  Each entry is
+        shaped like the old CLI output that ``RenderdocPerfService._build_rows``
+        consumes: ``eid``, ``type``, ``marker``, ``num_indices`` and
+        ``instances``.  Triangle counts are derived later from the per-draw
+        pipeline topology where the frame event is already set.
+        """
+        if self.controller is None or self.rd is None:
+            raise RuntimeError("RenderDoc replay is not opened")
+        rd = self.rd
+        draw_flag = getattr(rd.ActionFlags, "Drawcall", None)
+        dispatch_flag = getattr(rd.ActionFlags, "Dispatch", None)
+        results: list[dict] = []
+
+        def _has_flag(flags: Any, flag: Any) -> bool:
+            if flag is None:
+                return False
+            try:
+                return bool(int(flags) & int(flag))
+            except Exception:
+                return False
+
+        def walk(actions: Any, ancestors: list) -> None:
+            for action in actions:
+                name = self._stringify(getattr(action, "customName", ""))
+                named = ancestors + ([name] if name else [])
+                flags = getattr(action, "flags", 0)
+                if _has_flag(flags, draw_flag):
+                    results.append(
+                        {
+                            "eid": int(getattr(action, "eventId", 0) or 0),
+                            "type": "Dispatch" if _has_flag(flags, dispatch_flag) else "Draw",
+                            "marker": named[-1] if named else "",
+                            "num_indices": int(getattr(action, "numIndices", 0) or 0),
+                            "instances": int(getattr(action, "numInstances", 0) or 0),
+                        }
+                    )
+                walk(getattr(action, "children", []), named)
+
+        walk(self.controller.GetRootActions(), [])
+        return results
+
     def _import_renderdoc(self):
+        from app.services.renderdoc_runtime_resolver import add_renderdoc_dll_search_dirs
+
         python_path = self._renderdoc_python_path or (app_config.RENDERDOC_PYTHON_PATH or "").strip()
         if not python_path:
             raise RuntimeError("未配置 RenderDoc Python 路径")
+        # The official RenderDoc layout keeps renderdoc.dll one level above the
+        # renderdoc.pyd (in ``pymodules``); register both so the import below
+        # doesn't fail with ``DLL load failed``.
+        add_renderdoc_dll_search_dirs(python_path)
         if python_path not in sys.path:
             sys.path.insert(0, python_path)
         import renderdoc  # type: ignore

@@ -51,17 +51,18 @@
     <section class="panel form-panel">
       <h2>单 RDC 性能分析</h2>
       <form id="perf-form">
-        <label>RenderDoc `.rdc` 路径</label>
-        <div class="input-with-button">
-          <input id="perf-capture-path" type="text" placeholder="例如 G:\Capture\profile.rdc">
-          <button id="pick-perf-capture-path-btn" type="button" class="secondary-btn">浏览</button>
+        <label>RenderDoc `.rdc` 文件</label>
+        <div class="file-like-picker">
+          <button type="button" class="secondary-btn" data-fs-pick="file" data-fs-target="perf-capture-path" data-fs-exts=".rdc" data-fs-title="选择 .rdc 文件">选择文件</button>
+          <span id="perf-capture-path-label" class="file-like-label">未选择任何文件</span>
+          <input id="perf-capture-path" type="hidden" value="">
         </div>
-        <input id="perf-capture-file" name="capture_file" type="file" accept=".rdc" class="hidden">
 
-        <label>RenderDoc 目录（可选）</label>
-        <div class="input-with-button">
-          <input id="perf-renderdoc-dir" name="renderdoc_dir" type="text" placeholder="例如 C:\Program Files\RenderDoc">
-          <button id="pick-perf-renderdoc-dir-btn" type="button" class="secondary-btn">浏览</button>
+        <label>RenderDoc 目录（可选，服务器端路径）</label>
+        <div class="file-like-picker">
+          <button type="button" class="secondary-btn" data-fs-pick="dir" data-fs-target="perf-renderdoc-dir" data-fs-title="选择 RenderDoc 目录">选择文件夹</button>
+          <span id="perf-renderdoc-dir-label" class="file-like-label">未选择任何文件夹</span>
+          <input id="perf-renderdoc-dir" name="renderdoc_dir" type="hidden" value="">
         </div>
 
         <button id="perf-run-btn" type="submit">执行性能分析</button>
@@ -157,31 +158,36 @@
     <section class="panel form-panel">
       <h2>renderdoc_cmp 比较</h2>
       <form id="cmp-form">
-        <label>Base `.rdc` 路径</label>
-        <div class="input-with-button">
-          <input id="cmp-base-path" type="text" placeholder="例如 G:\Capture\base.rdc">
-          <button id="pick-cmp-base-path-btn" type="button" class="secondary-btn">浏览</button>
+        <label>Base `.rdc` 文件</label>
+        <div class="file-like-picker">
+          <button type="button" class="secondary-btn" data-fs-pick="file" data-fs-target="cmp-base-path" data-fs-exts=".rdc" data-fs-title="选择 Base .rdc 文件">选择文件</button>
+          <span id="cmp-base-path-label" class="file-like-label">未选择任何文件</span>
+          <input id="cmp-base-path" type="hidden" value="">
         </div>
-        <input id="cmp-base-file" name="base_file" type="file" accept=".rdc" class="hidden">
 
-        <label>New `.rdc` 路径</label>
-        <div class="input-with-button">
-          <input id="cmp-new-path" type="text" placeholder="例如 G:\Capture\new.rdc">
-          <button id="pick-cmp-new-path-btn" type="button" class="secondary-btn">浏览</button>
+        <label>New `.rdc` 文件</label>
+        <div class="file-like-picker">
+          <button type="button" class="secondary-btn" data-fs-pick="file" data-fs-target="cmp-new-path" data-fs-exts=".rdc" data-fs-title="选择 New .rdc 文件">选择文件</button>
+          <span id="cmp-new-path-label" class="file-like-label">未选择任何文件</span>
+          <input id="cmp-new-path" type="hidden" value="">
         </div>
-        <input id="cmp-new-file" name="new_file" type="file" accept=".rdc" class="hidden">
 
         <div class="row">
           <div>
-            <label>RenderDoc 目录（可选）</label>
-            <div class="input-with-button">
-              <input id="cmp-renderdoc-dir" name="renderdoc_dir" type="text" placeholder="例如 C:\Program Files\RenderDoc">
-              <button id="pick-cmp-renderdoc-dir-btn" type="button" class="secondary-btn">浏览</button>
+            <label>RenderDoc 目录（可选，服务器端路径）</label>
+            <div class="file-like-picker">
+              <button type="button" class="secondary-btn" data-fs-pick="dir" data-fs-target="cmp-renderdoc-dir" data-fs-title="选择 RenderDoc 目录">选择文件夹</button>
+              <span id="cmp-renderdoc-dir-label" class="file-like-label">未选择任何文件夹</span>
+              <input id="cmp-renderdoc-dir" name="renderdoc_dir" type="hidden" value="">
             </div>
           </div>
           <div>
             <label>Malioc 路径（可选）</label>
-            <input id="cmp-malioc-path" name="malioc_path" type="text" placeholder="例如 C:\Path\to\malioc.exe">
+            <div class="file-like-picker">
+              <button type="button" class="secondary-btn" data-fs-pick="file" data-fs-target="cmp-malioc-path" data-fs-exts=".exe" data-fs-title="选择 malioc.exe">选择文件</button>
+              <span id="cmp-malioc-path-label" class="file-like-label">未选择任何文件</span>
+              <input id="cmp-malioc-path" name="malioc_path" type="hidden" value="">
+            </div>
           </div>
         </div>
 
@@ -220,12 +226,12 @@
     <section class="panel form-panel">
       <h2>资产批量导出</h2>
       <form id="asset-pass-scan-form">
-        <label>RenderDoc `.rdc` 路径</label>
-        <div class="input-with-button">
-          <input id="asset-capture-source-path" type="text" placeholder="例如 G:\Capture\face_issue.rdc">
-          <button id="pick-asset-capture-path-btn" type="button" class="secondary-btn">浏览</button>
+        <label>RenderDoc `.rdc` 文件</label>
+        <div class="file-like-picker">
+          <button type="button" class="secondary-btn" data-fs-pick="file" data-fs-target="asset-capture-source-path" data-fs-exts=".rdc" data-fs-title="选择 .rdc 文件">选择文件</button>
+          <span id="asset-capture-source-path-label" class="file-like-label">未选择任何文件</span>
+          <input id="asset-capture-source-path" type="hidden" value="">
         </div>
-        <input id="asset-capture-file" type="file" accept=".rdc" class="hidden">
         <button id="asset-pass-scan-btn" type="submit">读取 Pass 列表</button>
       </form>
 
@@ -302,13 +308,17 @@
     <section class="panel result-panel">
       <h2>CSV 列映射预览</h2>
       <form id="asset-csv-inspect-form">
-        <label>CSV 或目录路径（可手填；多文件请每行一个路径）</label>
-        <div class="input-with-button input-with-button-multi">
-          <textarea id="asset-csv-source-path" rows="3" placeholder="例如：&#10;G:\Capture\a\mesh.csv&#10;G:\Capture\b\mesh.csv&#10;或单个目录路径"></textarea>
-          <button id="pick-asset-csv-path-btn" type="button" class="secondary-btn">浏览</button>
-          <button id="pick-asset-csv-dir-btn" type="button" class="secondary-btn">目录</button>
-        </div>
-        <input id="asset-csv-file" type="file" accept=".csv" class="hidden">
+        <label>CSV 文件（上传单个）</label>
+        <input id="asset-csv-file" type="file" accept=".csv">
+        <details class="advanced-path">
+          <summary>高级：使用服务器本地路径（支持多文件 / 目录）</summary>
+          <div class="input-with-button input-with-button-multi">
+            <textarea id="asset-csv-source-path" rows="3" placeholder="例如：&#10;G:\Capture\a\mesh.csv&#10;G:\Capture\b\mesh.csv&#10;或单个目录路径（需位于服务器）"></textarea>
+            <button type="button" class="secondary-btn" data-fs-pick="file" data-fs-target="asset-csv-source-path" data-fs-exts=".csv" data-fs-append="1" data-fs-title="选择 CSV 文件">追加文件</button>
+            <button type="button" class="secondary-btn" data-fs-pick="dir" data-fs-target="asset-csv-source-path" data-fs-append="1" data-fs-title="选择 CSV 目录">追加目录</button>
+          </div>
+          <p class="advanced-hint">填写后将优先使用服务器端路径；支持每行一个 CSV 路径或单个目录，忽略上方上传的文件。「追加」会把所选路径追加到文本框新的一行。</p>
+        </details>
         <button id="asset-csv-inspect-btn" type="submit">识别列映射</button>
       </form>
 
@@ -452,6 +462,22 @@
       <div class="modal-actions">
         <button id="asset-export-mapping-confirm-btn" type="button">确认映射并开始导出</button>
         <button id="asset-export-mapping-cancel-btn" type="button" class="secondary-btn">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="fs-picker-modal" class="modal-backdrop hidden">
+    <div class="modal-panel fs-picker-panel">
+      <h2 id="fs-picker-title">选择目录</h2>
+      <div class="fs-picker-pathbar">
+        <input id="fs-picker-path" type="text" placeholder="当前路径">
+        <button id="fs-picker-go" type="button" class="secondary-btn">前往</button>
+        <button id="fs-picker-up" type="button" class="secondary-btn">上一级</button>
+      </div>
+      <div id="fs-picker-list" class="fs-picker-list"></div>
+      <div class="modal-actions">
+        <button id="fs-picker-choose" type="button">选择此目录</button>
+        <button id="fs-picker-cancel" type="button" class="secondary-btn">取消</button>
       </div>
     </div>
   </div>

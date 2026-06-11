@@ -154,14 +154,12 @@ class RenderdocPerfService:
             f"[renderdoc] dir={rd_ctx.renderdoc_dir} python={rd_ctx.renderdoc_python_path} source={rd_ctx.source}",
         ]
 
-        self._emit_progress(job_id, "load_draws", "正在加载 draw 列表（rdc draws --json）…")
-        draws_payload = self._load_draws_payload(capture_path)
-        draw_rows = self._extract_draw_rows(draws_payload)
-        # Opt-1: skip ``rdc counters --json`` (one full capture open/close).
-        # The 6 counters consumed by ``_build_rows`` come from the same
-        # underlying RenderDoc Python API; ``fetch_counter_map`` filters
-        # out names that the current backend doesn't expose, which matches
-        # the CLI path's behaviour when those counters are unavailable.
+        # Draw enumeration and counters both come straight from the RenderDoc
+        # Python API inside the replay session below.  This removes the old
+        # dependency on the external ``rdc draws --json`` CLI (a fixed, often
+        # stale RenderDoc build) so the whole perf path honours the
+        # user-selected RenderDoc install and supports the same capture
+        # versions that install can open.
         counter_map: Dict[str, Dict[str, float]] = {}
 
         shader_cache: Dict[str, Dict[str, Any]] = {}
@@ -169,6 +167,9 @@ class RenderdocPerfService:
         with RenderdocDirectReplay(capture_path, renderdoc_python_path=rd_ctx.renderdoc_python_path) as replay:
             capture_info = replay.get_capture_metadata()
             texture_desc_map = replay.get_texture_description_map()
+            self._emit_progress(job_id, "load_draws", "正在枚举 draw 列表（直连 RenderDoc API）…")
+            draw_rows = replay.list_draws()
+            run_log_lines.append(f"[draws] enumerated={len(draw_rows)} via direct RenderDoc API")
             self._emit_progress(job_id, "fetch_counters", f"正在批量采集 GPU counter ({len(self.COUNTER_NAMES)} 个)…")
             counter_map = replay.fetch_counter_map(self.COUNTER_NAMES)
             missing_counters = [
@@ -894,7 +895,12 @@ class RenderdocPerfService:
             pass_name = self._stringify(metadata.get("pass_name")) or self._stringify(draw.get("marker")) or f"EID {eid}"
             scene_pass_from_marker = self._normalize_scene_pass_name(self._stringify(metadata.get("scene_pass")))
             scene_pass_source = self._stringify(metadata.get("scene_pass_source"))
-            triangle_count = int(draw.get("triangles") or 0)
+            if draw.get("triangles") is not None:
+                triangle_count = int(draw.get("triangles") or 0)
+            else:
+                triangle_count = self._compute_triangle_count(
+                    replay.rd, pipe, int(draw.get("num_indices") or 0)
+                )
             instances = int(draw.get("instances") or 0)
             ps_invocations = int(counters.get("PS Invocations", 0))
             instruction_total = int(shader_metrics.get("instruction_total", 0))
@@ -1688,6 +1694,41 @@ class RenderdocPerfService:
             mb = float(item.get("byte_size_mb") or 0.0)
             parts.append(f"T{slot} {width}x{height} {fmt} {mb:.3f}MB")
         return " | ".join(parts)
+
+    @staticmethod
+    def _compute_triangle_count(rd_mod: Any, pipe: Any, num_indices: int) -> int:
+        """Derive a triangle count from the draw's primitive topology.
+
+        Replaces the value the old ``rdc draws --json`` CLI used to provide.
+        Only triangle topologies contribute; lines / points / patches return
+        0 (their geometry isn't measured in triangles).
+        """
+        if num_indices <= 0:
+            return 0
+        topology_enum = getattr(rd_mod, "Topology", None)
+        if topology_enum is None:
+            return 0
+        try:
+            topo = int(pipe.GetPrimitiveTopology())
+        except Exception:
+            return 0
+        try:
+            tri_list = int(topology_enum.TriangleList)
+            tri_strip = int(topology_enum.TriangleStrip)
+            tri_fan = int(topology_enum.TriangleFan)
+            tri_list_adj = int(topology_enum.TriangleList_Adj)
+            tri_strip_adj = int(topology_enum.TriangleStrip_Adj)
+        except Exception:
+            return 0
+        if topo == tri_list:
+            return num_indices // 3
+        if topo in (tri_strip, tri_fan):
+            return max(0, num_indices - 2)
+        if topo == tri_list_adj:
+            return num_indices // 6
+        if topo == tri_strip_adj:
+            return max(0, (num_indices // 2) - 2)
+        return 0
 
     @staticmethod
     def _extract_draw_rows(payload: Any) -> List[Dict[str, Any]]:

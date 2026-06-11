@@ -61,6 +61,16 @@ if (-not (Test-Path (Join-Path $BundledCmpRoot "rdc_compare_ultimate.py"))) {
     throw "Bundled renderdoc_cmp runtime not found: $BundledCmpRoot"
 }
 
+$VerifyScript = Join-Path $ProjectRoot "scripts\verify_bundled_assets.py"
+if (-not (Test-Path $VerifyScript)) {
+    throw "Bundled asset verify script not found: $VerifyScript"
+}
+Write-Host "== Verify bundled runtime assets ==" -ForegroundColor Cyan
+python $VerifyScript
+if ($LASTEXITCODE -ne 0) {
+    throw "Bundled asset verification failed — fix .gitignore / LFS pointers before building."
+}
+
 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
 
 $SourceSettings = Read-SettingsFile $SourceSettingsPath
@@ -121,6 +131,29 @@ if (-not (Test-Path $BuiltDir)) {
 
 Copy-Item $BuiltDir $PortableDir -Recurse -Force
 
+# RenderDoc 1.4x (built with VS2022) can fail to load its renderdoc.dll when an
+# older MSVC runtime ends up on the DLL search path -- the import dies with "DLL
+# initialization routine failed".  Overwrite the bundled CRT with the current
+# System32 (VS2022) copies so the process uses a runtime new enough for RenderDoc.
+# (The Qt/PyQt5 backend is no longer bundled in the web-only build, so its CRT
+# target below is simply skipped when the directory is absent.)
+$System32 = Join-Path $env:SystemRoot "System32"
+$CrtNames = @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll")
+$CrtTargets = @(
+    (Join-Path $PortableDir "_internal"),
+    (Join-Path $PortableDir "_internal\PyQt5\Qt5\bin")
+)
+foreach ($Crt in $CrtNames) {
+    $CrtSource = Join-Path $System32 $Crt
+    if (-not (Test-Path $CrtSource)) { continue }
+    foreach ($CrtDir in $CrtTargets) {
+        if (Test-Path $CrtDir) {
+            Copy-Item $CrtSource (Join-Path $CrtDir $Crt) -Force
+        }
+    }
+}
+Write-Host "Patched bundled MSVC runtime with System32 (VS2022) copies for RenderDoc 1.4x compatibility" -ForegroundColor Cyan
+
 $UserDataConfigDir = Join-Path $PortableDir "user_data\config"
 New-Item -ItemType Directory -Force -Path $UserDataConfigDir | Out-Null
 
@@ -160,11 +193,16 @@ $Settings = @{
 $Settings | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $UserDataConfigDir "settings.json") -Encoding UTF8
 
 $ReadmeLines = @(
-    "RenderdocDiffTools portable package",
+    "RenderdocDiffTools portable package (web service)",
     "",
     "Start:",
     "1. Double-click RenderdocDiffTools.exe",
-    "2. The app will start an embedded desktop window",
+    "2. It starts a local web service and prints the URL (default http://127.0.0.1:8010)",
+    "3. Open that URL in any browser",
+    "",
+    "Network deployment:",
+    "- Set environment variable RENDERDOC_WEBUI_HOST=0.0.0.0 before launching to expose",
+    "  the service on the LAN, then visit http://<machine-ip>:<port> from other machines",
     "",
     "Data folders:",
     "- user_data\config\settings.json",
@@ -172,9 +210,9 @@ $ReadmeLines = @(
     "- user_data\logs\",
     "",
     "Notes:",
-    "- settings.json is pre-generated and can be edited directly",
+    "- settings.json is pre-generated and can be edited directly (host/port live here too)",
     "- Install RenderDoc first if the target machine does not have it",
-    "- The desktop window still hosts a local loopback service internally, but it no longer depends on an external browser"
+    "- This build no longer bundles Qt/pywebview; it is a pure web service"
 )
 $Readme = [string]::Join([Environment]::NewLine, $ReadmeLines)
 
