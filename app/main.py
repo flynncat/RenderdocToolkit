@@ -99,6 +99,22 @@ def _require_existing_file(path_text: str, suffix: str, label: str) -> Path:
     return path
 
 
+def _require_renderdoc_available(renderdoc_dir: str = "", *, need_cmd: bool = False) -> dict:
+    """Ensure a usable RenderDoc runtime is resolvable before starting a job.
+
+    When the user leaves the RenderDoc directory blank we auto-detect a system
+    install; if nothing is found we raise a 400 with an actionable prompt
+    (install official RenderDoc, or fill in a custom path).
+    """
+    from app.services.renderdoc_runtime_resolver import renderdoc_availability
+
+    info = renderdoc_availability(renderdoc_dir or "")
+    ok = info["cmd_available"] if need_cmd else info["available"]
+    if not ok:
+        raise HTTPException(status_code=400, detail=info["guidance"])
+    return info
+
+
 def _require_existing_text_file(path_text: str, label: str, allowed_suffixes: tuple[str, ...]) -> Path:
     path_text = (path_text or "").strip()
     if not path_text:
@@ -627,17 +643,13 @@ async def fs_local_pick(mode: str = "dir", exts: str = "", title: str = "") -> d
     def _pick():
         import platform
         if platform.system().lower().startswith("win"):
-            from app.services.win32_picker import pick_directory_win32, pick_file_win32
+            from app.services.win32_picker import (
+                pick_directory_win32,
+                pick_file_win32_exts,
+            )
             if mode == "dir":
                 return pick_directory_win32(title or "选择文件夹")
-            else:
-                filetypes = []
-                if exts:
-                    suffixes = [item.strip() for item in exts.split(",") if item.strip()]
-                    for s in suffixes:
-                        ext_name = s.lstrip(".").upper()
-                        filetypes.append((f"{ext_name} Files (*{s})", f"*{s}"))
-                return pick_file_win32(title or "选择文件", filetypes=filetypes)
+            return pick_file_win32_exts(title or "选择文件", exts=exts)
         else:
             try:
                 import tkinter as tk
@@ -666,7 +678,6 @@ async def fs_local_pick(mode: str = "dir", exts: str = "", title: str = "") -> d
         path = await run_in_threadpool(_pick)
         return {"path": path}
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"打开系统对话框失败: {exc}")
         raise HTTPException(status_code=500, detail=f"打开系统对话框失败: {exc}")
 
 
@@ -727,6 +738,19 @@ async def get_cmp_job(job_id: str) -> dict:
         return cmp_service.get_job_detail(job_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="cmp job 不存在")
+
+
+@app.get("/api/renderdoc-runtime/status")
+async def renderdoc_runtime_status(renderdoc_dir: str = "") -> dict:
+    """Report whether a RenderDoc runtime is resolvable.
+
+    The UI calls this to show the auto-detected RenderDoc (system install /
+    bundled / user path) or, when nothing is found, an actionable prompt to
+    install official RenderDoc or fill in a custom path.
+    """
+    from app.services.renderdoc_runtime_resolver import renderdoc_availability
+
+    return renderdoc_availability(renderdoc_dir or "")
 
 
 @app.get("/api/renderdoc-perf/jobs")
@@ -945,6 +969,8 @@ def _build_perf_zip_bytes(job_dir: Path, job_id: str) -> bytes:
     candidate_paths: list[tuple[Path, str]] = []
     for relative in (
         "artifacts/perf_report.md",
+        "artifacts/perf_report_enhanced.md",
+        "artifacts/perf_report_enhanced.html",
         "artifacts/perf_analysis.json",
         "artifacts/findings.json",
         "artifacts/perf_run_log.txt",
@@ -1060,13 +1086,22 @@ async def get_perf_job_report(job_id: str, format: str = "html") -> Response:
     download route.
     """
     fmt = (format or "html").lower().strip()
-    if fmt not in {"html", "md"}:
-        raise HTTPException(status_code=400, detail="format 仅支持 html 或 md")
+    relative_map = {
+        "html": "artifacts/perf_report.html",
+        "md": "artifacts/perf_report.md",
+        "enhanced": "artifacts/perf_report_enhanced.html",
+        "enhanced_html": "artifacts/perf_report_enhanced.html",
+        "enhanced_md": "artifacts/perf_report_enhanced.md",
+    }
+    if fmt not in relative_map:
+        raise HTTPException(
+            status_code=400,
+            detail="format 仅支持 html / md / enhanced / enhanced_md",
+        )
     job_dir = _resolve_perf_job_dir(job_id)
-    relative = "artifacts/perf_report.html" if fmt == "html" else "artifacts/perf_report.md"
-    target = _perf_artifact_path(job_dir, relative)
+    target = _perf_artifact_path(job_dir, relative_map[fmt])
     text = target.read_text(encoding="utf-8", errors="replace")
-    if fmt == "html":
+    if fmt in {"html", "enhanced", "enhanced_html"}:
         return HTMLResponse(content=text)
     return PlainTextResponse(content=text, media_type="text/markdown; charset=utf-8")
 
@@ -1095,6 +1130,7 @@ async def run_renderdoc_cmp_by_path(
 ) -> dict:
     base_file = _require_existing_file(base_path, ".rdc", "base_path")
     new_file = _require_existing_file(new_path, ".rdc", "new_path")
+    _require_renderdoc_available(renderdoc_dir, need_cmd=True)
 
     title = f"renderdoc_cmp: {base_file.name} vs {new_file.name}"
     metadata = cmp_service.create_job(title=title)
@@ -1140,6 +1176,7 @@ async def run_renderdoc_perf_by_path(
     renderdoc_dir: str = Form(""),
 ) -> dict:
     capture_file = _require_existing_file(capture_path, ".rdc", "capture_path")
+    _require_renderdoc_available(renderdoc_dir)
     title = f"renderdoc_perf: {capture_file.name}"
     metadata = perf_service.create_job(title=title)
     job_id = metadata["job_id"]
@@ -1777,6 +1814,7 @@ async def run_renderdoc_cmp(
 ) -> dict:
     _ensure_rdc_file(base_file.filename)
     _ensure_rdc_file(new_file.filename)
+    _require_renderdoc_available(renderdoc_dir, need_cmd=True)
 
     title = f"renderdoc_cmp: {base_file.filename} vs {new_file.filename}"
     metadata = cmp_service.create_job(title=title)
@@ -1821,6 +1859,7 @@ async def run_renderdoc_perf(
     renderdoc_dir: str = Form(""),
 ) -> dict:
     _ensure_rdc_file(capture_file.filename)
+    _require_renderdoc_available(renderdoc_dir)
     title = f"renderdoc_perf: {capture_file.filename}"
     metadata = perf_service.create_job(title=title)
     job_id = metadata["job_id"]

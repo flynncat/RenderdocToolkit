@@ -12,7 +12,7 @@
 
 | 功能 | 说明 |
 | --- | --- |
-| `性能` | 针对单个 `.rdc` 做 Pass 级性能分析，支持**实时进度反馈**、多维排序、热点提示、绘制预览（RT / 线框 / 绑定纹理，含按需生成），以及基于规则引擎的**证据型性能诊断报告**（HTML / Markdown / CSV 导出） |
+| `性能` | 针对单个 `.rdc` 做 Pass 级性能分析，支持**实时进度反馈**、多维排序、热点提示、绘制预览，以及**基础 + 增强**两份证据型性能诊断报告（HTML / Markdown / CSV 导出）；移动端抓帧若缺少 pipeline counter 会自动隐藏无效列 |
 | `性能 Diff` | 基于 `renderdoc_cmp` 对两份抓帧做性能差异分析，并在界面内查看 HTML 报告 |
 | `资产批量导出` | 扫描 Pass、批量导出资产、导出当前 draw 的 shader/参数、检查 CSV 列映射，并将 CSV 转换为 `FBX` / `OBJ` |
 
@@ -177,13 +177,13 @@ RenderdocDiffPortable\RenderdocDiffTools.exe
 
 - **界面内嵌报告**：结果面板下方的「性能诊断报告」区域，默认展示 HTML；结论中的 EID 可点击跳转到上方性能表对应行
 - **规则覆盖**：过绘、全屏 ALU/带宽、半透明、Shadow/后处理占比、Shader ALU 离群、超大纹理绑定、微三角浪费、Pass 纹理爆炸等（见 `app/services/perf_rule_engine.py`）
-- **可读副本**：`artifacts/perf_report.md`、`artifacts/perf_report.html`
+- **可读副本**：`artifacts/perf_report.md`、`artifacts/perf_report.html`；可选 **增强报告** `artifacts/perf_report_enhanced.md/html`（业务分类、纹理审计、优化建议等，见 `app/services/perf_report/`）
 - **结构化数据**：`artifacts/findings.json`，以及 `artifacts/exports/` 下的 CSV/TSV（overview、pass、draw、纹理长表等，便于 Excel / pandas 二次分析）
 - **一键打包**：工具栏「下载报告+CSV (.zip)」或分别下载 `.md` / `.html` / `.zip`
 
 相关 API（供脚本或集成调用）：
 
-- `GET /api/renderdoc-perf/jobs/{job_id}/report?format=html|md` — 内嵌报告
+- `GET /api/renderdoc-perf/jobs/{job_id}/report?format=html|md|enhanced|enhanced_md` — 内嵌/下载报告
 - `GET /api/renderdoc-perf/jobs/{job_id}/export?format=csv|tsv|json|md|html|zip` — 单文件或 zip 导出
 - `POST /api/renderdoc-perf/jobs/{job_id}/draw-preview` — 按需生成单 Draw 的 RT / 线框预览
 - `GET /api/renderdoc-perf/jobs/{job_id}/draw-texture-thumbnail` — XML 回退路径下的绑定纹理缩略图
@@ -258,6 +258,7 @@ RenderdocDiffPortable\RenderdocDiffTools.exe
 
 ```text
 app/                                    FastAPI 应用与前端模板
+app/services/perf_report/                 增强性能报告（分类、纹理审计、优化建议）
 app/services/perf_rule_engine.py        性能诊断规则引擎（证据型 Finding）
 app/services/perf_report_builder.py       Markdown / HTML 报告渲染
 app/services/renderdoc_perf_exporter.py  CSV / TSV / JSON 扁平化导出
@@ -273,7 +274,7 @@ scripts/verify_bundled_assets.py      打包前 bundled 资源完整性校验
 
 绿色包依赖以下路径的**真实文件**（须以普通 git blob 提交，不能是 Git LFS 指针）：
 
-- `external_tools/renderdoccmp/tools/**` — `renderdoccmd.exe`、`renderdoc.dll`、`astcenc`、`malioc` 等
+- `external_tools/renderdoccmp/tools/{astcenc,mali_offline_compiler}/**` — astcenc、malioc 等（**不再打包** `tools/renderdoc/`，绿色包依赖本机已安装的 RenderDoc 或任务级路径）
 - `external_tools/renderdoccmp/{qr_replay_worker.py,rdc_compare_ultimate.py}`
 - `docs/images/**` — README 截图
 - `.cursor/skills/renderdoc-compare-diagnose/**` — 诊断脚本

@@ -230,6 +230,22 @@ select {
   user-select: text;
 }
 
+.renderdoc-status {
+  margin: 6px 0 4px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #98a2b3;
+}
+.renderdoc-status.ok {
+  color: #56d364;
+}
+.renderdoc-status.warn {
+  color: #f2c55c;
+}
+.renderdoc-status a {
+  color: #6cb6ff;
+}
+
 .fs-picker-panel {
   width: min(720px, 92vw);
   display: flex;

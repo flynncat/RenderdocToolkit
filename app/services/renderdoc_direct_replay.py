@@ -1092,6 +1092,89 @@ class RenderdocDirectReplay:
             header.append("// Note: RenderDoc did not expose a GLSL target for this shader, so this file contains the best available text output.")
         return "\n".join(header) + "\n\n" + str(payload.get("disassembly") or "")
 
+    def get_shader_glsl_source(self, pipe: Any, stage_enum: Any) -> tuple[str, str]:
+        """Return ``(source_text, kind)`` for the shader bound at ``stage_enum``.
+
+        Preference order:
+          1. Original GLSL source stored in ``reflection.debugInfo`` (the
+             same path the EID deep-dive uses) -> kind ``"glsl_source"``.
+          2. Disassembly via a GLSL / OpenGL target if RenderDoc exposes one
+             -> kind ``"glsl_disasm"``.
+          3. Disassembly via a SPIR-V target -> kind ``"spirv_disasm"``.
+          4. Whatever disassembly target is available (e.g. host GPU ISA)
+             -> kind ``"other_disasm"``.
+
+        Returns ``("", "")`` when nothing is available.  Never raises - any
+        failure degrades to an empty result so the perf path keeps running.
+
+        This is what the enhanced perf report needs to feed ``malioc`` and to
+        compute a GLSL-based instruction estimate instead of counting host
+        GPU ISA lines (which produced a near-constant value for mobile GLES
+        captures replayed on desktop).
+        """
+        try:
+            reflection = pipe.GetShaderReflection(stage_enum)
+        except Exception:
+            reflection = None
+        if reflection is None:
+            return "", ""
+
+        # 1. Original source from debug info.
+        try:
+            debug_info = getattr(reflection, "debugInfo", None)
+            debug_files = self._extract_shader_debug_files(debug_info)
+            source_text = self._select_debug_source_text(debug_files)
+            if source_text and source_text.strip():
+                return source_text, "glsl_source"
+        except Exception:
+            pass
+
+        # 2-4. Fall back to disassembly through the best available target.
+        try:
+            pipeline_object = pipe.GetGraphicsPipelineObject()
+        except Exception:
+            pipeline_object = None
+        try:
+            available_targets = [
+                self._stringify(item)
+                for item in list(self.controller.GetDisassemblyTargets(True))
+                if self._stringify(item)
+            ]
+        except Exception:
+            available_targets = []
+        if not available_targets:
+            return "", ""
+
+        glsl_target = self._pick_shader_target(
+            available_targets, priority=("glsl", "opengl", "gles")
+        )
+        spirv_target = self._pick_shader_target(
+            available_targets, priority=("spir", "spv")
+        )
+        for target, kind in (
+            (glsl_target, "glsl_disasm"),
+            (spirv_target, "spirv_disasm"),
+            (available_targets[0], "other_disasm"),
+        ):
+            if not target:
+                continue
+            family = self._classify_shader_target(target)
+            expected_family = {
+                "glsl_disasm": "glsl",
+                "spirv_disasm": "spirv",
+            }.get(kind)
+            if expected_family is not None and family != expected_family:
+                continue
+            try:
+                disassembly = self.controller.DisassembleShader(
+                    pipeline_object, reflection, target
+                )
+            except Exception:
+                continue
+            if disassembly and disassembly.strip():
+                return disassembly, kind
+        return "", ""
+
     def _extract_shader_debug_files(self, debug_info: Any) -> list[Dict[str, str]]:
         result: list[Dict[str, str]] = []
         if debug_info is None:

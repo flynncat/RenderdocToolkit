@@ -265,15 +265,51 @@ class RenderdocPerfService:
                 disassembly_targets_seen.append(tgt)
             if entry.get("estimated"):
                 any_estimated = True
+        # Which GPU pipeline-statistics counters the replay backend actually
+        # provided.  Desktop replay of a mobile GLES capture typically only
+        # exposes ``GPU Duration`` (everything else comes back missing), so
+        # downstream display/sorting must avoid the all-zero columns.
+        missing_counter_names = list(missing_counters)
+        counter_dependent = {
+            "ps_invocations": "PS Invocations",
+            "vs_invocations": "VS Invocations",
+            "vertices_read": "Input Vertices Read",
+            "input_primitives": "Input Primitives",
+            "samples_passed": "Samples Passed",
+        }
+        # A field is "valid" only if its backing counter was provided.
+        unavailable_fields = [
+            field_id
+            for field_id, counter_name in counter_dependent.items()
+            if counter_name in missing_counter_names
+        ]
+        # Coverage + stable-sort are derived from PS Invocations, so they are
+        # only meaningful when that counter exists.
+        if "PS Invocations" in missing_counter_names:
+            unavailable_fields.extend(
+                ["screen_coverage_percent", "stable_sort_score", "instruction_coverage_score"]
+            )
+        counters_available = not unavailable_fields
         analysis_features = {
             "analysis_mode": "direct_replay",
             "instruction_count_estimated": any_estimated,
             "instruction_count_disassembly_targets": disassembly_targets_seen,
+            "missing_counters": missing_counter_names,
+            "counters_available": counters_available,
+            "unavailable_fields": sorted(set(unavailable_fields)),
         }
         run_log_lines.append(
             f"[shader] disassembly_targets={disassembly_targets_seen or '[]'} "
             f"estimated={any_estimated}"
         )
+
+        # Mali Offline Compiler per-shader analysis (Work Reg / ALU / LS /
+        # bound / register-spill).  Runs on the GLSL source we extracted into
+        # the shader cache; best-effort and skipped silently if malioc or the
+        # source is unavailable.  This is the data behind the enhanced
+        # report's "Shader Mali 编译器分析" section.
+        self._emit_progress(job_id, "mali", "正在用 Mali 编译器分析 shader…")
+        shader_mali_metrics = self._run_mali_shader_analysis(shader_cache, run_log_lines)
 
         analysis = {
             "capture_name": capture_path.name,
@@ -283,25 +319,11 @@ class RenderdocPerfService:
             "warnings": warnings,
             "analysis_mode": "direct_replay",
             "analysis_features": analysis_features,
-            "sort_fields": [
-                {"id": "stable_sort_score", "label": "稳定得分(估算)"},
-                {"id": "screen_coverage_percent", "label": "屏幕覆盖率(估算%)"},
-                {"id": "gpu_duration_ms", "label": "GPU耗时"},
-                {"id": "triangles", "label": "三角面数"},
-                {"id": "vertices_read", "label": "顶点数量"},
-                {"id": "input_primitives", "label": "输入图元"},
-                {"id": "instruction_total", "label": "总指令数"},
-                {"id": "ps_instruction_count", "label": "PS指令数"},
-                {"id": "vs_instruction_count", "label": "VS指令数"},
-                {"id": "ps_invocations", "label": "PS调用数"},
-                {"id": "vs_invocations", "label": "VS调用数"},
-                {"id": "texture_count", "label": "贴图数量"},
-                {"id": "texture_total_mb", "label": "贴图总大小(MB)"},
-                {"id": "texture_bandwidth_risk", "label": "纹理带宽风险(估算)"},
-            ],
+            "sort_fields": self._build_sort_fields(unavailable_fields),
             "rows": rows,
             "pass_chart": pass_chart,
             "hotspot_hints": hotspot_hints,
+            "shader_mali_metrics": shader_mali_metrics,
         }
 
         self.store.write_json_artifact(job_id, "artifacts/perf_analysis.json", analysis)
@@ -402,6 +424,30 @@ class RenderdocPerfService:
                 report_html_relpath="artifacts/perf_report.html",
             )
 
+            # Enhanced report (reference-report layout: business category
+            # breakdown, Mali shader table, texture audit, optimisation
+            # priorities).  Best-effort: a failure here must not invalidate the
+            # primary report above.
+            try:
+                from app.services.perf_report import EnhancedReportBuilder
+
+                enhanced_builder = EnhancedReportBuilder()
+                enhanced_md = enhanced_builder.build_from_analysis(analysis, findings_serialised)
+                enhanced_html = enhanced_builder.render_html(
+                    enhanced_builder.assemble_from_analysis(analysis, findings_serialised)
+                )
+                self.store.write_text_artifact(
+                    job_id, "artifacts/perf_report_enhanced.md", enhanced_md,
+                )
+                self.store.write_text_artifact(
+                    job_id, "artifacts/perf_report_enhanced.html", enhanced_html,
+                )
+                run_log_lines.append(
+                    "[report] enhanced=artifacts/perf_report_enhanced.md/html"
+                )
+            except Exception as enh_exc:
+                run_log_lines.append(f"[report] enhanced FAILED: {enh_exc}")
+
             severity_counts = {"high": 0, "med": 0, "low": 0}
             for finding in findings_serialised:
                 sev = str(finding.get("severity") or "").lower()
@@ -417,6 +463,8 @@ class RenderdocPerfService:
                 "finding_count_by_severity": severity_counts,
                 "report_md_path": "artifacts/perf_report.md",
                 "report_html_path": "artifacts/perf_report.html",
+                "report_enhanced_md_path": "artifacts/perf_report_enhanced.md",
+                "report_enhanced_html_path": "artifacts/perf_report_enhanced.html",
                 "exports_dir": "artifacts/exports",
             }
         except Exception as exc:
@@ -1251,10 +1299,34 @@ class RenderdocPerfService:
                     refl=refl,
                     available_targets=available_targets,
                 )
+                # Prefer a GLSL/SPIR-V-based instruction estimate over the
+                # host-GPU ISA line count.  Mobile GLES captures replayed on
+                # desktop only expose the host ISA (e.g. "AMD GCN ISA"), which
+                # our line-count heuristic could not parse, so every shader
+                # collapsed to a near-constant value.  The original GLSL source
+                # lives in ``reflection.debugInfo`` and is far more meaningful,
+                # and is also what ``malioc`` needs downstream.
+                glsl_source = ""
+                source_kind = ""
+                try:
+                    glsl_source, source_kind = replay.get_shader_glsl_source(pipe, stage_enum)
+                except Exception:
+                    glsl_source, source_kind = "", ""
+                if glsl_source and source_kind in {"glsl_source", "glsl_disasm", "spirv_disasm"}:
+                    glsl_count = self._estimate_source_instructions(glsl_source, source_kind)
+                    if glsl_count > 0:
+                        count = glsl_count
+                        used_target = source_kind
+                        # A real source counts as solid; a disassembly-derived
+                        # estimate stays flagged as estimated.
+                        estimated = source_kind != "glsl_source"
                 shader_cache[shader_id] = {
                     "instruction_count": count,
                     "disassembly_target": used_target,
                     "estimated": estimated,
+                    "glsl_source": glsl_source,
+                    "source_kind": source_kind,
+                    "stage": stage_name,
                 }
             cache_entry = shader_cache[shader_id]
             metrics[f"{stage_name}_instruction_count"] = int(cache_entry["instruction_count"])
@@ -1263,6 +1335,74 @@ class RenderdocPerfService:
                 metrics["instruction_count_estimated"] = True
         metrics["instruction_total"] = metrics["vs_instruction_count"] + metrics["ps_instruction_count"]
         return metrics
+
+    @staticmethod
+    def _estimate_source_instructions(source: str, source_kind: str) -> int:
+        """Estimate an instruction count from GLSL source / SPIR-V disassembly.
+
+        Used as the preferred instruction metric when the host-GPU ISA line
+        count is meaningless (mobile GLES capture replayed on desktop).
+        Never raises - returns 0 on any failure so the caller falls back to
+        the disassembly count.
+        """
+        text = source or ""
+        if not text.strip():
+            return 0
+        if source_kind == "spirv_disasm":
+            try:
+                return RenderdocPerfService._count_shader_instructions(text, family="spirv")
+            except Exception:
+                return 0
+        try:
+            from app.services.renderdoc_xml_analyzer import _estimate_glsl_instructions
+            return int(_estimate_glsl_instructions(text))
+        except Exception:
+            return 0
+
+    def _run_mali_shader_analysis(
+        self,
+        shader_cache: Dict[str, Dict[str, Any]],
+        run_log_lines: List[str],
+    ) -> List[Dict[str, Any]]:
+        """Run the Mali Offline Compiler over every unique shader that has
+        real GLSL source in the cache, returning a list of metric dicts.
+
+        Best-effort: any failure (malioc missing, source unavailable, parse
+        error) leaves that shader out and never aborts the analysis.
+        """
+        try:
+            from app.services.perf_report import MaliShaderAnalyzer
+        except Exception as exc:  # pragma: no cover - import guard
+            run_log_lines.append(f"[mali] analyzer import failed: {exc}")
+            return []
+
+        analyzer = MaliShaderAnalyzer()
+        if not analyzer.is_available():
+            run_log_lines.append("[mali] malioc 不可用，跳过 Mali shader 分析")
+            return []
+
+        results: List[Dict[str, Any]] = []
+        analyzed = 0
+        for shader_id, entry in shader_cache.items():
+            source = self._stringify(entry.get("glsl_source"))
+            source_kind = self._stringify(entry.get("source_kind"))
+            # malioc compiles GLSL source; disassembly text won't compile.
+            if not source or source_kind != "glsl_source":
+                continue
+            stage = self._stringify(entry.get("stage")) or "fs"
+            try:
+                metrics = analyzer.analyze(source, stage, shader_id=shader_id)
+            except Exception as exc:
+                run_log_lines.append(f"[mali] {shader_id} FAILED: {exc}")
+                continue
+            results.append(metrics.to_dict())
+            if metrics.available:
+                analyzed += 1
+        run_log_lines.append(
+            f"[mali] analyzed={analyzed} of {len(shader_cache)} unique shaders "
+            f"(only shaders with GLSL source are compiled)"
+        )
+        return results
 
     def _disassemble_and_count_instructions(
         self,
@@ -1580,6 +1720,37 @@ class RenderdocPerfService:
         if fallback.exists():
             return fallback
         raise FileNotFoundError(f"performance capture not found for job: {job_id}")
+
+    @staticmethod
+    def _build_sort_fields(unavailable_fields: List[str]) -> List[Dict[str, str]]:
+        """Build the SPA sort dropdown, dropping fields whose backing GPU
+        counter the replay backend did not provide.
+
+        When pipeline-statistics counters are missing (typical for desktop
+        replay of a mobile GLES capture), sorting/displaying by PS 调用 /
+        覆盖率 / 稳定得分 / 顶点 / 图元 is meaningless (all zero), so we hide
+        them and lead with the metrics that ARE real: GPU 耗时, 三角面,
+        指令数, 贴图.
+        """
+        unavailable = set(unavailable_fields or [])
+        # Ordered so the first valid entry becomes the SPA's default sort.
+        all_fields = [
+            {"id": "gpu_duration_ms", "label": "GPU耗时"},
+            {"id": "instruction_total", "label": "总指令数"},
+            {"id": "ps_instruction_count", "label": "PS指令数"},
+            {"id": "vs_instruction_count", "label": "VS指令数"},
+            {"id": "triangles", "label": "三角面数"},
+            {"id": "texture_total_mb", "label": "贴图总大小(MB)"},
+            {"id": "texture_count", "label": "贴图数量"},
+            {"id": "texture_bandwidth_risk", "label": "纹理带宽风险(估算)"},
+            {"id": "stable_sort_score", "label": "稳定得分(估算)"},
+            {"id": "screen_coverage_percent", "label": "屏幕覆盖率(估算%)"},
+            {"id": "vertices_read", "label": "顶点数量"},
+            {"id": "input_primitives", "label": "输入图元"},
+            {"id": "ps_invocations", "label": "PS调用数"},
+            {"id": "vs_invocations", "label": "VS调用数"},
+        ]
+        return [field for field in all_fields if field["id"] not in unavailable]
 
     def _build_overview(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         total_gpu_duration_ms = round(sum(float(item.get("gpu_duration_ms") or 0.0) for item in rows), 6)

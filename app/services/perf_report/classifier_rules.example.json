@@ -1,0 +1,18 @@
+{
+  "_comment": "业务语义分类规则示例。DrawcallClassifier 按从上到下顺序匹配 keywords（大小写不敏感的子串），第一个命中的规则生效。复制此文件为 classifier_rules.json 并按项目命名约定扩展。keywords 会与 draw 的 pass_name / breadcrumbs / shader 名字做匹配。",
+  "version": 1,
+  "default": { "level1": "其他", "class_id": "unknown" },
+  "rules": [
+    { "level1": "其他", "class_id": "engine_pass", "keywords": ["SlateUI", "Slate", "Tonemap", "CopyScene", "OcclusionCull", "CLODOcclusion", "PostProcess", "Resolve", "DepthFetch"], "note": "UI Slate / 后处理 / 引擎内部 pass" },
+    { "level1": "农作物", "class_id": "crop_special", "keywords": ["PlantSP", "Frozen", "Strawberry", "Tomato", "Blueberry", "Hyacinth"], "note": "特效植物（shader 较重）" },
+    { "level1": "农作物", "class_id": "crop", "keywords": ["Crop", "Plant", "Apple", "Wheat", "Carrot"], "note": "普通植物" },
+    { "level1": "场景装饰物", "class_id": "env_terrain", "keywords": ["TerBlend", "Terrain", "Foundation"], "note": "地形混合" },
+    { "level1": "场景装饰物", "class_id": "env_tool", "keywords": ["Harvester", "Robot", "StartPoint", "Tool"], "note": "场景道具/工具" },
+    { "level1": "其他", "class_id": "vfx_particle", "keywords": ["FX_", "Particle", "IdleShow", "Portal"], "note": "粒子/特效" },
+    { "level1": "其他", "class_id": "vfx_bubble", "keywords": ["Bubble"], "note": "气泡特效" },
+    { "level1": "玩家角色", "class_id": "character_face", "keywords": ["Face", "HairClip", "Hair"], "note": "角色面部/发饰" },
+    { "level1": "玩家角色", "class_id": "character_body", "keywords": ["SK_PL_", "Matcap", "Body", "Skin"], "note": "角色身体" },
+    { "level1": "宠物", "class_id": "pet", "keywords": ["Pet", "Giraffe", "Fox", "Egg"], "note": "宠物" },
+    { "level1": "其他", "class_id": "commodity_ui", "keywords": ["Commodity", "Comm_BC", "Icon"], "note": "商品图标" }
+  ]
+}

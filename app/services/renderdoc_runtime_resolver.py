@@ -29,6 +29,15 @@ _FOREIGN_MAGICS: set[bytes] = {
     b"\x43\x4f\x44\x52",  # CODR / RDOC (v1.36 and custom builds)
 }
 
+# Shown to the user when no RenderDoc runtime can be resolved at all (no
+# per-task override, no global setting, no bundled tool, and no system
+# install detected).  The portable package no longer ships RenderDoc's CLI,
+# so we rely on a system install or a user-provided path.
+RENDERDOC_NOT_FOUND_GUIDANCE = (
+    "未检测到可用的 RenderDoc。请先安装官方 RenderDoc（https://renderdoc.org/builds），"
+    "或在「RenderDoc 目录」中填写自定义的 RenderDoc 安装路径后重试。"
+)
+
 
 @dataclass
 class RenderdocRuntimeContext:
@@ -67,7 +76,12 @@ def resolve_renderdoc_runtime(
             )
 
     global_python_path = (app_config.RENDERDOC_PYTHON_PATH or "").strip()
-    if global_python_path:
+    # Only honour the global setting when it still points at something real.
+    # Portable builds may bake a path detected on the build machine; if that
+    # path is absent on the end-user's machine we must fall through to system
+    # detection (and ultimately the "install RenderDoc" prompt) instead of
+    # pretending a runtime exists.
+    if global_python_path and Path(global_python_path).expanduser().exists():
         resolved = Path(global_python_path).expanduser().resolve()
         base = resolved if resolved.is_dir() else resolved.parent
         # Honour the official RenderDoc layout where the importable
@@ -407,5 +421,176 @@ def _find_bundled_renderdoccmd() -> str:
 
 
 def _find_system_renderdoccmd() -> str:
+    """Locate a system-installed ``renderdoccmd`` executable.
+
+    The official RenderDoc installer does NOT add itself to ``PATH`` and
+    installs under ``C:\\Program Files\\RenderDoc`` on Windows, so a plain
+    ``shutil.which`` misses the common case.  We therefore also consult the
+    Windows registry (``.rdc`` file association) and the well-known install
+    directories before giving up.
+    """
     result = shutil.which("renderdoccmd")
-    return result or ""
+    if result:
+        return result
+    install_dir = _find_system_renderdoc_install_dir()
+    if install_dir:
+        cmd = _find_renderdoccmd_in(Path(install_dir))
+        if cmd:
+            return cmd
+    return ""
+
+
+def _find_system_renderdoc_install_dir() -> str:
+    """Best-effort detection of a system RenderDoc install directory.
+
+    Order: Windows registry (``.rdc`` association + ``App Paths``) → the
+    common ``Program Files`` / ``%LOCALAPPDATA%`` locations.  Returns the
+    directory that actually contains ``renderdoccmd``/``qrenderdoc``, or "".
+    """
+    if platform.system() != "Windows":
+        # On Linux/macOS a PATH lookup (handled by the caller) is the norm.
+        return ""
+
+    for directory in _registry_renderdoc_dirs():
+        if _renderdoc_dir_is_usable(directory):
+            return str(directory)
+
+    for directory in _common_renderdoc_dirs():
+        if _renderdoc_dir_is_usable(directory):
+            return str(directory)
+    return ""
+
+
+def _renderdoc_dir_is_usable(directory: Path) -> bool:
+    try:
+        if not directory.is_dir():
+            return False
+    except OSError:
+        return False
+    return (
+        _find_renderdoccmd_in(directory) != ""
+        or (directory / "qrenderdoc.exe").is_file()
+    )
+
+
+def _common_renderdoc_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    for env_name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(env_name)
+        if base:
+            dirs.append(Path(base) / "RenderDoc")
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        dirs.append(Path(local) / "Programs" / "RenderDoc")
+    # De-dup while preserving order.
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for d in dirs:
+        key = str(d).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(d)
+    return unique
+
+
+def _registry_renderdoc_dirs() -> list[Path]:
+    """Resolve RenderDoc install dir(s) via the Windows registry.
+
+    Uses the ``.rdc`` file association (``HKCR\\.rdc`` -> ProgID ->
+    ``shell\\open\\command``) and the ``App Paths`` entry for
+    ``qrenderdoc.exe``.  Both yield a path to ``qrenderdoc.exe`` whose parent
+    is the install directory.  Best-effort; any failure is ignored.
+    """
+    try:
+        import winreg  # Windows-only
+    except Exception:
+        return []
+
+    dirs: list[Path] = []
+
+    def _add_from_exe(exe_str: str) -> None:
+        exe = _parse_exe_from_command(exe_str)
+        if exe:
+            parent = Path(exe).parent
+            if parent.name.lower() == "pymodules":
+                parent = parent.parent
+            dirs.append(parent)
+
+    # 1. .rdc association -> ProgID -> open command.
+    try:
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, ".rdc") as k:
+            progid, _ = winreg.QueryValueEx(k, "")
+        if progid:
+            with winreg.OpenKey(
+                winreg.HKEY_CLASSES_ROOT, rf"{progid}\shell\open\command"
+            ) as k:
+                cmd, _ = winreg.QueryValueEx(k, "")
+            _add_from_exe(cmd)
+    except OSError:
+        pass
+
+    # 2. App Paths for qrenderdoc.exe (set by some installers).
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            with winreg.OpenKey(
+                hive,
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\qrenderdoc.exe",
+            ) as k:
+                exe, _ = winreg.QueryValueEx(k, "")
+            _add_from_exe(exe)
+        except OSError:
+            pass
+
+    return dirs
+
+
+def _parse_exe_from_command(command: str) -> str:
+    """Extract the executable path from a shell ``open`` command string such as
+    ``"C:\\Program Files\\RenderDoc\\qrenderdoc.exe" "%1"``.
+    """
+    command = (command or "").strip()
+    if not command:
+        return ""
+    if command.startswith('"'):
+        end = command.find('"', 1)
+        if end > 0:
+            return command[1:end]
+        return command.strip('"')
+    # Unquoted: take everything up to the first ``.exe``.
+    lowered = command.lower()
+    idx = lowered.find(".exe")
+    if idx > 0:
+        return command[: idx + 4]
+    return command.split(" ")[0]
+
+
+def renderdoc_availability(task_renderdoc_dir: str = "") -> dict:
+    """Report whether a usable RenderDoc runtime can be resolved.
+
+    Returns a dict the API/UI can consume directly::
+
+        {
+          "available": bool,          # any cmd OR python module resolvable
+          "cmd_available": bool,      # renderdoccmd (convert/thumbnail) usable
+          "python_available": bool,   # renderdoc.pyd (direct replay) usable
+          "renderdoc_dir": str,
+          "renderdoc_cmd_path": str,
+          "renderdoc_python_path": str,
+          "source": str,              # task_override|global_settings|bundled|path|none
+          "guidance": str,            # actionable prompt when unavailable
+        }
+    """
+    ctx = resolve_renderdoc_runtime(task_renderdoc_dir)
+    cmd_available = bool(ctx.renderdoc_cmd_path)
+    python_available = bool(ctx.renderdoc_python_path)
+    available = cmd_available or python_available
+    return {
+        "available": available,
+        "cmd_available": cmd_available,
+        "python_available": python_available,
+        "renderdoc_dir": ctx.renderdoc_dir,
+        "renderdoc_cmd_path": ctx.renderdoc_cmd_path,
+        "renderdoc_python_path": ctx.renderdoc_python_path,
+        "source": ctx.source,
+        "guidance": "" if available else RENDERDOC_NOT_FOUND_GUIDANCE,
+    }

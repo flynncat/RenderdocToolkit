@@ -411,9 +411,9 @@ function renderPerfSummary(detail) {
     <div><strong>总 ${features.api_duration_from_chrome_json ? "API" : "GPU"} 耗时:</strong> ${Number(overview.total_gpu_duration_ms || 0).toFixed(3)} ms${features.api_duration_from_chrome_json ? " <em>(CPU API 近似)</em>" : ""}</div>
     <div><strong>Draw 数:</strong> ${overview.draw_count || 0}</div>
     <div><strong>总三角面:</strong> ${overview.total_triangles || 0}</div>
-    <div><strong>总顶点:</strong> ${overview.total_vertices_read || 0}</div>
+    ${features.counters_available === false ? "" : `<div><strong>总顶点:</strong> ${overview.total_vertices_read || 0}</div>`}
     <div><strong>总指令${features.instruction_count_estimated ? "(估算)" : ""}:</strong> ${overview.total_instruction_count || 0}</div>
-    <div><strong>稳定总分:</strong> ${Number(overview.total_stable_sort_score || 0).toFixed(3)}</div>
+    ${features.counters_available === false ? "" : `<div><strong>稳定总分:</strong> ${Number(overview.total_stable_sort_score || 0).toFixed(3)}</div>`}
     <div><strong>总贴图:</strong> ${Number(overview.total_texture_mb || 0).toFixed(3)} MB</div>
     ${thumbBlock}
   `;
@@ -638,7 +638,14 @@ function renderPerfTable() {
     container.innerHTML = '<div class="empty-state">暂无性能结果。</div>';
     return;
   }
-  const sortField = document.getElementById("perf-sort-field").value || "stable_sort_score";
+  const features = (currentPerfAnalysis && currentPerfAnalysis.analysis_features) || {};
+  // When the replay backend didn't provide pipeline-statistics counters
+  // (typical for desktop replay of a mobile GLES capture), the columns
+  // 稳定得分 / 覆盖率% / 顶点 / 图元 / PS调用 are all zero and misleading,
+  // so we hide them and lead with the metrics that are actually real.
+  const countersAvailable = features.counters_available !== false;
+  const defaultSort = countersAvailable ? "stable_sort_score" : "gpu_duration_ms";
+  const sortField = document.getElementById("perf-sort-field").value || defaultSort;
   const sortDirection = document.getElementById("perf-sort-direction").value || "desc";
   rows.sort((a, b) => {
     const av = Number((a && a[sortField]) || 0);
@@ -669,21 +676,26 @@ function renderPerfTable() {
     const sceneCellHtml = decidedLabel
       ? `${row.scene_pass || "-"}<br/><small style="color:#7d8696">[${escapeHtml(decidedLabel)}]</small>`
       : (row.scene_pass || "-");
+    const stableCells = countersAvailable
+      ? `<td>${Number(row.stable_sort_score || 0).toFixed(3)}</td><td>${Number(row.screen_coverage_percent || 0).toFixed(4)}</td>`
+      : "";
+    const geomCounterCells = countersAvailable
+      ? `<td>${row.vertices_read || 0}</td><td>${row.input_primitives || 0}</td>`
+      : "";
+    const psInvCell = countersAvailable ? `<td>${row.ps_invocations || 0}</td>` : "";
     return `
       <tr id="perf-row-${escapeHtml(eid)}" data-eid="${escapeHtml(eid)}">
         <td>${eid || "-"}</td>
         <td title="${escapeHtml(stateTooltip)}">${sceneCellHtml}</td>
         <td title="${escapeHtml(row.pass_name || "")}">${escapeHtml(row.pass_name || "-")}</td>
-        <td>${Number(row.stable_sort_score || 0).toFixed(3)}</td>
-        <td>${Number(row.screen_coverage_percent || 0).toFixed(4)}</td>
+        ${stableCells}
         <td>${Number(row.gpu_duration_ms || 0).toFixed(3)}</td>
         <td>${row.triangles || 0}</td>
-        <td>${row.vertices_read || 0}</td>
-        <td>${row.input_primitives || 0}</td>
+        ${geomCounterCells}
         <td>${row.instruction_total || 0}</td>
         <td>${row.ps_instruction_count || 0}</td>
         <td>${row.vs_instruction_count || 0}</td>
-        <td>${row.ps_invocations || 0}</td>
+        ${psInvCell}
         <td id="perf-draw-preview-${row.eid || ""}"><div class="perf-preview-strip">${renderPerfDrawPreviewMarkup(row)}</div></td>
         <td>${row.texture_count || 0}</td>
         <td>${Number(row.texture_total_mb || 0).toFixed(3)}</td>
@@ -693,23 +705,29 @@ function renderPerfTable() {
     `;
   }).join("");
 
+  const stableHeaders = countersAvailable ? "<th>稳定得分</th><th>覆盖率%</th>" : "";
+  const geomCounterHeaders = countersAvailable ? "<th>顶点</th><th>图元</th>" : "";
+  const psInvHeader = countersAvailable ? "<th>PS调用</th>" : "";
+  const counterNotice = countersAvailable
+    ? ""
+    : '<div class="empty-state" style="text-align:left;margin-bottom:8px;color:#a7b0bf">本次为桌面回放，GPU 管线计数器（PS调用/覆盖率/顶点/图元/稳定得分）不可用，已隐藏这些无效列并默认按 GPU ms 排序。</div>';
+
   container.innerHTML = `
+    ${counterNotice}
     <table class="perf-table">
       <thead>
         <tr>
           <th>EID</th>
           <th>渲染分类</th>
           <th>Pass marker</th>
-          <th>稳定得分</th>
-          <th>覆盖率%</th>
+          ${stableHeaders}
           <th>GPU ms</th>
           <th>三角面</th>
-          <th>顶点</th>
-          <th>图元</th>
+          ${geomCounterHeaders}
           <th>总指令</th>
           <th>PS指令</th>
           <th>VS指令</th>
-          <th>PS调用</th>
+          ${psInvHeader}
           <th>线框预览</th>
           <th>贴图数</th>
           <th>贴图总量(MB)</th>
@@ -1030,10 +1048,12 @@ async function renderPerfReportPanel(jobId) {
   const linkMd = document.getElementById("perf-report-download-md");
   const linkHtml = document.getElementById("perf-report-download-html");
   const linkZip = document.getElementById("perf-report-download-zip");
+  const linkEnhancedView = document.getElementById("perf-report-view-enhanced");
+  const linkEnhancedMd = document.getElementById("perf-report-download-enhanced-md");
   if (!panel) return;
   panel.innerHTML = '<div class="empty-state">报告加载中...</div>';
   if (status) status.textContent = "报告加载中...";
-  [linkMd, linkHtml, linkZip].forEach((el) => { if (el) el.classList.add("hidden"); });
+  [linkMd, linkHtml, linkZip, linkEnhancedView, linkEnhancedMd].forEach((el) => { if (el) el.classList.add("hidden"); });
   if (!jobId) {
     panel.innerHTML = '<div class="empty-state">执行性能分析后将自动生成报告</div>';
     if (status) status.textContent = "尚未生成报告";
@@ -1073,6 +1093,21 @@ async function renderPerfReportPanel(jobId) {
       linkZip.href = `/api/renderdoc-perf/jobs/${jobId}/export?format=zip`;
       linkZip.classList.remove("hidden");
     }
+    // Enhanced report links are best-effort: probe the endpoint and only
+    // reveal them when the artifact exists for this job.
+    try {
+      const enhancedResp = await fetch(`/api/renderdoc-perf/jobs/${jobId}/report?format=enhanced`, { method: "HEAD" });
+      if (enhancedResp.ok) {
+        if (linkEnhancedView) {
+          linkEnhancedView.href = `/api/renderdoc-perf/jobs/${jobId}/report?format=enhanced`;
+          linkEnhancedView.classList.remove("hidden");
+        }
+        if (linkEnhancedMd) {
+          linkEnhancedMd.href = `/api/renderdoc-perf/jobs/${jobId}/report?format=enhanced_md`;
+          linkEnhancedMd.classList.remove("hidden");
+        }
+      }
+    } catch (e) { /* enhanced report optional */ }
   } catch (error) {
     const msg = error && error.message ? error.message : String(error);
     panel.innerHTML = `<div class="empty-state">报告未生成或加载失败：${escapeHtml(msg)}</div>`;
@@ -1730,26 +1765,15 @@ async function handleAssetCsvInspect(event) {
     "说明: 正在识别 CSV 列映射，请稍候...",
   ]);
   try {
-    let response;
-    if (csvPath) {
-      const formData = new FormData();
-      formData.append("csv_path", csvPath);
-      response = await fetch("/api/asset-export/csv-inspect/by-path", {
-        method: "POST",
-        body: formData,
-      });
-    } else {
-      const csvFile = document.getElementById("asset-csv-file").files[0];
-      if (!csvFile) {
-        throw new Error("请先选择 CSV 文件、多个 CSV 路径，或填写目录路径。");
-      }
-      const formData = new FormData();
-      formData.append("csv_file", csvFile);
-      response = await fetch("/api/asset-export/csv-inspect", {
-        method: "POST",
-        body: formData,
-      });
+    if (!csvPath) {
+      throw new Error("请先选择 CSV 文件、多个 CSV 路径，或填写目录路径。");
     }
+    const formData = new FormData();
+    formData.append("csv_path", csvPath);
+    const response = await fetch("/api/asset-export/csv-inspect/by-path", {
+      method: "POST",
+      body: formData,
+    });
     const data = await response.json();
     if (!response.ok) {
       throw new Error(data.detail || "CSV 识别失败");
@@ -1871,30 +1895,17 @@ async function handleAssetCsvConvert() {
     formData.append("color", document.getElementById("mapping-color").value);
     formData.append("tangent", document.getElementById("mapping-tangent").value);
     formData.append("flip_texture_y", document.getElementById("asset-csv-flip-texture-y").checked ? "true" : "false");
-    if (csvPath) {
-      formData.append("csv_path", csvPath);
-      const targetUrl = currentExportJobId
-        ? `/api/asset-export/jobs/${currentExportJobId}/convert-csv/by-path`
-        : "/api/asset-export/convert-csv/by-path";
-      response = await fetch(targetUrl, {
-        method: "POST",
-        body: formData,
-      });
-    } else {
-      const csvFile = document.getElementById("asset-csv-file").files[0];
-      if (!csvFile) {
-        throw new Error("请先选择 CSV 文件、多个 CSV 路径，或填写目录路径。");
-      }
-      formData.append("csv_file", csvFile);
-      formData.append("csv_source_path", csvPath);
-      const targetUrl = currentExportJobId
-        ? `/api/asset-export/jobs/${currentExportJobId}/convert-csv`
-        : "/api/asset-export/convert-csv";
-      response = await fetch(targetUrl, {
-        method: "POST",
-        body: formData,
-      });
+    if (!csvPath) {
+      throw new Error("请先选择 CSV 文件、多个 CSV 路径，或填写目录路径。");
     }
+    formData.append("csv_path", csvPath);
+    const targetUrl = currentExportJobId
+      ? `/api/asset-export/jobs/${currentExportJobId}/convert-csv/by-path`
+      : "/api/asset-export/convert-csv/by-path";
+    response = await fetch(targetUrl, {
+      method: "POST",
+      body: formData,
+    });
     const data = await response.json();
     if (!response.ok) {
       throw new Error(data.detail || "CSV 转换失败");
@@ -1992,6 +2003,44 @@ document.addEventListener("click", (event) => {
 }
 document.getElementById("perf-sort-field").addEventListener("change", renderPerfTable);
 document.getElementById("perf-sort-direction").addEventListener("change", renderPerfTable);
+
+// ---- RenderDoc runtime detection status ----
+async function refreshRenderdocStatus(statusId, inputId) {
+  const el = document.getElementById(statusId);
+  if (!el) return;
+  const inputEl = document.getElementById(inputId);
+  const dir = ((inputEl && inputEl.value) || "").split(/\r?\n/)[0].trim();
+  try {
+    const params = new URLSearchParams();
+    if (dir) params.set("renderdoc_dir", dir);
+    const resp = await fetch(`/api/renderdoc-runtime/status?${params.toString()}`);
+    const data = await resp.json();
+    if (data.available) {
+      const srcLabel = {
+        task_override: "自定义路径",
+        global_settings: "全局设置",
+        bundled: "内置",
+        path: "系统安装",
+      }[data.source] || data.source || "";
+      const where = data.renderdoc_cmd_path || data.renderdoc_python_path || data.renderdoc_dir || "";
+      el.className = "renderdoc-status ok";
+      el.textContent = `✓ 已检测到 RenderDoc（来源：${srcLabel}）${where ? " · " + where : ""}`;
+    } else {
+      el.className = "renderdoc-status warn";
+      el.innerHTML = `⚠ ${escapeHtml(data.guidance || "未检测到 RenderDoc，请安装官方 RenderDoc 或填写自定义路径。")} ` +
+        `<a href="https://renderdoc.org/builds" target="_blank" rel="noopener">下载官方 RenderDoc</a>`;
+    }
+  } catch (_e) {
+    el.className = "renderdoc-status";
+    el.textContent = "RenderDoc 检测失败（不影响手动填写路径）";
+  }
+}
+["perf-renderdoc-dir", "cmp-renderdoc-dir"].forEach((inputId) => {
+  const statusId = inputId === "perf-renderdoc-dir" ? "perf-renderdoc-status" : "cmp-renderdoc-status";
+  const inputEl = document.getElementById(inputId);
+  if (inputEl) inputEl.addEventListener("change", () => refreshRenderdocStatus(statusId, inputId));
+  refreshRenderdocStatus(statusId, inputId);
+});
 {
   // "上下翻转贴图" toggle in the perf toolbar.  Pure SPA-side CSS
   // flip via a body-scoped class - this never touches the PNG files

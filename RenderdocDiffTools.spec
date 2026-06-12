@@ -1,18 +1,57 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+
 from PyInstaller.utils.hooks import collect_submodules
 
 hiddenimports = ["app.services.win32_picker"]
-for package_name in ("fastapi", "starlette", "uvicorn", "httpx", "anyio", "jinja2", "markdown"):
+for package_name in (
+    "fastapi",
+    "starlette",
+    "uvicorn",
+    "httpx",
+    "anyio",
+    "jinja2",
+    "markdown",
+    "app.services.perf_report",
+):
     hiddenimports += collect_submodules(package_name)
+
+
+def _collect_cmp_datas():
+    """Bundle ``external_tools/renderdoccmp`` but skip the heavy RenderDoc CLI.
+
+    ``tools/renderdoc`` (renderdoc.dll + renderdoccmd.exe, ~24.5MB) is no
+    longer shipped: the app auto-detects a system-installed RenderDoc or uses
+    a user-provided path (see ``renderdoc_runtime_resolver``).  malioc /
+    astcenc and the python scripts are still bundled.
+    """
+    root = "external_tools/renderdoccmp"
+    skip = os.path.normpath(os.path.join("tools", "renderdoc"))
+    entries = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        rel = "" if rel == "." else os.path.normpath(rel)
+        if rel == skip or rel.startswith(skip + os.sep):
+            continue
+        if "__pycache__" in rel.split(os.sep):
+            continue
+        for fn in filenames:
+            if fn.endswith(".pyc"):
+                continue
+            src = os.path.join(dirpath, fn)
+            dest = os.path.join(root, rel) if rel else root
+            entries.append((src, dest))
+    return entries
+
 
 datas = [
     ("app/templates", "app/templates"),
     ("app/static", "app/static"),
     (".cursor/skills/renderdoc-compare-diagnose", ".cursor/skills/renderdoc-compare-diagnose"),
     ("docs", "docs"),
-    ("external_tools/renderdoccmp", "external_tools/renderdoccmp"),
-]
+    ("app/services/perf_report/classifier_rules.example.json", "app/services/perf_report"),
+] + _collect_cmp_datas()
 
 a = Analysis(
     ["launcher.py"],

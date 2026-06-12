@@ -19,8 +19,10 @@ CRITICAL_ASSETS: list[tuple[str, int]] = [
     ("external_tools/renderdoccmp/rdc_compare_ultimate.py", 10_000),
     ("external_tools/renderdoccmp/qr_replay_worker.py", 1_000),
     ("external_tools/renderdoccmp/tools/babylon.js", 100),
-    ("external_tools/renderdoccmp/tools/renderdoc/windows/renderdoccmd.exe", 100_000),
-    ("external_tools/renderdoccmp/tools/renderdoc/windows/renderdoc.dll", 1_000_000),
+    # NOTE: The RenderDoc CLI (tools/renderdoc/windows/*) is intentionally NOT
+    # bundled anymore - the portable package relies on a system-installed
+    # RenderDoc (auto-detected) or a user-provided path, which keeps the
+    # package ~24MB smaller.  See renderdoc_runtime_resolver.
     ("external_tools/renderdoccmp/tools/astcenc/windows/astcenc-sse4.1.exe", 100_000),
     ("external_tools/renderdoccmp/tools/mali_offline_compiler/windows/malioc.exe", 10_000),
     (
